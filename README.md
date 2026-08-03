@@ -60,14 +60,14 @@ frontend/                vite vanilla-JS room interface
 ```
 git clone https://github.com/thelamer/romm-broker-dev.git
 cd romm-broker-dev
-docker run --rm -it --name webstation-dev \
+docker run --rm -it \
   -e BROKER_DEV_MODE=true \
   -e PUID=1000 -e PGID=1000 \
   -v $(pwd):/broker \
   -v /path/to/roms:/romm \
   -v /path/to/config:/config \
   -p 3001:3001 \
-  <webstation-romm-image> bash
+  linuxserver/webstation:romm bash
 ```
 
 With `BROKER_DEV_MODE=true` the mounted `/broker` is pip-installed editable,
