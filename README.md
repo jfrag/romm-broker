@@ -60,7 +60,7 @@ frontend/                vite vanilla-JS room interface
 ## Dev mode
 
 ```
-git clone https://github.com/thelamer/romm-broker-dev.git
+git clone https://github.com/romm-streaming/romm-broker.git
 cd romm-broker-dev
 docker run --rm -it \
   -e BROKER_DEV_MODE=true \
