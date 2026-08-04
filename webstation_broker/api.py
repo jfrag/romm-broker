@@ -114,6 +114,9 @@ async def activate(
     emulator = get_emulator(body.emulator)
     if emulator is None:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
+    # General-purpose emulators (retroarch) pick their core from the platform.
+    if body.rom is not None:
+        emulator.platform = body.rom.platform
 
     rom_file = None
     if emulator.requires_rom:
