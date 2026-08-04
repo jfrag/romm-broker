@@ -37,6 +37,8 @@ class Emulator:
     save_subtrees: tuple[str, ...] = ()
     rom_extensions: tuple[str, ...] = ()
     log_path: Path = Path("/config/broker-app.log")
+    # Seconds SIGTERM gets before escalating to SIGKILL.
+    term_timeout: float = 5.0
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
@@ -75,7 +77,7 @@ class Emulator:
             pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGTERM)
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=self.term_timeout)
             except subprocess.TimeoutExpired:
                 os.killpg(pgid, signal.SIGKILL)
                 try:
