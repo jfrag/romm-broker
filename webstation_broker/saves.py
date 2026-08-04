@@ -28,13 +28,18 @@ def _iter_save_files(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
         base = root / sub
         if not base.is_dir():
             continue
-        files.extend(
-            p
-            for p in sorted(base.rglob("*"))
-            if p.is_file()
-            and not p.is_symlink()
-            and not any(part.startswith(".") for part in p.relative_to(base).parts)
-        )
+        for p in sorted(base.rglob("*")):
+            if not p.is_file() or p.is_symlink():
+                continue
+            rel = p.relative_to(base)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            # shadPS4 writes sce_sys/corrupted while a save is mounted
+            # read-write and removes it on unmount; shipping it would make
+            # the next mount treat the save as corrupt.
+            if p.name == "corrupted" and p.parent.name == "sce_sys":
+                continue
+            files.append(p)
     return files
 
 

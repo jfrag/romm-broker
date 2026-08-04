@@ -37,12 +37,18 @@ class Emulator:
     save_subtrees: tuple[str, ...] = ()
     rom_extensions: tuple[str, ...] = ()
     log_path: Path = Path("/config/broker-app.log")
+    # Seconds SIGTERM gets before escalating to SIGKILL.
+    term_timeout: float = 5.0
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
 
-    def _spawn(self, cmd: list[str], env: dict[str, str]) -> None:
-        """Start the app in its own process group with output captured."""
+    def _spawn(self, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False) -> None:
+        """Start the app in its own process group with output captured.
+
+        `stdin_pipe` keeps the child's stdin as a pipe so emulators with a
+        stdin control protocol (shadPS4 IPC) can be driven headlessly.
+        """
         try:
             log_fh = open(self.log_path, "ab", buffering=0)
             log_fh.write(
@@ -54,6 +60,7 @@ class Emulator:
             self._proc = subprocess.Popen(
                 cmd,
                 env=env,
+                stdin=subprocess.PIPE if stdin_pipe else None,
                 stdout=log_fh if log_fh else subprocess.DEVNULL,
                 stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
                 start_new_session=True,
@@ -75,7 +82,7 @@ class Emulator:
             pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGTERM)
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=self.term_timeout)
             except subprocess.TimeoutExpired:
                 os.killpg(pgid, signal.SIGKILL)
                 try:
