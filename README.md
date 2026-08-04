@@ -16,7 +16,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane (localhost:8083)
   saves.py               save archive restore on activate, delta dump on exit
-  emulators/             emulator launchers (pcsx2, desktop)
+  emulators/             emulator launchers (pcsx2, eden, shadps4, desktop)
 frontend/                vite vanilla-JS room interface
 ```
 
@@ -28,9 +28,11 @@ frontend/                vite vanilla-JS room interface
   routing per streaming connection. The room UI reassigns gamepads and
   mouse/keyboard by dragging icons onto users.
 * Save data flows through zip archives scoped to the emulator's save subtrees
-  (pcsx2: `memcards/`, `sstates/`). Activate restores an archive without
+  (pcsx2: `memcards/`, `sstates/`; eden: `nand/user/save/` 
+  `nand/system/save/8000000000000010/`; shadps4: `home/1000/savedata/`).
+  Activate restores an archive without
   rolling back newer files; exit zips everything modified since launch and
-  uploads it to the callback origin. In dev mode nothing is uploaded — the
+  uploads it to the callback origin. In dev mode nothing is uploaded the
   archive is written under `/config/broker-exports/` and the exit report says
   what *would* have been sent. Outside dev mode the archive only lands on
   disk when the upload fails, so a dead callback never loses save data.
@@ -58,7 +60,7 @@ frontend/                vite vanilla-JS room interface
 ## Dev mode
 
 ```
-git clone https://github.com/thelamer/romm-broker-dev.git
+git clone https://github.com/romm-streaming/romm-broker.git
 cd romm-broker-dev
 docker run --rm -it \
   -e BROKER_DEV_MODE=true \
@@ -94,6 +96,25 @@ streaming. Returns 409 if a session is already active.
 
 `rom.path` may be a file or a game folder; the broker picks the best bootable
 disc image (disc number first, then format ranking, chd > iso > ...).
+
+`emulator: "eden"` launches the Eden Switch emulator the same way. Eden has
+no save states: `resume_slot` is ignored, and exit performs a graceful
+shutdown followed by a save delta dump the game's own save data under the emulated NAND is the
+persistence. `EDEN_STOP_WAIT` (default 15 s) controls how long the graceful
+stop gets before SIGKILL.
+
+`emulator: "shadps4"` launches the shadPS4 PlayStation 4 emulator. shadPS4
+has no save states either (`resume_slot` is ignored); the game's save data
+under `home/1000/savedata/` is the persistence. The binary is picked from
+`$HOME/.local/share/shadPS4QtLauncher/versions`: the `Pre-release/` build if
+present (it always trumps releases), otherwise the newest semver release
+folder (`vX.Y.Z - ... - <date>/`, each holding `Shadps4-sdl.AppImage`).
+Override the search with `SHADPS4_BIN` (explicit path), `SHADPS4_VERSIONS_DIR`,
+`SHADPS4_BIN_NAME`, or `SHADPS4_DATA_DIR`. The broker drives shadPS4 through
+its stdin IPC (`SHADPS4_ENABLE_IPC=true`): RUN/START boot the game headlessly,
+and exit sends STOP (the SDL quit event) for a graceful teardown before the
+save delta is dumped. shadPS4 has no SIGTERM handler, so SIGTERM is only the
+fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
 
 ### Launch a game with save data
 
@@ -150,8 +171,8 @@ curl -k -X POST 'https://localhost:3001/streaming/api/session/exit?slot=10' \
 Saves state to `slot`, stops the emulator, dumps the save delta, and uploads
 it to the callback origin as multipart form data:
 `POST {base_url}{BROKER_SAVE_UPLOAD_PATH}` with an `archive` file part
-(zip, `{session_id}-{timestamp}.zip`) plus `session_id`, `emulator`, and —
-when the rom carried them — `rom_id` / `rom_name` form fields. If activate
+(zip, `{session_id}-{timestamp}.zip`) plus `session_id`, `emulator`, and
+when the rom carried them `rom_id` / `rom_name` form fields. If activate
 supplied `callback.token`, it is sent as `Authorization: Bearer <token>`.
 
 The callback base URL is derived from the activate request (the parent
