@@ -18,3 +18,12 @@ webstation-broker = "webstation_broker.main:run"
 
 [tool.setuptools.packages.find]
 include = ["webstation_broker*"]
+
+# Pinned explicitly so a new ruff release cannot turn master red on its own:
+# without a select the rule set is whatever that version defaults to.
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
