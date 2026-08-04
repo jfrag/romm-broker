@@ -53,6 +53,7 @@ frontend/                vite vanilla-JS room interface
 | `BROKER_SECRET` | unset | shared secret for the lifecycle endpoints (`X-Broker-Secret` header); unset disables auth |
 | `ROM_ROOT` | `/romm` | activate rejects rom paths outside this root |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | where exit writes save archives (always in dev mode, otherwise only when the upload fails) |
+| `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | path appended to the callback base URL when exit POSTs the save archive |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
 | `BROKER_DEV_MODE` | unset | run from mounted source with uvicorn/vite hot reload; also disables the exit save upload (report-only) |
@@ -61,7 +62,7 @@ frontend/                vite vanilla-JS room interface
 
 ```
 git clone https://github.com/romm-streaming/romm-broker.git
-cd romm-broker-dev
+cd romm-broker
 docker run --rm -it \
   -e BROKER_DEV_MODE=true \
   -e PUID=1000 -e PGID=1000 \
@@ -187,6 +188,30 @@ written to `BROKER_EXPORT_DIR` and the exit report's `upload` object is
 `mode: "report-only"` with what would have been sent. Outside dev mode a
 failed upload also writes the archive there so nothing is lost. The summary
 is posted to the room chat before the room is torn down.
+
+### Save archive transfer
+
+Activate's `save.archive` is a container path, but the parent is a separate
+service holding bytes, so archives move over these endpoints in both
+directions.
+
+```
+PUT    /streaming/api/session/imports/{name}.zip   body: raw zip
+GET    /streaming/api/session/exports
+GET    /streaming/api/session/exports/{name}.zip
+DELETE /streaming/api/session/exports/{name}.zip
+```
+
+All four take `X-Broker-Secret`. The upload returns
+`{"status": "stored", "name": ..., "path": ..., "size": ...}`; feed that
+`path` back as `save.archive` on activate. Names must be a bare `.zip`
+basename, the body must start with the zip magic, and the size ceiling is the
+same 256 MB the dump uses.
+
+Pulling covers the two cases the exit push cannot: dev mode, where the upload
+is disabled and the archive only ever lands on disk, and a failed upload,
+where the archive on disk is the only remaining copy of the save data. Delete
+each archive once the parent has stored it.
 
 ### Status
 

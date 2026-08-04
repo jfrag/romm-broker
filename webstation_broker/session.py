@@ -6,6 +6,7 @@ state are module globals.
 
 import asyncio
 import logging
+import re
 import secrets
 import time
 from typing import Optional
@@ -31,10 +32,21 @@ SESSION: Optional[dict] = None
 ROOM: dict = {"controller": None, "viewers": {}}
 
 
+def _session_id(raw) -> str:
+    """A caller-supplied id, reduced to what is safe in the export filename.
+
+    The exit archive is named after the session, and the export routes reject
+    anything with path structure in it, so an id carrying a slash or a dot
+    would produce an archive the parent could never fetch back.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(raw or ""))[:64]
+    return cleaned or secrets.token_hex(8)
+
+
 def new_session(payload: dict, emulator_obj, rom_file: str) -> dict:
     global SESSION
     SESSION = {
-        "id": payload.get("session_id") or secrets.token_hex(8),
+        "id": _session_id(payload.get("session_id")),
         "active": True,
         "created_at": time.time(),
         "user": payload.get("user") or {},

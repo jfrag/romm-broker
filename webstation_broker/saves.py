@@ -174,3 +174,17 @@ def write_export(zip_bytes: bytes, name: str) -> str:
     path = settings.EXPORT_DIR / name
     path.write_bytes(zip_bytes)
     return str(path)
+
+
+def write_import(zip_bytes: bytes, name: str) -> str:
+    """Persist an archive the parent uploaded for restore; returns the path.
+
+    Written through a temp file and renamed so a half-received upload can
+    never be handed to activate as a restore source.
+    """
+    settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    path = settings.IMPORT_DIR / name
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(zip_bytes)
+    tmp.replace(path)
+    return str(path)

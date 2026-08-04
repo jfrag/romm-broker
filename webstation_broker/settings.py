@@ -32,6 +32,10 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 # when the upload to the callback origin fails).
 EXPORT_DIR = Path(os.environ.get("BROKER_EXPORT_DIR", "/config/broker-exports"))
 
+# Where the parent uploads save archives it wants restored; activate's
+# save.archive path points into here.
+IMPORT_DIR = Path(os.environ.get("BROKER_IMPORT_DIR", "/config/broker-imports"))
+
 # Exit upload target: this path is appended to the callback base URL (the
 # parent origin derived at activate unless the payload supplies one).
 SAVE_UPLOAD_PATH = os.environ.get("BROKER_SAVE_UPLOAD_PATH", "/api/webstation/saves")

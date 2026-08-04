@@ -11,6 +11,7 @@ from typing import Optional
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from . import callback, saves, selkies, session, settings
@@ -344,6 +345,97 @@ async def status():
             for v in sess.get("viewers", [])
         ],
     }
+
+
+def _archive_name(name: str) -> str:
+    """A safe zip basename, or 400. Rejects anything with path structure."""
+    safe = Path(name).name
+    if safe != name or not safe.endswith(".zip") or safe.startswith("."):
+        raise HTTPException(status_code=400, detail="invalid archive name")
+    return safe
+
+
+def _export_file(name: str) -> Path:
+    """Resolve an archive name to a file inside EXPORT_DIR."""
+    candidate = (settings.EXPORT_DIR / _archive_name(name)).resolve()
+    if candidate.parent != settings.EXPORT_DIR.resolve():
+        raise HTTPException(status_code=400, detail="invalid export name")
+    if not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"no such export: {name}")
+    return candidate
+
+
+@router.put("/api/session/imports/{name}")
+async def upload_import(
+    name: str, request: Request, x_broker_secret: Optional[str] = Header(default=None)
+):
+    """Take a save archive from the parent and return the path activate wants.
+
+    Activate's save.archive is a container path, but the parent is a separate
+    service with only bytes, so it uploads here first and passes back the
+    path this returns. Body is the raw zip, matching the exit download.
+    """
+    _check_secret(x_broker_secret)
+    safe = _archive_name(name)
+
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > saves.SAVE_FILE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="archive too large")
+        chunks.append(chunk)
+    content = b"".join(chunks)
+    if not content.startswith(b"PK"):
+        raise HTTPException(status_code=422, detail="archive is not a zip")
+
+    path = await anyio.to_thread.run_sync(saves.write_import, content, safe)
+    log.info("import stored: %s (%d bytes)", safe, total)
+    return {"status": "stored", "name": safe, "path": path, "size": total}
+
+
+@router.get("/api/session/exports")
+async def list_exports(x_broker_secret: Optional[str] = Header(default=None)):
+    """Save archives sitting on disk, newest first."""
+    _check_secret(x_broker_secret)
+    if not settings.EXPORT_DIR.is_dir():
+        return {"exports": []}
+    items = []
+    for p in settings.EXPORT_DIR.glob("*.zip"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        items.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
+    items.sort(key=lambda i: i["mtime"], reverse=True)
+    return {"exports": items}
+
+
+@router.get("/api/session/exports/{name}")
+async def download_export(
+    name: str, x_broker_secret: Optional[str] = Header(default=None)
+):
+    """Hand an archive to the parent on request.
+
+    Pulling covers the two cases the exit push cannot: dev mode, where the
+    upload is disabled and the archive only ever lands here, and a failed
+    upload, where it is the sole remaining copy of the save data.
+    """
+    _check_secret(x_broker_secret)
+    path = _export_file(name)
+    return FileResponse(path, media_type="application/zip", filename=path.name)
+
+
+@router.delete("/api/session/exports/{name}")
+async def delete_export(
+    name: str, x_broker_secret: Optional[str] = Header(default=None)
+):
+    """Drop an archive once the parent has stored it."""
+    _check_secret(x_broker_secret)
+    path = _export_file(name)
+    await anyio.to_thread.run_sync(path.unlink)
+    log.info("export collected and removed: %s", path.name)
+    return {"status": "deleted", "name": path.name}
 
 
 @router.get("/api/session/context")

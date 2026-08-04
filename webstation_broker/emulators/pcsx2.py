@@ -71,18 +71,86 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
     return min(ranked)[4]
 
 
+# Selkies exposes the browser gamepad as an SDL device, but PCSX2 only maps a
+# controller through its setup wizard, which never runs here, so Pad1 would
+# stay on the keyboard-only defaults.
+_PAD1_SDL_BINDINGS = (
+    ("Up", "DPadUp"),
+    ("Right", "DPadRight"),
+    ("Down", "DPadDown"),
+    ("Left", "DPadLeft"),
+    ("Triangle", "FaceNorth"),
+    ("Circle", "FaceEast"),
+    ("Cross", "FaceSouth"),
+    ("Square", "FaceWest"),
+    ("Select", "Back"),
+    ("Start", "Start"),
+    ("L1", "LeftShoulder"),
+    ("L2", "+LeftTrigger"),
+    ("R1", "RightShoulder"),
+    ("R2", "+RightTrigger"),
+    ("L3", "LeftStick"),
+    ("R3", "RightStick"),
+    ("LUp", "-LeftY"),
+    ("LRight", "+LeftX"),
+    ("LDown", "+LeftY"),
+    ("LLeft", "-LeftX"),
+    ("RUp", "-RightY"),
+    ("RRight", "+RightX"),
+    ("RDown", "+RightY"),
+    ("RLeft", "-RightX"),
+    ("Analog", "Guide"),
+    ("LargeMotor", "LargeMotor"),
+    ("SmallMotor", "SmallMotor"),
+)
+
+
+def _ensure_sdl_pad(lines: list[str]) -> list[str]:
+    """Bind Pad1 to the virtual SDL pad, once. Repeated keys are how PCSX2
+    itself stores a second binding per action, so the keyboard defaults keep
+    working alongside the gamepad. Skipped when Pad1 already names an SDL
+    device, so a player's own remapping survives the next launch."""
+    bindings = [f"{action} = SDL-0/{binding}" for action, binding in _PAD1_SDL_BINDINGS]
+    start = None
+    end = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        if stripped == "[Pad1]":
+            start = i
+        elif start is not None:
+            end = i
+            break
+    if start is None:
+        return lines + ["", "[Pad1]", "Type = DualShock2"] + bindings
+    if any("SDL-0/" in ln for ln in lines[start:end]):
+        return lines
+    insert = end
+    while insert > start + 1 and not lines[insert - 1].strip():
+        insert -= 1
+    return lines[:insert] + bindings + lines[insert:]
+
+
 def _patch_ini() -> None:
-    """Force broker-required PCSX2.ini settings before every launch."""
-    if not INI_PATH.exists():
-        log.warning("PCSX2.ini not found at %s, skipping patch", INI_PATH)
-        return
+    """Force broker-required PCSX2.ini settings before every launch.
+
+    On a fresh container the file does not exist yet: PCSX2 writes it during
+    its own first start, by which point it is already sitting on the setup
+    wizard with PINE off. Seeding an empty file here means the patch below
+    creates the sections it needs, so the very first launch boots the disc."""
     patches: dict[tuple[str, str], str] = {
         ("EmuCore", "EnablePINE"): "EnablePINE = true",
         ("UI", "StartFullscreen"): "StartFullscreen = true",
         ("UI", "ConfirmShutdown"): "ConfirmShutdown = false",
+        ("UI", "SetupWizardIncomplete"): "SetupWizardIncomplete = false",
         ("EmuCore", "SaveStateOnShutdown"): "SaveStateOnShutdown = false",
     }
     try:
+        if not INI_PATH.exists():
+            log.info("PCSX2.ini not found at %s, seeding one", INI_PATH)
+            INI_PATH.parent.mkdir(parents=True, exist_ok=True)
+            INI_PATH.write_text("[UI]\nSettingsVersion = 1\n")
         lines = INI_PATH.read_text().splitlines()
         section = ""
         applied: set[tuple[str, str]] = set()
@@ -124,6 +192,7 @@ def _patch_ini() -> None:
                 else:
                     new_lines.extend(["", f"[{sec}]", val])
                     present.add(sec)
+        new_lines = _ensure_sdl_pad(new_lines)
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
