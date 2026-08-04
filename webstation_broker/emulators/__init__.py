@@ -2,10 +2,12 @@ from .base import Emulator
 from .desktop import Desktop
 from .eden import Eden
 from .pcsx2 import Pcsx2
+from .shadps4 import Shadps4
 
 REGISTRY: dict[str, type[Emulator]] = {
     "pcsx2": Pcsx2,
     "eden": Eden,
+    "shadps4": Shadps4,
     "desktop": Desktop,
 }
 

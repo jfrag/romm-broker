@@ -16,7 +16,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane (localhost:8083)
   saves.py               save archive restore on activate, delta dump on exit
-  emulators/             emulator launchers (pcsx2, eden, desktop)
+  emulators/             emulator launchers (pcsx2, eden, shadps4, desktop)
 frontend/                vite vanilla-JS room interface
 ```
 
@@ -29,7 +29,8 @@ frontend/                vite vanilla-JS room interface
   mouse/keyboard by dragging icons onto users.
 * Save data flows through zip archives scoped to the emulator's save subtrees
   (pcsx2: `memcards/`, `sstates/`; eden: `nand/user/save/` 
-  `nand/system/save/8000000000000010/`. Activate restores an archive without
+  `nand/system/save/8000000000000010/`; shadps4: `home/1000/savedata/`).
+  Activate restores an archive without
   rolling back newer files; exit zips everything modified since launch and
   uploads it to the callback origin. In dev mode nothing is uploaded the
   archive is written under `/config/broker-exports/` and the exit report says
@@ -101,6 +102,19 @@ no save states: `resume_slot` is ignored, and exit performs a graceful
 shutdown followed by a save delta dump the game's own save data under the emulated NAND is the
 persistence. `EDEN_STOP_WAIT` (default 15 s) controls how long the graceful
 stop gets before SIGKILL.
+
+`emulator: "shadps4"` launches the shadPS4 PlayStation 4 emulator. shadPS4
+has no save states either (`resume_slot` is ignored); the game's save data
+under `home/1000/savedata/` is the persistence. The binary is picked from
+`$HOME/.local/share/shadPS4QtLauncher/versions`: the `Pre-release/` build if
+present (it always trumps releases), otherwise the newest semver release
+folder (`vX.Y.Z - ... - <date>/`, each holding `Shadps4-sdl.AppImage`).
+Override the search with `SHADPS4_BIN` (explicit path), `SHADPS4_VERSIONS_DIR`,
+`SHADPS4_BIN_NAME`, or `SHADPS4_DATA_DIR`. The broker drives shadPS4 through
+its stdin IPC (`SHADPS4_ENABLE_IPC=true`): RUN/START boot the game headlessly,
+and exit sends STOP (the SDL quit event) for a graceful teardown before the
+save delta is dumped. shadPS4 has no SIGTERM handler, so SIGTERM is only the
+fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
 
 ### Launch a game with save data
 
