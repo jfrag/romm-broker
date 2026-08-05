@@ -19,6 +19,9 @@ webstation-broker = "webstation_broker.main:run"
 [tool.setuptools.packages.find]
 include = ["webstation_broker*"]
 
+[tool.setuptools.package-data]
+webstation_broker = ["**/*.json"]
+
 # Pinned explicitly so a new ruff release cannot turn master red on its own:
 # without a select the rule set is whatever that version defaults to.
 [tool.ruff]
