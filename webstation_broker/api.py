@@ -155,6 +155,7 @@ async def activate(
                 status_code=404, detail=f"save archive not found: {save.archive}"
             )
         content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+        await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
             saves.extract_save_archive, content, emulator.save_root, emulator.save_subtrees
         )

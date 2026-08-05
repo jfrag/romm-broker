@@ -13,7 +13,9 @@ from . import settings
 
 log = logging.getLogger(__name__)
 
-SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
+# Env-tunable: xemu's save artifact is a whole qcow2 disk image, which runs
+# far past a cap sized for memcards and state files.
+SAVE_FILE_MAX_BYTES = int(os.environ.get("SAVE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 # Zip stores mtimes at 2 s DOS resolution; slack keeps the newer-file guard
 # from skipping files over rounding alone.
 _SAVE_MTIME_SLACK = 2.0
