@@ -35,6 +35,7 @@ which merges stderr into stdout (that would corrupt the reply stream).
 """
 
 import io
+import json
 import logging
 import os
 import re
@@ -84,68 +85,24 @@ RESUME_LOAD_WAIT = float(os.environ.get("RETROARCH_RESUME_WAIT", "90.0"))
 RESUME_LOAD_SETTLE = float(os.environ.get("RETROARCH_RESUME_SETTLE", "3.0"))
 CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", "180"))
 
-# RomM platform slug -> libretro core. Extensions order doubles as the
-# preference order when a folder holds several candidates.
+# RomM platform slug -> libretro core, kept in retroarch_platforms.json next
+# to this module. Extensions order doubles as the preference order when a
+# folder holds several candidates.
 #
 # `savestate` is assumed true; only specialized cores opt out.
-PLATFORMS: dict[str, dict] = {
-    "ngc": {
-        "core": "dolphin",
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "wii": {
-        "core": "dolphin",
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "snes": {
-        "core": "snes9x",
-        "extensions": (".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"),
-    },
-    "n64": {
-        "core": "mupen64plus_next",
-        "extensions": (".n64", ".z64", ".v64", ".rom", ".ndd"),
-    },
-    "dc": {
-        "core": "flycast",
-        "extensions": (".gdi", ".cdi", ".chd", ".cue", ".m3u", ".iso", ".bin"),
-    },
-    "saturn": {
-        "core": "yabasanshiro",
-        "extensions": (".cue", ".chd", ".iso", ".bin", ".m3u", ".ccd", ".toc"),
-    },
-    "psp": {
-        "core": "ppsspp",
-        "extensions": (".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"),
-    },
-    "nds": {
-        "core": "melonds",
-        "extensions": (".nds", ".srl"),
-    },
-    "3ds": {
-        "core": "citra",
-        "extensions": (".3ds", ".cci", ".cxi", ".cia", ".3dsx", ".app", ".srl"),
-    },
-    "arcade": {
-        "core": "fbneo",
-        "extensions": (".zip", ".7z", ".chd"),
-    },
-    "genesis": {
-        "core": "genesis_plus_gx",
-        "extensions": (".md", ".gen", ".smd", ".bin", ".sg", ".sms", ".gg", ".cue"),
-    },
-}
+_PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
+
+
+def _load_platforms() -> dict[str, dict]:
+    platforms = json.loads(_PLATFORMS_FILE.read_text())
+    for info in platforms.values():
+        info["extensions"] = tuple(info["extensions"])
+        if "save_subtrees" in info:
+            info["save_subtrees"] = tuple(info["save_subtrees"])
+    return platforms
+
+
+PLATFORMS: dict[str, dict] = _load_platforms()
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _ADDON_RE = re.compile(
