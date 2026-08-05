@@ -58,6 +58,18 @@ frontend/                vite vanilla-JS room interface
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
 | `BROKER_DEV_MODE` | unset | run from mounted source with uvicorn/vite hot reload; also disables the exit save upload (report-only) |
 
+## Deployment
+
+The container is meant to be served from a subfolder of the parent's origin, so
+the parent's player can see pointer events inside the stream iframe. Point a
+reverse proxy rule at the container's web port and set `SUBFOLDER` to the same
+path it is mounted at. The proxy must pass the prefix through rather than strip
+it, and must forward websocket upgrades.
+
+See [docs/reverse-proxy.md](docs/reverse-proxy.md) for the RomM config keys,
+recipes for Zoraxy, nginx, Caddy and Traefik, how to verify a mount, and what
+running more than one container takes.
+
 ## Dev mode
 
 ```

@@ -1,0 +1,169 @@
+# Serving the container from RomM's origin
+
+The room UI iframes the selkies stream, and RomM in turn iframes the room. When
+that outer iframe is cross origin, the browser stops delivering pointer events
+to the parent document the moment the cursor enters it. RomM's player cannot
+see the mouse at all, so it has to overlay a strip of its own along the bottom
+edge to raise its control bar, and that strip sits on top of the container's own
+taskbar.
+
+Serving the container from a subfolder of RomM's origin fixes that: the player
+attaches listeners inside the frame, nothing overlays the stream, and the
+container's desktop is fully clickable.
+
+Nothing about this is proxied by RomM itself. A reverse proxy in front of both
+services maps a path on RomM's origin to the container, and the container is
+already built for it.
+
+## The contract
+
+Three rules, all of them load bearing.
+
+**`SUBFOLDER` must equal the mount path exactly, trailing slash included.** The
+app emits absolute asset paths (`/streaming/assets/...`) and builds its
+websocket URL from `window.location.host` plus that prefix. Set them to the
+same value and the whole thing follows the mount with no rewriting anywhere.
+
+**The proxy must pass the prefix through, not strip it.** This is the one that
+bites. Most proxies offer a strip-prefix mode and several make it the default.
+Stripping produces a page that loads and then 404s every asset it asks for.
+
+**The proxy must forward websocket upgrades.** The stream, the collab room, and
+the input channel are all websockets. Without the upgrade headers the room loads
+and then sits there dead.
+
+## Container side
+
+```
+SUBFOLDER=/streaming/
+```
+
+That is the whole container-side configuration. The container's own nginx serves
+the room UI, the broker API, and the selkies stream under that one prefix, so a
+single proxy rule covers all three. Port 3000 is HTTP, 3001 is HTTPS with a self
+signed certificate. Behind a proxy that terminates TLS already, target 3000 and
+save yourself the certificate exception.
+
+## RomM side
+
+In RomM's `config.yml`, a streaming container entry uses three keys for this:
+
+```yaml
+streaming:
+  containers:
+    - platform: ps2
+      # Where the browser goes. A path means "reverse proxied onto RomM's own
+      # origin", and the browser resolves it against whatever origin it is on.
+      host: /streaming
+      # Where RomM's backend goes, server to server. Required when host is a
+      # path, since a path carries no address RomM could call.
+      broker_host: http://10.0.1.56:3009
+      # The container's SUBFOLDER. RomM builds broker API paths under it.
+      subfolder: /streaming
+      broker_secret: "..."
+      protocol: webstation
+      emulator: pcsx2
+      library_path: /romm
+      label: WEBSTATION
+```
+
+`host` also still accepts a full URL (`https://webstation.example.com`), which
+is the cross origin deployment. Everything works there except the in frame
+pointer tracking, and RomM's player falls back to its edge strip automatically.
+
+Session identity is derived from `broker_host`, not `host`, so moving a
+container behind a proxy does not disturb a session it is already holding.
+
+## Proxy recipes
+
+### Zoraxy
+
+On the existing host entry for RomM, add a **Virtual Directory** rule:
+
+| Field | Value |
+| --- | --- |
+| Match | `/streaming` |
+| Target | `10.0.1.56:3009` |
+| Require TLS | off if targeting port 3000, on plus skip verification for 3001 |
+| Websocket | enabled |
+
+### nginx
+
+```nginx
+location /streaming/ {
+    proxy_pass http://10.0.1.56:3009;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+}
+```
+
+`proxy_pass` deliberately has no path component. Adding even a bare `/` makes
+nginx strip `/streaming/` before forwarding, which breaks every asset.
+`proxy_buffering off` matters for the stream, and the long read timeout keeps an
+idle session's websocket from being culled mid game.
+
+### Caddy
+
+```caddyfile
+handle /streaming/* {
+    reverse_proxy 10.0.1.56:3009
+}
+```
+
+Use `handle`, never `handle_path`. `handle_path` strips the matched prefix,
+which is the same failure as the nginx one above. Caddy forwards websocket
+upgrades on its own, so there is nothing to add for those.
+
+### Traefik
+
+```yaml
+labels:
+  - "traefik.http.routers.streaming.rule=Host(`romm.example.com`) && PathPrefix(`/streaming`)"
+  - "traefik.http.services.streaming.loadbalancer.server.port=3000"
+```
+
+Do not attach a `stripPrefix` middleware.
+
+## Verifying
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' https://romm.example.com/streaming/
+```
+
+Expect `200`. Then fetch the page body and confirm the asset paths it references
+still carry the prefix:
+
+```bash
+curl -sS https://romm.example.com/streaming/ | grep -o 'src="[^"]*"'
+```
+
+Every `src` should start with `/streaming/`. If they start with `/` alone, the
+container's `SUBFOLDER` is not set. If they look right but return 404 when
+fetched, the proxy is stripping the prefix.
+
+Last, confirm the broker answers through the same rule:
+
+```bash
+curl -sS https://romm.example.com/streaming/api/health
+```
+
+## Running more than one container
+
+The mount path is per container. The app bakes its prefix into asset URLs at
+startup, so there is no wildcard shortcut and no way to share one rule across a
+pool. Each container needs its own `SUBFOLDER` (`/streaming/`, `/streaming-2/`),
+its own proxy rule, and its own `config.yml` entry with the matching `host` and
+`subfolder`.
+
+## What same origin costs you
+
+RomM's session cookie is scoped to its origin, so once the container lives at a
+path under that origin the cookie is sent to the container on every request for
+`/streaming/*`. The container has no use for it and does not read it, but it does
+cross the boundary. On a LAN deployment where the container is already trusted
+enough to be handed the ROM library this is not a meaningful change. It is worth
+knowing before pointing this at anything you do not control.
