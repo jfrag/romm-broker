@@ -312,7 +312,7 @@ async def _do_exit(save_slot: int) -> dict:
     # empties; selkies errors on connected clients whose token vanished.
     await anyio.sleep(1.5)
     await selkies.clear_tokens()
-    session.clear_session()
+    session.retire_session()
     log.info("exit report: %s", report)
     return report
 
@@ -346,6 +346,22 @@ def _state_emulator():
     if not emulator.alive():
         raise HTTPException(status_code=409, detail="emulator is not running")
     return emulator
+
+
+def _readable_emulator():
+    """The emulator whose state files can be read right now.
+
+    The live session's while one is up, otherwise the one that just exited.
+    Reading a state needs the file on disk and the emulator's naming rules, not
+    a running process, and the exit state is the one RomM comes back for.
+    """
+    sess = session.SESSION
+    if sess is not None and sess.get("active"):
+        return sess["emulator_obj"]
+    retired = session.LAST_EXIT
+    if retired is None:
+        raise HTTPException(status_code=409, detail="no session to read a state from")
+    return retired["emulator_obj"]
 
 
 @router.post("/api/session/save-state")
@@ -388,10 +404,11 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)):
 
     The slot is the emulator's own, not the caller's: `slot` is accepted for
     symmetry with the per-emulator brokers and ignored the same way the save
-    routes ignore it. Only served while a session is up, since after exit the
-    state has already left inside the save archive."""
+    routes ignore it. Served after exit as well as during the session, because
+    the state exit captures is exactly the one RomM comes back for once the
+    teardown has answered."""
     _check_secret(x_broker_secret)
-    emulator = _state_emulator()
+    emulator = _readable_emulator()
     path = await anyio.to_thread.run_sync(emulator.state_path)
     if path is None:
         raise HTTPException(status_code=404, detail="no state file for slot")
@@ -419,9 +436,10 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
     Only for emulators that write the thumbnail as its own file; the ones that
     embed it in the state answer 404, which is the caller's cue to read the
     frame out of the state it already fetched. `slot` is accepted and ignored
-    the same way the state-file routes ignore it."""
+    the same way the state-file routes ignore it, and like the state itself the
+    frame stays readable after exit."""
     _check_secret(x_broker_secret)
-    emulator = _state_emulator()
+    emulator = _readable_emulator()
     path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
     if path is None:
         raise HTTPException(status_code=404, detail="no state screenshot for slot")

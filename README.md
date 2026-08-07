@@ -258,10 +258,14 @@ reports the name it landed under. What is checked is identity, the PCSX2 serial
 or the RetroArch content basename, so a state for another game or another
 directory is still a `400` rather than a stray file in the save tree.
 
-Both are session-scoped and return `409` once the session is gone. After exit
-the state has already left in the save archive the exit dumps, so there is
-nothing left to pull. `413` on either side means the file is over
-`BROKER_STATE_FILE_MAX_BYTES` (256 MiB); RomM caps the same transfer, so
+The PUT needs a live session and returns `409` without one, since a state is
+only pushed in so a running emulator can reach it. The GET outlives the session:
+exit captures a state on its way out, and RomM can only come back for it once
+the teardown has answered, so refusing there was what left every exit state
+stranded in the container. The broker holds the exited session's state until the
+next activate clears the working slot, and answers `409` before the first
+session and `404` once the slot is empty. `413` on either side means the file is
+over `BROKER_STATE_FILE_MAX_BYTES` (256 MiB); RomM caps the same transfer, so
 raising one end alone only moves which end refuses.
 
 ### Fetch the frame a state was taken at
@@ -275,8 +279,9 @@ This is what gives a stored state its thumbnail in RomM's resume picker. Only
 emulators that write the frame as its own file answer it: RetroArch saves a
 `<state file>.png` beside every state, so it serves that. PCSX2 embeds the frame
 inside the `.p2s` and returns `404`, which is the caller's cue to read it out of
-the state it already fetched rather than an error. Same session scoping as the
-state-file routes, with `413` over `BROKER_STATE_SCREENSHOT_MAX_BYTES` (16 MiB).
+the state it already fetched rather than an error. It stays readable after exit
+on the same terms as the state itself, with `413` over
+`BROKER_STATE_SCREENSHOT_MAX_BYTES` (16 MiB).
 
 ### Exit
 
