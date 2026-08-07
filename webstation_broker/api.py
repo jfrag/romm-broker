@@ -519,8 +519,8 @@ async def put_state_file(
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 
 
-def _memory_card(name: str) -> Path:
-    """The card the named emulator syncs, whether or not it exists yet.
+def _memory_card(name: str) -> tuple[Path, Optional[str]]:
+    """The card the named emulator syncs, and the marker file it needs inside.
 
     Named rather than read off the session, because the card is container
     state, not session state: RomM lays one down before activate, when there is
@@ -534,7 +534,7 @@ def _memory_card(name: str) -> Path:
             status_code=400,
             detail=f"{emulator.display_name} has no memory card to sync",
         )
-    return card
+    return card, emulator.memory_card_marker
 
 
 @router.get("/api/session/memory-card")
@@ -550,13 +550,13 @@ async def get_memory_card(
     managed to read would be destroyed on the next claim.
     """
     _check_secret(x_broker_secret)
-    card = _memory_card(emulator)
+    card, marker = _memory_card(emulator)
     # Contention means a card operation is already in flight, and the caller
     # should come back rather than queue behind it.
     if not memcard.LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a memory card operation is in progress")
     try:
-        result = await anyio.to_thread.run_sync(memcard.build_archive, card)
+        result = await anyio.to_thread.run_sync(memcard.build_archive, card, marker)
     finally:
         memcard.LOCK.release()
     if isinstance(result, str):
@@ -589,7 +589,7 @@ async def put_memory_card(
     with nothing running.
     """
     _check_secret(x_broker_secret)
-    card = _memory_card(emulator)
+    card, marker = _memory_card(emulator)
     content = bytearray()
     async for chunk in request.stream():
         content.extend(chunk)
@@ -607,7 +607,9 @@ async def put_memory_card(
                 status_code=409,
                 detail="cannot replace the memory card while a session is active",
             )
-        result = await anyio.to_thread.run_sync(memcard.replace, card, bytes(content))
+        result = await anyio.to_thread.run_sync(
+            memcard.replace, card, bytes(content), marker
+        )
     finally:
         memcard.LOCK.release()
     if isinstance(result, str):

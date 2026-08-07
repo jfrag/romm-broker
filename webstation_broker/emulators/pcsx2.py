@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from threading import Thread
 
+from .. import memcard
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
@@ -29,6 +30,10 @@ MEMCARD_DIR = Path("/config/.config/PCSX2/memcards")
 # by what it finds at the path, so this is a directory and the name carries no
 # .ps2 extension, to keep it from reading as one of PCSX2's own file cards.
 SLOT1_CARD_NAME = os.environ.get("PCSX2_SLOT1_CARD", "romm-slot1")
+# PCSX2 only counts a directory as a folder card once this file is inside it,
+# and skips the directory entirely otherwise, which leaves the slot reading as
+# missing with nowhere for the game to save.
+SLOT1_MARKER = "_pcsx2_superblock"
 
 PINE_WAIT = float(os.environ.get("PINE_WAIT", "20.0"))
 RESUME_LOAD_WAIT = float(os.environ.get("RESUME_LOAD_WAIT", "90.0"))
@@ -348,6 +353,7 @@ class Pcsx2(Emulator):
     save_root = Path("/config/.config/PCSX2")
     save_subtrees = ("memcards", "sstates")
     memory_card_subtree = "memcards"
+    memory_card_marker = SLOT1_MARKER
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
@@ -375,17 +381,14 @@ class Pcsx2(Emulator):
         return MEMCARD_DIR / SLOT1_CARD_NAME
 
     def _ensure_folder_card(self) -> None:
-        """Have a directory waiting at the Slot-1 card path before PCSX2 opens it.
+        """Have a folder card waiting at the Slot-1 path before PCSX2 opens it.
 
         A path that is not there is what makes PCSX2 write itself a fresh 8 MB
         file card, and a file card cannot be shipped or replaced as an image,
         so the whole-card routes would refuse the container from then on."""
         card = MEMCARD_DIR / SLOT1_CARD_NAME
-        if card.is_dir():
-            return
         try:
-            card.mkdir(parents=True, exist_ok=True)
-            log.info("created slot 1 folder card at %s", card)
+            memcard.ensure_card(card, SLOT1_MARKER)
         except OSError as exc:
             log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
 

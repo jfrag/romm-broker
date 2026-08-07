@@ -56,6 +56,11 @@ class Emulator:
     # routes instead of inside the save archive, so activate drops it from the
     # restore and exit drops it from the dump.
     memory_card_subtree: str | None = None
+    # A file the emulator looks for inside the card directory before it will
+    # treat that directory as a card at all. The broker lays it down empty, the
+    # way the emulator does when it creates a card itself; a card holding
+    # nothing but this is still an empty slot.
+    memory_card_marker: str | None = None
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None

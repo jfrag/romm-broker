@@ -31,7 +31,31 @@ def _card_files(card: Path) -> list[Path]:
     return [p for p in sorted(card.rglob("*")) if p.is_file() and not p.is_symlink()]
 
 
-def build_archive(card: Path) -> bytes | None | str:
+def _is_blank_marker(path: Path, card: Path, marker: str | None) -> bool:
+    """True for the marker file while it is still the empty one we laid down."""
+    if marker is None or path != card / marker:
+        return False
+    try:
+        return path.stat().st_size == 0
+    except OSError:
+        return False
+
+
+def ensure_card(card: Path, marker: str | None) -> None:
+    """Have a card the emulator will actually open waiting at `card`.
+
+    A bare directory is not enough. PCSX2 skips any directory in its memcards
+    folder that carries no marker file, so the slot reads as missing and the
+    game has nowhere to save. The marker goes down empty, which is exactly what
+    PCSX2 writes when it creates a folder card, and stays empty until the card
+    is formatted.
+    """
+    card.mkdir(parents=True, exist_ok=True)
+    if marker:
+        (card / marker).touch(exist_ok=True)
+
+
+def build_archive(card: Path, marker: str | None = None) -> bytes | None | str:
     """Zip the whole card at `card`, members relative to the card root.
 
     Relative so the image carries no trace of the card's name and can be laid
@@ -43,11 +67,11 @@ def build_archive(card: Path) -> bytes | None | str:
     if not card.is_dir():
         return None
     files = _card_files(card)
-    if not files:
-        # The directory exists because the broker created it, not because the
-        # emulator ever formatted a card into it. Reporting that as a card
-        # would have RomM storing an empty image and prompting the user to
-        # import it; an empty slot is what it actually is.
+    if all(_is_blank_marker(p, card, marker) for p in files):
+        # Nothing here but the scaffolding the broker put down, so the emulator
+        # never formatted a card into it. Reporting that as a card would have
+        # RomM storing an empty image and prompting the user to import it; an
+        # empty slot is what it actually is.
         return None
     total = 0
     for p in files:
@@ -68,7 +92,7 @@ def build_archive(card: Path) -> bytes | None | str:
     return buf.getvalue()
 
 
-def replace(card: Path, content: bytes) -> int | str:
+def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
     """Wipe the card at `card` and lay the pulled image down in its place.
 
     The whole card is replaced with no per-file merge: that is what isolates
@@ -99,6 +123,11 @@ def replace(card: Path, content: bytes) -> int | str:
         written = 0
         try:
             staging.mkdir(parents=True)
+            # Down before the members so the card is openable the instant it is
+            # swapped in, and so a wipe leaves a card rather than a directory
+            # the emulator ignores. An image carrying its own marker wins.
+            if marker:
+                (staging / marker).touch()
             for info in infos:
                 target = staging / PurePosixPath(info.filename)
                 target.parent.mkdir(parents=True, exist_ok=True)
