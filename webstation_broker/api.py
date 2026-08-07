@@ -5,6 +5,7 @@ BROKER_SECRET is set."""
 
 import hmac
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -12,7 +13,7 @@ from typing import Optional
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from . import callback, saves, selkies, session, settings
 from .emulators import get_emulator
@@ -41,6 +42,13 @@ class CallbackIn(BaseModel):
 class JoinIn(BaseModel):
     user: Optional[dict] = None
     permission: str = "participant"
+
+
+class StateIn(BaseModel):
+    # RomM is the library of states, so the emulator works in a single slot and
+    # resolves whatever is asked for to it. The bound is kept only to reject
+    # obvious garbage, and 0 is the other brokers' "use your default slot".
+    slot: int = Field(default=0, ge=0, le=10)
 
 
 class ActivateIn(BaseModel):
@@ -145,7 +153,9 @@ async def activate(
                 },
             )
 
-    # Restore save data before the emulator boots.
+    # Restore save data before the emulator boots. The working slot is emptied
+    # first so the restore, not the previous session, decides what is in it.
+    await anyio.to_thread.run_sync(emulator.clear_working_slot)
     restore_report = None
     save = body.save
     if save and save.archive and emulator.save_subtrees:
@@ -236,9 +246,7 @@ async def _do_exit(save_slot: int) -> dict:
     archive_path = None
     if settings.DEV_MODE:
         if dump.get("zip_bytes"):
-            archive_path = await anyio.to_thread.run_sync(
-                saves.write_export, dump["zip_bytes"], archive_name
-            )
+            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
         upload = {
             "mode": "report-only",
             "note": "dev mode: nothing was uploaded",
@@ -257,9 +265,7 @@ async def _do_exit(save_slot: int) -> dict:
         )
         if not upload["ok"]:
             # Keep the archive on disk so a failed push never loses save data.
-            archive_path = await anyio.to_thread.run_sync(
-                saves.write_export, dump["zip_bytes"], archive_name
-            )
+            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
             upload["archive_path"] = archive_path
 
     report = {
@@ -326,6 +332,156 @@ async def exit_session(
     return await _do_exit(slot)
 
 
+def _state_emulator():
+    """The running emulator, if it is in a position to take a state command."""
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    emulator = sess["emulator_obj"]
+    if not emulator.supports_states:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} has no save states",
+        )
+    if not emulator.alive():
+        raise HTTPException(status_code=409, detail="emulator is not running")
+    return emulator
+
+
+@router.post("/api/session/save-state")
+async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    saved = await anyio.to_thread.run_sync(emulator.save_state, body.slot)
+    slot = emulator.state_slot
+    log.info("save state slot %d: %s", slot, "ok" if saved else "failed")
+    return {"status": "saved" if saved else "failed", "slot": slot, "saved": saved}
+
+
+@router.post("/api/session/load-state")
+async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
+    slot = emulator.state_slot
+    log.info("load state slot %d: %s", slot, "ok" if loaded else "failed")
+    return {
+        "status": "loaded" if loaded else "failed",
+        "slot": slot,
+        "loaded": loaded,
+    }
+
+
+def _header_token(value: str, fallback: str) -> str:
+    """`value` reduced to something safe to put in a response header.
+
+    A Linux filename may hold CR, LF and any non-ASCII byte, all of which would
+    either split the response or fail the header encoder, so anything outside
+    printable ASCII is dropped rather than passed through."""
+    cleaned = "".join(c for c in value if 32 <= ord(c) < 127)
+    return cleaned or fallback
+
+
+@router.get("/api/session/state-file")
+async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)):
+    """Serve the working slot's state file so RomM can file it in the library.
+
+    The slot is the emulator's own, not the caller's: `slot` is accepted for
+    symmetry with the per-emulator brokers and ignored the same way the save
+    routes ignore it. Only served while a session is up, since after exit the
+    state has already left inside the save archive."""
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    path = await anyio.to_thread.run_sync(emulator.state_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="no state file for slot")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not read state file: {exc}")
+    if size > settings.STATE_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="state file exceeds size limit")
+    log.info("state-file: serving %s (%d bytes)", path.name, size)
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={
+            "X-State-Filename": _header_token(path.name, "state"),
+            "X-State-Slot": str(emulator.state_slot),
+        },
+    )
+
+
+@router.get("/api/session/state-screenshot")
+async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)):
+    """Serve the frame captured with the working slot's state.
+
+    Only for emulators that write the thumbnail as its own file; the ones that
+    embed it in the state answer 404, which is the caller's cue to read the
+    frame out of the state it already fetched. `slot` is accepted and ignored
+    the same way the state-file routes ignore it."""
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="no state screenshot for slot")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not read screenshot: {exc}")
+    if size > settings.STATE_SCREENSHOT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
+    log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
+    return FileResponse(path, media_type="image/png")
+
+
+@router.put("/api/session/state-file")
+async def put_state_file(
+    request: Request,
+    filename: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Write a state RomM is sending back into the working slot.
+
+    The name has to be one the running emulator could have written for the
+    loaded game, which is what state_target decides; anything else is refused
+    rather than dropped somewhere in the save tree under a name nothing reads.
+    The slot it was captured in does not have to match, since RomM holds the
+    library, so the reply reports the name it was filed under."""
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    name = Path(filename).name
+    target = emulator.state_target(name)
+    if target is None:
+        raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
+
+    tmp = target.with_name(f".{target.name}.tmp")
+    written = 0
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Streamed to disk rather than buffered: a state runs to hundreds of
+        # megabytes and holding one per request on the heap is the whole limit
+        # multiplied by however many callers are pushing at once.
+        with tmp.open("wb") as out:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > settings.STATE_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="state file exceeds size limit")
+                await anyio.to_thread.run_sync(out.write, chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="empty request body")
+        os.replace(tmp, target)
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"could not write state file: {exc}")
+
+    log.info("state-file: stored %s (%d bytes)", target.name, written)
+    return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
+
+
 @router.get("/api/session/status")
 async def status():
     sess = session.SESSION
@@ -338,6 +494,12 @@ async def status():
         "rom": sess.get("rom"),
         "rom_file": sess.get("rom_file"),
         "emulator_alive": sess["emulator_obj"].alive(),
+        # The emulator class is the authority on what it can do, so RomM reads
+        # this rather than keeping its own per-emulator table.
+        "supports_states": sess["emulator_obj"].supports_states,
+        # The slot every state route resolves to. There is only one because
+        # RomM holds the library of states.
+        "state_slot": sess["emulator_obj"].state_slot,
         "started_at": sess.get("created_at"),
         "user": sess.get("user"),
         "viewers": [

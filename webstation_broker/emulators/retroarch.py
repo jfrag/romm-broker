@@ -17,6 +17,8 @@ replies to *stdout*. Commands:
   SAVE_STATE           -> no reply; dispatches CMD_EVENT_SAVE_STATE from the
                           runloop (the save-state hotkey path)
   LOAD_STATE_SLOT <n>  -> bare echo "LOAD_STATE_SLOT <n>" (no success bit)
+  STATE_SLOT_PLUS      -> no reply; current slot +1
+  STATE_SLOT_MINUS     -> no reply; current slot -1, floored at -1 (auto)
   SAVE_FILES           -> "OK" / "NO" (newline-terminated)
   GET_STATUS           -> "GET_STATUS PLAYING <core_id>,<basename>\n"
                           or "GET_STATUS CONTENTLESS"
@@ -24,9 +26,21 @@ replies to *stdout*. Commands:
 
 Saves are confirmed on the filesystem instead of from a reply.
 
+Save slots: there is no "save to slot n" command. SAVE_STATE writes whichever
+slot is current, nothing reports which that is, and a `state_slot` in the
+appended config does not survive content load (verified on 1.22.2: pinning 10
+still wrote slot 0). None of that matters much here, because RomM keeps the
+library of states and this only ever works in STATE_SLOT. What RetroArch does
+have is that hard floor at -1, so counting MINUS presses down to it and PLUS
+presses back up parks the slot absolutely. That runs once per launch, and
+again only if a save lands somewhere else, which is the one thing that can
+happen: the player cycling slots with their own hotkeys.
+
 State file naming:
-  <content_basename>.state    slot 0
-  <content_basename>.state<n> slot n
+  <content_basename>.state      slot 0
+  <content_basename>.state<n>   slot n
+  <content_basename>.state.auto slot -1
+  Each save writes a <name>.png thumbnail beside the state file.
   SRAM: <content_basename>.srm under the savefile dir.
 
 Because stdout carries only command replies here, the child is spawned with
@@ -55,12 +69,33 @@ log = logging.getLogger(__name__)
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 
 XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
-# RetroArch's default Linux cores dir; dropping cores here is what makes the
-# desktop RetroArch "just work" without its in-app core downloader.
+RA_CONFIG_DIR = Path(os.environ.get("RETROARCH_CONFIG_DIR", str(Path.home() / ".config" / "retroarch")))
+
+
+def _configured_cores_dir() -> Path | None:
+    """`libretro_directory` from the user's RetroArch config."""
+    try:
+        text = (RA_CONFIG_DIR / "retroarch.cfg").read_text(errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "libretro_directory":
+            raw = value.strip().strip('"').strip()
+            if raw and raw != "default":
+                return Path(os.path.expanduser(raw))
+    return None
+
+
+# A core has to land in the dir RetroArch also reads .info files from. Loading
+# one from anywhere else leaves its core info unset, and GET_STATUS then
+# segfaults RetroArch mid-session (1.22.2). Following the user's own
+# libretro_directory is also what makes a downloaded core show up in the
+# desktop RetroArch without its in-app core downloader.
 CORES_DIR = Path(
-    os.environ.get(
-        "RETROARCH_CORES_DIR", str(Path(XDG_DATA_HOME) / "RetroArch" / "cores")
-    )
+    os.environ.get("RETROARCH_CORES_DIR")
+    or _configured_cores_dir()
+    or Path(XDG_DATA_HOME) / "RetroArch" / "cores"
 )
 # Buildbot ships every core as <core>_libretro.so.zip;
 CORES_BASE_URL = os.environ.get(
@@ -83,6 +118,14 @@ QUIT_WAIT = float(os.environ.get("RETROARCH_QUIT_WAIT", "10.0"))
 QUIT_CONFIRM_GAP = float(os.environ.get("RETROARCH_QUIT_CONFIRM_GAP", "0.1"))
 RESUME_LOAD_WAIT = float(os.environ.get("RETROARCH_RESUME_WAIT", "90.0"))
 RESUME_LOAD_SETTLE = float(os.environ.get("RETROARCH_RESUME_SETTLE", "3.0"))
+LOAD_ACK_WAIT = float(os.environ.get("RETROARCH_LOAD_ACK_WAIT", "10.0"))
+# The one slot the broker works in. 0 is RetroArch's own default, so a state
+# written here is also the one the player's own load hotkey reaches for.
+STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
+# Homing: the pause is what keeps RetroArch from dropping presses, and the
+# step count has to outrun any slot the player could have cycled to.
+SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
+SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", "180"))
 
 # RomM platform slug -> libretro core, kept in retroarch_platforms.json next
@@ -155,9 +198,6 @@ def _write_broker_cfg() -> Path:
         'stdin_cmd_enable = "true"\n'
         f'savestate_directory = "{STATE_DIR}"\n'
         f'savefile_directory = "{SAVE_DIR}"\n'
-        # SAVE_STATE saves to the current state_slot; pin it to the broker's
-        # slot so saves and resumes agree.
-        'state_slot = "10"\n'
         'savestate_auto_save = "false"\n'
         'savestate_auto_load = "false"\n'
         'savestate_auto_index = "false"\n'
@@ -170,6 +210,29 @@ def _write_broker_cfg() -> Path:
     tmp.write_text(cfg)
     os.replace(tmp, BROKER_CFG)
     return BROKER_CFG
+
+
+def _state_name(base: str, slot: int) -> str:
+    """RetroArch's state filename for a slot."""
+    if slot < 0:
+        return f"{base}.state.auto"
+    return base + (".state" if slot == 0 else f".state{slot}")
+
+
+_STATE_SUFFIX_RE = re.compile(r"\.state(?:\d{1,2}|\.auto)?$")
+
+
+def _is_state_name(filename: str, base: str) -> bool:
+    """Whether `filename` is a state RetroArch would write for `base`, in any
+    slot. Which slot does not matter: RomM keeps the library, so a stored state
+    carries whatever slot it was captured in and this broker files it into its
+    own. What does matter is the basename, since that is what says the state
+    belongs to the content currently loaded."""
+    return (
+        "/" not in filename
+        and filename.startswith(f"{base}.state")
+        and _STATE_SUFFIX_RE.search(filename) is not None
+    )
 
 
 def _state_snapshot(dir_path: Path, base: str) -> dict:
@@ -196,20 +259,20 @@ def _wait_for_state_file(
     before: dict, dir_path: Path, base: str, slot: int, timeout: float
 ) -> bool:
     """Poll until `slot`'s state file is rewritten and its size is stable,
-    which is the only reliable confirmation a save-state landed."""
+    which is the only reliable confirmation a save-state landed.
+
+    The name has to match `slot` exactly: accepting any state file would let a
+    save that landed on the wrong slot pass as a save of the requested one."""
     STABLE = 0.5
     POLL = 0.1
-    target_names = {
-        base + (".state" if slot <= 0 else f".state{slot}"),
-        base + ".state",
-    }
+    target_name = _state_name(base, slot)
     deadline = time.monotonic() + timeout
     last_size: int | None = None
     stable_since: float | None = None
     seen_change = False
     while time.monotonic() < deadline:
         after = _state_snapshot(dir_path, base)
-        targets = [p for p in after if p.name in target_names]
+        targets = [p for p in after if p.name == target_name]
         if not targets:
             time.sleep(POLL)
             continue
@@ -228,16 +291,26 @@ def _wait_for_state_file(
             log.info("retroarch: save state write complete: %s (%d bytes)", cur_path.name, last_size)
             return True
         time.sleep(POLL)
-    log.warning("retroarch: state file not confirmed on disk within %.1fs", timeout)
+    stray = sorted(
+        p.name
+        for p, meta in _state_snapshot(dir_path, base).items()
+        if not p.name.endswith(".png") and before.get(p) != meta
+    )
+    log.warning(
+        "retroarch: %s not confirmed on disk within %.1fs%s",
+        target_name,
+        timeout,
+        f"; {', '.join(stray)} changed instead" if stray else "",
+    )
     return False
 
 
 def _newest_state(dir_path: Path, base: str, slot: int) -> Path | None:
-    names = {base + (".state" if slot <= 0 else f".state{slot}"), base + ".state"}
+    name = _state_name(base, slot)
     best: tuple[float, Path] | None = None
     try:
         for p in dir_path.rglob(f"{base}.state*"):
-            if not p.is_file() or p.name not in names:
+            if not p.is_file() or p.name != name:
                 continue
             st = p.stat()
             if best is None or st.st_mtime > best[0]:
@@ -292,6 +365,9 @@ class Retroarch(Emulator):
     display_name = "RetroArch"
     save_root = RA_DATA_DIR
     log_path = RA_LOG_PATH
+    supports_states = True
+    state_slot = STATE_SLOT
+    state_dir = STATE_DIR
     # QUIT walks a graceful core teardown; give it room before SIGTERM.
     term_timeout = float(os.environ.get("RETROARCH_STOP_WAIT", "15"))
 
@@ -300,6 +376,7 @@ class Retroarch(Emulator):
         # Set from the activate payload's rom.platform before launch.
         self.platform: str | None = None
         self._rom_base: str = ""
+        self._slot_homed = False
         self._launch_seq = 0
         self._stdout_buf = bytearray()
         self._stdout_lock = threading.Lock()
@@ -445,6 +522,8 @@ class Retroarch(Emulator):
             raise RuntimeError(f"retroarch binary not found in PATH: {binary}")
 
         self._rom_base = rom_path.stem
+        # A fresh process starts on whatever slot the config left it on.
+        self._slot_homed = False
         self._launch_seq += 1
         seq = self._launch_seq
 
@@ -480,17 +559,15 @@ class Retroarch(Emulator):
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
                 time.sleep(RESUME_LOAD_SETTLE)
+                if not self.wait_for_state(deadline):
+                    log.warning("resume: slot %d never got a state file", slot)
+                    return
                 if self._launch_seq != seq:
                     return
-                ok = self._send(
-                    f"LOAD_STATE_SLOT {slot}",
-                    wait_prefix="LOAD_STATE_SLOT",
-                    timeout=RESUME_LOAD_WAIT,
-                )
                 log.info(
-                    "resume: requested load of slot %d (%s)",
+                    "resume: load of slot %d %s",
                     slot,
-                    "delivered" if ok is not None else "no reply",
+                    "delivered" if self.load_state(slot) else "failed",
                 )
                 return
             time.sleep(1.0)
@@ -498,12 +575,88 @@ class Retroarch(Emulator):
             "resume: retroarch never reported PLAYING, slot %d not loaded", slot
         )
 
-    def save_state(self, slot: int) -> bool:
+    def _home_state_slot(self) -> None:
+        """Park RetroArch's current state slot on STATE_SLOT.
+
+        Absolute, not relative: MINUS runs the slot down onto its -1 floor
+        first, so this holds no matter where the slot was."""
+        for _ in range(SLOT_HOME_STEPS):
+            self._send("STATE_SLOT_MINUS")
+            time.sleep(SLOT_STEP_DELAY)
+        for _ in range(STATE_SLOT + 1):
+            self._send("STATE_SLOT_PLUS")
+            time.sleep(SLOT_STEP_DELAY)
+        self._slot_homed = True
+
+    def _try_save(self) -> bool:
         before = _state_snapshot(STATE_DIR, self._rom_base)
         self._send("SAVE_STATE")
-        return _wait_for_state_file(
-            before, STATE_DIR, self._rom_base, slot, STATE_CONFIRM_WAIT
+        return _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT)
+
+    def save_state(self, slot: int) -> bool:
+        """`slot` is what RomM asked for and is ignored: this saves into
+        STATE_SLOT and the caller reads the effective slot back off state_slot.
+
+        Homing costs a couple of seconds, so it runs once per launch and then
+        only to recover: a save landing on another slot means the player moved
+        it with their own hotkeys, and re-homing puts the next one back."""
+        if not self.alive():
+            return False
+        if not self._slot_homed:
+            self._home_state_slot()
+        if self._try_save():
+            return True
+        if not self.alive():
+            return False
+        log.info("retroarch: save missed slot %d, re-homing and retrying", STATE_SLOT)
+        self._home_state_slot()
+        return self._try_save()
+
+    def load_state(self, slot: int) -> bool:
+        """LOAD_STATE_SLOT is absolute and does not move the current slot, so
+        this needs no homing. The echo carries no success bit and a load writes
+        nothing to disk, so an empty slot is ruled out here instead."""
+        if not self.alive():
+            return False
+        if self.state_path() is None:
+            log.warning("load state: slot %d holds no state file", STATE_SLOT)
+            return False
+        echo = self._send(
+            f"LOAD_STATE_SLOT {STATE_SLOT}",
+            wait_prefix="LOAD_STATE_SLOT",
+            timeout=LOAD_ACK_WAIT,
         )
+        if echo is None:
+            log.warning("load state: retroarch did not acknowledge slot %d", STATE_SLOT)
+            return False
+        return True
+
+    def state_path(self) -> Path | None:
+        if not self._rom_base:
+            return None
+        return _newest_state(STATE_DIR, self._rom_base, STATE_SLOT)
+
+    def state_screenshot_path(self) -> Path | None:
+        """RetroArch writes the thumbnail as `<state file>.png` beside the
+        state, so it is only meaningful next to the state it was taken with."""
+        state = self.state_path()
+        if state is None:
+            return None
+        shot = state.with_name(f"{state.name}.png")
+        return shot if shot.is_file() else None
+
+    def state_target(self, filename: str) -> Path | None:
+        """RetroArch looks a state up by the name it derives from the loaded
+        content, so the target is that name in this broker's slot and a pushed
+        one only has to say which content it belongs to."""
+        if not self._rom_base or not _is_state_name(filename, self._rom_base):
+            return None
+        existing = self.state_path()
+        # Cores that redirect states into their own subdir keep writing there,
+        # so a push has to land where the last save did, not at the top.
+        if existing is not None:
+            return existing
+        return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
 
     def save_and_exit(self, slot: int) -> dict:
         saved = False
@@ -513,14 +666,14 @@ class Retroarch(Emulator):
             if info is None or info.get("savestate", True):
                 saved = self.save_state(slot)
                 if saved:
-                    p = _newest_state(STATE_DIR, self._rom_base, slot)
+                    p = self.state_path()
                     if p is not None:
                         st = p.stat()
                         state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
             # Flush SRAM so the save dump ships current save data.
             self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
         self._quit()
-        return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
+        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
 
     def _quit(self) -> None:
         proc = self._proc

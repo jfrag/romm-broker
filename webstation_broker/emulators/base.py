@@ -36,6 +36,18 @@ class Emulator:
     save_root: Path = Path("/config")
     save_subtrees: tuple[str, ...] = ()
     rom_extensions: tuple[str, ...] = ()
+    # Whether the emulator can save and load state mid-session. Emulators whose
+    # only persistence is the game's own save data leave this off, so the state
+    # routes refuse instead of silently doing nothing.
+    supports_states: bool = False
+    # The one slot the broker saves into. RomM is the library of states: every
+    # save is pulled out of the container and every stored state is pushed back
+    # into this slot, so nothing here needs to address more than one. Requested
+    # slots resolve to it rather than being honoured, which is why the routes
+    # echo the effective slot back.
+    state_slot: int = 0
+    # Where that slot's file lives, for the state-file routes to read and write.
+    state_dir: Path = Path("/config")
     log_path: Path = Path("/config/broker-app.log")
     # Seconds SIGTERM gets before escalating to SIGKILL.
     term_timeout: float = 5.0
@@ -100,6 +112,64 @@ class Emulator:
 
     def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
         raise NotImplementedError
+
+    def save_state(self, slot: int) -> bool:
+        """Save the running game to `slot`. Only called when supports_states."""
+        raise NotImplementedError
+
+    def load_state(self, slot: int) -> bool:
+        """Load `slot` into the running game. Only called when supports_states."""
+        raise NotImplementedError
+
+    def state_path(self) -> Path | None:
+        """The file the working slot holds right now, or None if it is empty.
+
+        This is what the state-file GET serves, so it has to be the file the
+        emulator just wrote, not the newest state in the directory: another
+        slot or another game's state would otherwise be filed in RomM as this
+        save."""
+        return None
+
+    def state_screenshot_path(self) -> Path | None:
+        """The frame captured alongside the working slot's state, or None.
+
+        Only for emulators that write the thumbnail as a separate file. The
+        ones that embed it in the state itself return None and let RomM pull it
+        out of the state it already fetched."""
+        return None
+
+    def clear_working_slot(self) -> None:
+        """Drop whatever the working slot holds from an earlier session.
+
+        Called at activate, before the incoming save archive is restored, so
+        only the container's own leftovers go. Emulators that name a state
+        after the loaded content can tell a stale one apart on sight and leave
+        this alone; the override exists for the ones that cannot."""
+
+    def state_target(self, filename: str) -> Path | None:
+        """Where a pushed state called `filename` belongs, or None if the name
+        is not one this emulator would write for the loaded game.
+
+        Validating the name against the emulator's own convention is what keeps
+        a caller from dropping arbitrary files into the save tree. The slot in
+        it is not part of that test: RomM holds the library, so a stored state
+        carries whatever slot it was captured in and lands in this broker's own
+        working slot regardless."""
+        return None
+
+    def wait_for_state(self, deadline: float, poll: float = 0.5) -> bool:
+        """Block until the working slot holds a state file, or `deadline` passes.
+
+        A resume state can turn up after launch: the state-file routes only
+        answer while a session is up, so RomM pushes its pick once activate has
+        returned and the game is already booting. Waiting for it here is what
+        keeps a deferred resume load from firing on a slot that is still empty
+        and reporting a fresh start."""
+        while time.monotonic() < deadline:
+            if self.state_path() is not None:
+                return True
+            time.sleep(poll)
+        return self.state_path() is not None
 
     def save_and_exit(self, slot: int) -> dict:
         """Save state (best effort) and stop. Default: nothing to save."""
