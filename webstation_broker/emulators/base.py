@@ -51,6 +51,11 @@ class Emulator:
     log_path: Path = Path("/config/broker-app.log")
     # Seconds SIGTERM gets before escalating to SIGKILL.
     term_timeout: float = 5.0
+    # The save subtree holding the whole memory card, for emulators that have
+    # one. With whole-card sync on, that subtree travels on the memory-card
+    # routes instead of inside the save archive, so activate drops it from the
+    # restore and exit drops it from the dump.
+    memory_card_subtree: str | None = None
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
@@ -145,6 +150,14 @@ class Emulator:
         only the container's own leftovers go. Emulators that name a state
         after the loaded content can tell a stale one apart on sight and leave
         this alone; the override exists for the ones that cannot."""
+
+    def memory_card_path(self) -> Path | None:
+        """The directory holding the card the memory-card routes sync, or None.
+
+        The broker names the card rather than reading the name out of the
+        emulator's own config, because RomM lays a card down before the first
+        launch has written that config."""
+        return None
 
     def state_target(self, filename: str) -> Path | None:
         """Where a pushed state called `filename` belongs, or None if the name

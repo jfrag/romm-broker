@@ -24,6 +24,12 @@ PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
 # resolving their existing states.
 STATE_SLOT = int(os.environ.get("PCSX2_STATE_SLOT", "10"))
 
+MEMCARD_DIR = Path("/config/.config/PCSX2/memcards")
+# The Slot-1 card the broker owns. PCSX2 tells a folder card from a file card
+# by what it finds at the path, so this is a directory and the name carries no
+# .ps2 extension, to keep it from reading as one of PCSX2's own file cards.
+SLOT1_CARD_NAME = os.environ.get("PCSX2_SLOT1_CARD", "romm-slot1")
+
 PINE_WAIT = float(os.environ.get("PINE_WAIT", "20.0"))
 RESUME_LOAD_WAIT = float(os.environ.get("RESUME_LOAD_WAIT", "90.0"))
 RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "3.0"))
@@ -149,6 +155,8 @@ def _patch_ini() -> None:
         ("UI", "ConfirmShutdown"): "ConfirmShutdown = false",
         ("UI", "SetupWizardIncomplete"): "SetupWizardIncomplete = false",
         ("EmuCore", "SaveStateOnShutdown"): "SaveStateOnShutdown = false",
+        ("MemoryCards", "Slot1_Enable"): "Slot1_Enable = true",
+        ("MemoryCards", "Slot1_Filename"): f"Slot1_Filename = {SLOT1_CARD_NAME}",
     }
     try:
         if not INI_PATH.exists():
@@ -339,6 +347,7 @@ class Pcsx2(Emulator):
     display_name = "PCSX2"
     save_root = Path("/config/.config/PCSX2")
     save_subtrees = ("memcards", "sstates")
+    memory_card_subtree = "memcards"
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
@@ -362,9 +371,28 @@ class Pcsx2(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
+    def memory_card_path(self) -> Path | None:
+        return MEMCARD_DIR / SLOT1_CARD_NAME
+
+    def _ensure_folder_card(self) -> None:
+        """Have a directory waiting at the Slot-1 card path before PCSX2 opens it.
+
+        A path that is not there is what makes PCSX2 write itself a fresh 8 MB
+        file card, and a file card cannot be shipped or replaced as an image,
+        so the whole-card routes would refuse the container from then on."""
+        card = MEMCARD_DIR / SLOT1_CARD_NAME
+        if card.is_dir():
+            return
+        try:
+            card.mkdir(parents=True, exist_ok=True)
+            log.info("created slot 1 folder card at %s", card)
+        except OSError as exc:
+            log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
+
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
         _patch_ini()
+        self._ensure_folder_card()
         self._launch_seq += 1
         seq = self._launch_seq
 

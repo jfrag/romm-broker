@@ -12,10 +12,10 @@ from typing import Optional
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from . import callback, saves, selkies, session, settings
+from . import callback, memcard, saves, selkies, session, settings
 from .emulators import get_emulator
 
 log = logging.getLogger(__name__)
@@ -25,6 +25,10 @@ router = APIRouter()
 class SaveIn(BaseModel):
     archive: Optional[str] = None
     resume_slot: Optional[int] = None
+    # Set when the caller syncs the whole memory card on the memory-card
+    # routes. The card then travels as its own image, so it comes out of the
+    # archive on both the restore and the dump.
+    memory_card_synced: bool = False
 
 
 class RomIn(BaseModel):
@@ -101,6 +105,18 @@ def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict:
     }
 
 
+def _archive_subtrees(emulator, memory_card_synced: bool) -> tuple[str, ...]:
+    """The save subtrees this session ships in its archive.
+
+    With the whole card synced, leaving it in the archive too would have the
+    restore and the card hydrate writing over each other, and a stale card
+    inside an older archive would land on top of the one RomM just laid down.
+    """
+    if not memory_card_synced or emulator.memory_card_subtree is None:
+        return emulator.save_subtrees
+    return tuple(s for s in emulator.save_subtrees if s != emulator.memory_card_subtree)
+
+
 @router.get("/api/health")
 async def health():
     return {"status": "ok"}
@@ -158,7 +174,8 @@ async def activate(
     await anyio.to_thread.run_sync(emulator.clear_working_slot)
     restore_report = None
     save = body.save
-    if save and save.archive and emulator.save_subtrees:
+    subtrees = _archive_subtrees(emulator, bool(save and save.memory_card_synced))
+    if save and save.archive and subtrees:
         archive_path = Path(save.archive)
         if not archive_path.is_file():
             raise HTTPException(
@@ -167,7 +184,7 @@ async def activate(
         content = await anyio.to_thread.run_sync(archive_path.read_bytes)
         await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
-            saves.extract_save_archive, content, emulator.save_root, emulator.save_subtrees
+            saves.extract_save_archive, content, emulator.save_root, subtrees
         )
         if restore_report["error"]:
             raise HTTPException(
@@ -238,7 +255,9 @@ async def _do_exit(save_slot: int) -> dict:
     dump = await anyio.to_thread.run_sync(
         saves.build_save_archive,
         emulator.save_root,
-        emulator.save_subtrees,
+        _archive_subtrees(
+            emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
+        ),
         sess["save_baseline"],
     )
     cb = sess.get("callback")
@@ -498,6 +517,103 @@ async def put_state_file(
 
     log.info("state-file: stored %s (%d bytes)", target.name, written)
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
+
+
+def _memory_card(name: str) -> Path:
+    """The card the named emulator syncs, whether or not it exists yet.
+
+    Named rather than read off the session, because the card is container
+    state, not session state: RomM lays one down before activate, when there is
+    no session to resolve it through."""
+    emulator = get_emulator(name)
+    if emulator is None:
+        raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
+    card = emulator.memory_card_path()
+    if card is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} has no memory card to sync",
+        )
+    return card
+
+
+@router.get("/api/session/memory-card")
+async def get_memory_card(
+    emulator: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Serve the whole Slot-1 card so RomM can file it against the player.
+
+    A 404 carrying `X-Memory-Card: absent` is the broker confirming the slot is
+    empty, which is what tells RomM the card is safe to wipe. Every other
+    failure has to read as "could not be captured", or a card RomM never
+    managed to read would be destroyed on the next claim.
+    """
+    _check_secret(x_broker_secret)
+    card = _memory_card(emulator)
+    # Contention means a card operation is already in flight, and the caller
+    # should come back rather than queue behind it.
+    if not memcard.LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+    try:
+        result = await anyio.to_thread.run_sync(memcard.build_archive, card)
+    finally:
+        memcard.LOCK.release()
+    if isinstance(result, str):
+        raise HTTPException(status_code=409, detail=result)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no memory card in slot 1",
+            headers={"X-Memory-Card": "absent"},
+        )
+    log.info("memory-card: serving slot 1 (%d bytes)", len(result))
+    return Response(
+        content=result,
+        media_type="application/zip",
+        headers={"X-Memory-Card-Slot": "1"},
+    )
+
+
+@router.put("/api/session/memory-card")
+async def put_memory_card(
+    request: Request,
+    emulator: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Wipe Slot 1 and lay down the card RomM is sending.
+
+    Refused while a session is up: the emulator holds the card open for as long
+    as the game runs, and swapping it underneath corrupts it. RomM hydrates
+    before activate and evacuates after exit, so the card is only ever replaced
+    with nothing running.
+    """
+    _check_secret(x_broker_secret)
+    card = _memory_card(emulator)
+    content = bytearray()
+    async for chunk in request.stream():
+        content.extend(chunk)
+        if len(content) > saves.SAVE_FILE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="memory card exceeds size limit")
+    if not content:
+        raise HTTPException(status_code=400, detail="empty request body")
+
+    if not memcard.LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+    try:
+        sess = session.SESSION
+        if sess is not None and sess.get("active"):
+            raise HTTPException(
+                status_code=409,
+                detail="cannot replace the memory card while a session is active",
+            )
+        result = await anyio.to_thread.run_sync(memcard.replace, card, bytes(content))
+    finally:
+        memcard.LOCK.release()
+    if isinstance(result, str):
+        raise HTTPException(status_code=400, detail=result)
+    log.info("memory-card: replaced slot 1, %d file(s)", result)
+    return {"status": "ok", "written": result, "slot": 1}
 
 
 @router.get("/api/session/status")
