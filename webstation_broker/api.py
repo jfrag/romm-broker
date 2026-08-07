@@ -105,16 +105,22 @@ def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict:
     }
 
 
-def _archive_subtrees(emulator, memory_card_synced: bool) -> tuple[str, ...]:
-    """The save subtrees this session ships in its archive.
+def _archive_subtrees(
+    emulator, memory_card_synced: bool
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The save subtrees this session ships, and the ones it leaves alone.
 
     With the whole card synced, leaving it in the archive too would have the
     restore and the card hydrate writing over each other, and a stale card
     inside an older archive would land on top of the one RomM just laid down.
+    The excluded set is returned rather than simply dropped because archives
+    RomM took before the card was synced still carry it, and a restore has to
+    pass those members over instead of refusing the whole archive.
     """
     if not memory_card_synced or emulator.memory_card_subtree is None:
-        return emulator.save_subtrees
-    return tuple(s for s in emulator.save_subtrees if s != emulator.memory_card_subtree)
+        return emulator.save_subtrees, ()
+    card = emulator.memory_card_subtree
+    return tuple(s for s in emulator.save_subtrees if s != card), (card,)
 
 
 @router.get("/api/health")
@@ -174,7 +180,9 @@ async def activate(
     await anyio.to_thread.run_sync(emulator.clear_working_slot)
     restore_report = None
     save = body.save
-    subtrees = _archive_subtrees(emulator, bool(save and save.memory_card_synced))
+    subtrees, excluded = _archive_subtrees(
+        emulator, bool(save and save.memory_card_synced)
+    )
     if save and save.archive and subtrees:
         archive_path = Path(save.archive)
         if not archive_path.is_file():
@@ -184,7 +192,11 @@ async def activate(
         content = await anyio.to_thread.run_sync(archive_path.read_bytes)
         await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
-            saves.extract_save_archive, content, emulator.save_root, subtrees
+            saves.extract_save_archive,
+            content,
+            emulator.save_root,
+            subtrees,
+            excluded,
         )
         if restore_report["error"]:
             raise HTTPException(
@@ -252,12 +264,13 @@ async def _do_exit(save_slot: int) -> dict:
     emulator = sess["emulator_obj"]
     exit_report = await anyio.to_thread.run_sync(emulator.save_and_exit, save_slot)
 
+    dump_subtrees, _ = _archive_subtrees(
+        emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
+    )
     dump = await anyio.to_thread.run_sync(
         saves.build_save_archive,
         emulator.save_root,
-        _archive_subtrees(
-            emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
-        ),
+        dump_subtrees,
         sess["save_baseline"],
     )
     cb = sess.get("callback")

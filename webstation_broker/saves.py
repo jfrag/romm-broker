@@ -120,16 +120,30 @@ def build_save_archive(
     return report
 
 
+def _under(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
+    return any(member.as_posix().startswith(sub + "/") for sub in subtrees)
+
+
 def extract_save_archive(
-    content: bytes, root: Path, subtrees: tuple[str, ...]
+    content: bytes,
+    root: Path,
+    subtrees: tuple[str, ...],
+    excluded: tuple[str, ...] = (),
 ) -> dict:
     """Restore an archive into the emulator's data dir.
 
+    `excluded` names subtrees the emulator owns but this session syncs some
+    other way. Those members are dropped rather than refused: archives taken
+    before that sync was turned on still carry them, and restoring one would
+    undo what the other route just wrote. A member under neither is still a
+    hard error, since that is the guard against an archive writing outside the
+    save area.
+
     Existing files newer than their archive member are skipped so a restore
     can never roll back saves made since the archive was taken. Returns
-    {"written", "skipped", "failed", "error"}.
+    {"written", "skipped", "excluded", "failed", "error"}.
     """
-    result = {"written": 0, "skipped": 0, "failed": 0, "error": None}
+    result = {"written": 0, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
     except zipfile.BadZipFile:
@@ -140,16 +154,21 @@ def extract_save_archive(
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             result["error"] = "archive exceeds size limit when extracted"
             return result
+        wanted = []
         for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
                 result["error"] = f"archive member escapes save dir: {info.filename}"
                 return result
-            if not any(member.as_posix().startswith(sub + "/") for sub in subtrees):
+            if _under(member, excluded):
+                result["excluded"] += 1
+                continue
+            if not _under(member, subtrees):
                 result["error"] = f"archive member outside save subtrees: {info.filename}"
                 return result
+            wanted.append(info)
 
-        for info in infos:
+        for info in wanted:
             target = root / PurePosixPath(info.filename)
             mtime = calendar.timegm(info.date_time)
             try:
