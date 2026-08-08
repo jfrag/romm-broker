@@ -1,6 +1,7 @@
 from .base import Emulator
 from .desktop import Desktop
 from .duckstation import Duckstation
+from .dolphin import Dolphin
 from .eden import Eden
 from .pcsx2 import Pcsx2
 from .retroarch import Retroarch
@@ -11,6 +12,7 @@ from .xemu import Xemu
 REGISTRY: dict[str, type[Emulator]] = {
     "pcsx2": Pcsx2,
     "duckstation": Duckstation,
+    "dolphin": Dolphin,
     "eden": Eden,
     "shadps4": Shadps4,
     "retroarch": Retroarch,
