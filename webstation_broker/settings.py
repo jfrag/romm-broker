@@ -46,6 +46,15 @@ FRONTEND_DIST = Path(
     os.environ.get("BROKER_FRONTEND_DIST", "/usr/share/webstation-broker/www")
 )
 
+# Ceiling on a single state file moving either way over the state-file routes.
+# RomM caps its side of the same transfer, so raising one without the other
+# just moves which end refuses.
+STATE_FILE_MAX_BYTES = int(os.environ.get("BROKER_STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
+
+# Same two-sided cap for the frame served alongside a state. Matches RomM's
+# own ceiling on the transfer.
+STATE_SCREENSHOT_MAX_BYTES = int(os.environ.get("BROKER_STATE_SCREENSHOT_MAX_BYTES", str(16 * 1024 * 1024)))
+
 DEV_MODE = os.environ.get("BROKER_DEV_MODE", "").lower() == "true"
 
 GAMEPAD_SLOTS = int(os.environ.get("BROKER_GAMEPAD_SLOTS", "4"))

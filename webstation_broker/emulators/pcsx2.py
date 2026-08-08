@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from threading import Thread
 
+from .. import memcard
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
@@ -19,6 +20,20 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 INI_PATH = Path("/config/.config/PCSX2/inis/PCSX2.ini")
 SSTATE_DIR = Path(os.environ.get("SSTATE_DIR", "/config/.config/PCSX2/sstates"))
 PCSX2_LOG_PATH = Path(os.environ.get("PCSX2_LOG_PATH", "/config/pcsx2-qt.log"))
+# The one slot the broker works in. 10 is PCSX2's own autosave slot, which the
+# per-emulator broker has always used, so containers that ran that one keep
+# resolving their existing states.
+STATE_SLOT = int(os.environ.get("PCSX2_STATE_SLOT", "10"))
+
+MEMCARD_DIR = Path("/config/.config/PCSX2/memcards")
+# The Slot-1 card the broker owns. PCSX2 tells a folder card from a file card
+# by what it finds at the path, so this is a directory and the name carries no
+# .ps2 extension, to keep it from reading as one of PCSX2's own file cards.
+SLOT1_CARD_NAME = os.environ.get("PCSX2_SLOT1_CARD", "romm-slot1")
+# PCSX2 only counts a directory as a folder card once this file is inside it,
+# and skips the directory entirely otherwise, which leaves the slot reading as
+# missing with nowhere for the game to save.
+SLOT1_MARKER = "_pcsx2_superblock"
 
 PINE_WAIT = float(os.environ.get("PINE_WAIT", "20.0"))
 RESUME_LOAD_WAIT = float(os.environ.get("RESUME_LOAD_WAIT", "90.0"))
@@ -145,6 +160,8 @@ def _patch_ini() -> None:
         ("UI", "ConfirmShutdown"): "ConfirmShutdown = false",
         ("UI", "SetupWizardIncomplete"): "SetupWizardIncomplete = false",
         ("EmuCore", "SaveStateOnShutdown"): "SaveStateOnShutdown = false",
+        ("MemoryCards", "Slot1_Enable"): "Slot1_Enable = true",
+        ("MemoryCards", "Slot1_Filename"): f"Slot1_Filename = {SLOT1_CARD_NAME}",
     }
     try:
         if not INI_PATH.exists():
@@ -215,6 +232,25 @@ def _sstate_snapshot() -> dict:
 
 def _matches_slot(p: Path, slot: int) -> bool:
     return p.name.endswith(f".{slot:02d}.p2s") or p.name.endswith(f".{slot}.p2s")
+
+
+# "<serial> (<crc>).<slot>.p2s", the name PCSX2 builds for a save state. The
+# serial is what ties the file to a disc, the slot is just which of the ten it
+# went in.
+_STATE_NAME_RE = re.compile(r"^(?P<serial>.+)\.\d{1,2}\.p2s$")
+
+
+def _restamp_slot(filename: str, slot: int) -> str | None:
+    """The same state named for `slot`, or None if it is not a state name.
+
+    RomM holds the library, so a stored state carries whatever slot it happened
+    to be captured in. Only the serial has to survive the trip: PCSX2 looks a
+    state up by the serial it reads off the running disc, so moving the name
+    into this broker's one slot is what makes any stored capture loadable."""
+    match = _STATE_NAME_RE.match(filename)
+    if match is None:
+        return None
+    return f"{match.group('serial')}.{slot:02d}.p2s"
 
 
 def _wait_for_sstate_write(before: dict, deadline: float, slot: int | None = None) -> bool:
@@ -316,7 +352,12 @@ class Pcsx2(Emulator):
     display_name = "PCSX2"
     save_root = Path("/config/.config/PCSX2")
     save_subtrees = ("memcards", "sstates")
+    memory_card_subtree = "memcards"
+    memory_card_marker = SLOT1_MARKER
     rom_extensions = ROM_EXTENSIONS
+    supports_states = True
+    state_slot = STATE_SLOT
+    state_dir = SSTATE_DIR
     log_path = PCSX2_LOG_PATH
 
     def __init__(self):
@@ -336,9 +377,25 @@ class Pcsx2(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
+    def memory_card_path(self) -> Path | None:
+        return MEMCARD_DIR / SLOT1_CARD_NAME
+
+    def _ensure_folder_card(self) -> None:
+        """Have a folder card waiting at the Slot-1 path before PCSX2 opens it.
+
+        A path that is not there is what makes PCSX2 write itself a fresh 8 MB
+        file card, and a file card cannot be shipped or replaced as an image,
+        so the whole-card routes would refuse the container from then on."""
+        card = MEMCARD_DIR / SLOT1_CARD_NAME
+        try:
+            memcard.ensure_card(card, SLOT1_MARKER)
+        except OSError as exc:
+            log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
+
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
         _patch_ini()
+        self._ensure_folder_card()
         self._launch_seq += 1
         seq = self._launch_seq
 
@@ -362,19 +419,70 @@ class Pcsx2(Emulator):
                 return
             if _pine_emu_status() == 0:
                 time.sleep(RESUME_LOAD_SETTLE)
+                if not self.wait_for_state(deadline):
+                    log.warning("resume: slot %d never got a state file", slot)
+                    return
                 if self._launch_seq != seq:
                     return
-                ok = _pine_request(_PINE_MSG_LOAD_STATE, bytes([slot])) is not None
+                ok = self.load_state(slot)
                 log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
                 return
             time.sleep(1.0)
         log.warning("resume: VM never reached running state, slot %d not loaded", slot)
 
     def save_state(self, slot: int) -> bool:
+        """`slot` is what RomM asked for and is ignored: this saves into
+        STATE_SLOT and the caller reads the effective slot back off
+        state_slot. PINE can address any slot directly, but RomM keeps the
+        library of states, so working in one slot is all this needs to do."""
         before = _sstate_snapshot()
-        if _pine_request(_PINE_MSG_SAVE_STATE, bytes([slot])) is None:
+        if _pine_request(_PINE_MSG_SAVE_STATE, bytes([STATE_SLOT])) is None:
             return False
-        return _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, slot)
+        return _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, STATE_SLOT)
+
+    def load_state(self, slot: int) -> bool:
+        # PINE acks a load for an empty slot, so an absent file has to be
+        # caught here or the caller reads a no-op as success.
+        if self.state_path() is None:
+            log.warning("load state: slot %d holds no state file", STATE_SLOT)
+            return False
+        return _pine_request(_PINE_MSG_LOAD_STATE, bytes([STATE_SLOT])) is not None
+
+    def state_path(self) -> Path | None:
+        return newest_state_for_slot(STATE_SLOT)
+
+    def clear_working_slot(self) -> None:
+        """A .p2s is named for the disc it was taken from, and the serial only
+        comes off the running disc, so a leftover cannot be told apart from the
+        state of the game about to boot. Anything still here belongs to a
+        session that has already exited and whose states RomM holds, so
+        dropping it is what stops the last player's save being served as this
+        one's. The archive restore and the resume push both land afterwards."""
+        if not SSTATE_DIR.is_dir():
+            return
+        for pattern in {f"*.{STATE_SLOT:02d}.p2s", f"*.{STATE_SLOT}.p2s"}:
+            for stale in SSTATE_DIR.glob(pattern):
+                try:
+                    stale.unlink()
+                    log.info("cleared stale state %s", stale.name)
+                except OSError as exc:
+                    log.warning("could not clear stale state %s: %s", stale.name, exc)
+
+    def state_target(self, filename: str) -> Path | None:
+        """PCSX2 finds a state by the serial it reads off the running disc, so
+        the serial is what a pushed name has to get right; the slot it was
+        captured in is rewritten to this broker's. With the slot already holding
+        a state, that name is the one to match, otherwise the serial is taken on
+        trust, bounded to a `<serial>.<slot>.p2s` basename in the state dir."""
+        if "/" in filename or filename in ("", ".", ".."):
+            return None
+        restamped = _restamp_slot(filename, STATE_SLOT)
+        if restamped is None:
+            return None
+        existing = self.state_path()
+        if existing is not None:
+            return existing if restamped == existing.name else None
+        return SSTATE_DIR / restamped
 
     def save_and_exit(self, slot: int) -> dict:
         saved = False
@@ -382,12 +490,12 @@ class Pcsx2(Emulator):
         if self.alive():
             saved = self.save_state(slot)
             if saved:
-                p = newest_state_for_slot(slot)
+                p = self.state_path()
                 if p is not None:
                     st = p.stat()
                     state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
-        return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
+        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
 
     def stop(self) -> None:
         # Invalidate any in-flight deferred state load before the kill.

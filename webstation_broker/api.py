@@ -5,16 +5,17 @@ BROKER_SECRET is set."""
 
 import hmac
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
-from . import callback, saves, selkies, session, settings
+from . import callback, memcard, saves, selkies, session, settings
 from .emulators import get_emulator
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,10 @@ router = APIRouter()
 class SaveIn(BaseModel):
     archive: Optional[str] = None
     resume_slot: Optional[int] = None
+    # Set when the caller syncs the whole memory card on the memory-card
+    # routes. The card then travels as its own image, so it comes out of the
+    # archive on both the restore and the dump.
+    memory_card_synced: bool = False
 
 
 class RomIn(BaseModel):
@@ -41,6 +46,13 @@ class CallbackIn(BaseModel):
 class JoinIn(BaseModel):
     user: Optional[dict] = None
     permission: str = "participant"
+
+
+class StateIn(BaseModel):
+    # RomM is the library of states, so the emulator works in a single slot and
+    # resolves whatever is asked for to it. The bound is kept only to reject
+    # obvious garbage, and 0 is the other brokers' "use your default slot".
+    slot: int = Field(default=0, ge=0, le=10)
 
 
 class ActivateIn(BaseModel):
@@ -91,6 +103,24 @@ def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict:
         "token": body_cb.token if body_cb else None,
         "derived": True,
     }
+
+
+def _archive_subtrees(
+    emulator, memory_card_synced: bool
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The save subtrees this session ships, and the ones it leaves alone.
+
+    With the whole card synced, leaving it in the archive too would have the
+    restore and the card hydrate writing over each other, and a stale card
+    inside an older archive would land on top of the one RomM just laid down.
+    The excluded set is returned rather than simply dropped because archives
+    RomM took before the card was synced still carry it, and a restore has to
+    pass those members over instead of refusing the whole archive.
+    """
+    if not memory_card_synced or emulator.memory_card_subtree is None:
+        return emulator.save_subtrees, ()
+    card = emulator.memory_card_subtree
+    return tuple(s for s in emulator.save_subtrees if s != card), (card,)
 
 
 @router.get("/api/health")
@@ -145,10 +175,15 @@ async def activate(
                 },
             )
 
-    # Restore save data before the emulator boots.
+    # Restore save data before the emulator boots. The working slot is emptied
+    # first so the restore, not the previous session, decides what is in it.
+    await anyio.to_thread.run_sync(emulator.clear_working_slot)
     restore_report = None
     save = body.save
-    if save and save.archive and emulator.save_subtrees:
+    subtrees, excluded = _archive_subtrees(
+        emulator, bool(save and save.memory_card_synced)
+    )
+    if save and save.archive and subtrees:
         archive_path = Path(save.archive)
         if not archive_path.is_file():
             raise HTTPException(
@@ -157,7 +192,11 @@ async def activate(
         content = await anyio.to_thread.run_sync(archive_path.read_bytes)
         await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
-            saves.extract_save_archive, content, emulator.save_root, emulator.save_subtrees
+            saves.extract_save_archive,
+            content,
+            emulator.save_root,
+            subtrees,
+            excluded,
         )
         if restore_report["error"]:
             raise HTTPException(
@@ -225,10 +264,13 @@ async def _do_exit(save_slot: int) -> dict:
     emulator = sess["emulator_obj"]
     exit_report = await anyio.to_thread.run_sync(emulator.save_and_exit, save_slot)
 
+    dump_subtrees, _ = _archive_subtrees(
+        emulator, bool((sess.get("save") or {}).get("memory_card_synced"))
+    )
     dump = await anyio.to_thread.run_sync(
         saves.build_save_archive,
         emulator.save_root,
-        emulator.save_subtrees,
+        dump_subtrees,
         sess["save_baseline"],
     )
     cb = sess.get("callback")
@@ -236,9 +278,7 @@ async def _do_exit(save_slot: int) -> dict:
     archive_path = None
     if settings.DEV_MODE:
         if dump.get("zip_bytes"):
-            archive_path = await anyio.to_thread.run_sync(
-                saves.write_export, dump["zip_bytes"], archive_name
-            )
+            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
         upload = {
             "mode": "report-only",
             "note": "dev mode: nothing was uploaded",
@@ -257,9 +297,7 @@ async def _do_exit(save_slot: int) -> dict:
         )
         if not upload["ok"]:
             # Keep the archive on disk so a failed push never loses save data.
-            archive_path = await anyio.to_thread.run_sync(
-                saves.write_export, dump["zip_bytes"], archive_name
-            )
+            archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
             upload["archive_path"] = archive_path
 
     report = {
@@ -306,7 +344,7 @@ async def _do_exit(save_slot: int) -> dict:
     # empties; selkies errors on connected clients whose token vanished.
     await anyio.sleep(1.5)
     await selkies.clear_tokens()
-    session.clear_session()
+    session.retire_session()
     log.info("exit report: %s", report)
     return report
 
@@ -326,6 +364,273 @@ async def exit_session(
     return await _do_exit(slot)
 
 
+def _state_emulator():
+    """The running emulator, if it is in a position to take a state command."""
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    emulator = sess["emulator_obj"]
+    if not emulator.supports_states:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} has no save states",
+        )
+    if not emulator.alive():
+        raise HTTPException(status_code=409, detail="emulator is not running")
+    return emulator
+
+
+def _readable_emulator():
+    """The emulator whose state files can be read right now.
+
+    The live session's while one is up, otherwise the one that just exited.
+    Reading a state needs the file on disk and the emulator's naming rules, not
+    a running process, and the exit state is the one RomM comes back for.
+    """
+    sess = session.SESSION
+    if sess is not None and sess.get("active"):
+        return sess["emulator_obj"]
+    retired = session.LAST_EXIT
+    if retired is None:
+        raise HTTPException(status_code=409, detail="no session to read a state from")
+    return retired["emulator_obj"]
+
+
+@router.post("/api/session/save-state")
+async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    saved = await anyio.to_thread.run_sync(emulator.save_state, body.slot)
+    slot = emulator.state_slot
+    log.info("save state slot %d: %s", slot, "ok" if saved else "failed")
+    return {"status": "saved" if saved else "failed", "slot": slot, "saved": saved}
+
+
+@router.post("/api/session/load-state")
+async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    loaded = await anyio.to_thread.run_sync(emulator.load_state, body.slot)
+    slot = emulator.state_slot
+    log.info("load state slot %d: %s", slot, "ok" if loaded else "failed")
+    return {
+        "status": "loaded" if loaded else "failed",
+        "slot": slot,
+        "loaded": loaded,
+    }
+
+
+def _header_token(value: str, fallback: str) -> str:
+    """`value` reduced to something safe to put in a response header.
+
+    A Linux filename may hold CR, LF and any non-ASCII byte, all of which would
+    either split the response or fail the header encoder, so anything outside
+    printable ASCII is dropped rather than passed through."""
+    cleaned = "".join(c for c in value if 32 <= ord(c) < 127)
+    return cleaned or fallback
+
+
+@router.get("/api/session/state-file")
+async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)):
+    """Serve the working slot's state file so RomM can file it in the library.
+
+    The slot is the emulator's own, not the caller's: `slot` is accepted for
+    symmetry with the per-emulator brokers and ignored the same way the save
+    routes ignore it. Served after exit as well as during the session, because
+    the state exit captures is exactly the one RomM comes back for once the
+    teardown has answered."""
+    _check_secret(x_broker_secret)
+    emulator = _readable_emulator()
+    path = await anyio.to_thread.run_sync(emulator.state_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="no state file for slot")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not read state file: {exc}")
+    if size > settings.STATE_FILE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="state file exceeds size limit")
+    log.info("state-file: serving %s (%d bytes)", path.name, size)
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={
+            "X-State-Filename": _header_token(path.name, "state"),
+            "X-State-Slot": str(emulator.state_slot),
+        },
+    )
+
+
+@router.get("/api/session/state-screenshot")
+async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)):
+    """Serve the frame captured with the working slot's state.
+
+    Only for emulators that write the thumbnail as its own file; the ones that
+    embed it in the state answer 404, which is the caller's cue to read the
+    frame out of the state it already fetched. `slot` is accepted and ignored
+    the same way the state-file routes ignore it, and like the state itself the
+    frame stays readable after exit."""
+    _check_secret(x_broker_secret)
+    emulator = _readable_emulator()
+    path = await anyio.to_thread.run_sync(emulator.state_screenshot_path)
+    if path is None:
+        raise HTTPException(status_code=404, detail="no state screenshot for slot")
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"could not read screenshot: {exc}")
+    if size > settings.STATE_SCREENSHOT_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
+    log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
+    return FileResponse(path, media_type="image/png")
+
+
+@router.put("/api/session/state-file")
+async def put_state_file(
+    request: Request,
+    filename: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Write a state RomM is sending back into the working slot.
+
+    The name has to be one the running emulator could have written for the
+    loaded game, which is what state_target decides; anything else is refused
+    rather than dropped somewhere in the save tree under a name nothing reads.
+    The slot it was captured in does not have to match, since RomM holds the
+    library, so the reply reports the name it was filed under."""
+    _check_secret(x_broker_secret)
+    emulator = _state_emulator()
+    name = Path(filename).name
+    target = emulator.state_target(name)
+    if target is None:
+        raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
+
+    tmp = target.with_name(f".{target.name}.tmp")
+    written = 0
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Streamed to disk rather than buffered: a state runs to hundreds of
+        # megabytes and holding one per request on the heap is the whole limit
+        # multiplied by however many callers are pushing at once.
+        with tmp.open("wb") as out:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > settings.STATE_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="state file exceeds size limit")
+                await anyio.to_thread.run_sync(out.write, chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="empty request body")
+        os.replace(tmp, target)
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"could not write state file: {exc}")
+
+    log.info("state-file: stored %s (%d bytes)", target.name, written)
+    return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
+
+
+def _memory_card(name: str) -> tuple[Path, Optional[str]]:
+    """The card the named emulator syncs, and the marker file it needs inside.
+
+    Named rather than read off the session, because the card is container
+    state, not session state: RomM lays one down before activate, when there is
+    no session to resolve it through."""
+    emulator = get_emulator(name)
+    if emulator is None:
+        raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
+    card = emulator.memory_card_path()
+    if card is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} has no memory card to sync",
+        )
+    return card, emulator.memory_card_marker
+
+
+@router.get("/api/session/memory-card")
+async def get_memory_card(
+    emulator: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Serve the whole Slot-1 card so RomM can file it against the player.
+
+    A 404 carrying `X-Memory-Card: absent` is the broker confirming the slot is
+    empty, which is what tells RomM the card is safe to wipe. Every other
+    failure has to read as "could not be captured", or a card RomM never
+    managed to read would be destroyed on the next claim.
+    """
+    _check_secret(x_broker_secret)
+    card, marker = _memory_card(emulator)
+    # Contention means a card operation is already in flight, and the caller
+    # should come back rather than queue behind it.
+    if not memcard.LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+    try:
+        result = await anyio.to_thread.run_sync(memcard.build_archive, card, marker)
+    finally:
+        memcard.LOCK.release()
+    if isinstance(result, str):
+        raise HTTPException(status_code=409, detail=result)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="no memory card in slot 1",
+            headers={"X-Memory-Card": "absent"},
+        )
+    log.info("memory-card: serving slot 1 (%d bytes)", len(result))
+    return Response(
+        content=result,
+        media_type="application/zip",
+        headers={"X-Memory-Card-Slot": "1"},
+    )
+
+
+@router.put("/api/session/memory-card")
+async def put_memory_card(
+    request: Request,
+    emulator: str = Query(...),
+    x_broker_secret: Optional[str] = Header(default=None),
+):
+    """Wipe Slot 1 and lay down the card RomM is sending.
+
+    Refused while a session is up: the emulator holds the card open for as long
+    as the game runs, and swapping it underneath corrupts it. RomM hydrates
+    before activate and evacuates after exit, so the card is only ever replaced
+    with nothing running.
+    """
+    _check_secret(x_broker_secret)
+    card, marker = _memory_card(emulator)
+    content = bytearray()
+    async for chunk in request.stream():
+        content.extend(chunk)
+        if len(content) > saves.SAVE_FILE_MAX_BYTES:
+            raise HTTPException(status_code=413, detail="memory card exceeds size limit")
+    if not content:
+        raise HTTPException(status_code=400, detail="empty request body")
+
+    if not memcard.LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+    try:
+        sess = session.SESSION
+        if sess is not None and sess.get("active"):
+            raise HTTPException(
+                status_code=409,
+                detail="cannot replace the memory card while a session is active",
+            )
+        result = await anyio.to_thread.run_sync(
+            memcard.replace, card, bytes(content), marker
+        )
+    finally:
+        memcard.LOCK.release()
+    if isinstance(result, str):
+        raise HTTPException(status_code=400, detail=result)
+    log.info("memory-card: replaced slot 1, %d file(s)", result)
+    return {"status": "ok", "written": result, "slot": 1}
+
+
 @router.get("/api/session/status")
 async def status():
     sess = session.SESSION
@@ -338,6 +643,12 @@ async def status():
         "rom": sess.get("rom"),
         "rom_file": sess.get("rom_file"),
         "emulator_alive": sess["emulator_obj"].alive(),
+        # The emulator class is the authority on what it can do, so RomM reads
+        # this rather than keeping its own per-emulator table.
+        "supports_states": sess["emulator_obj"].supports_states,
+        # The slot every state route resolves to. There is only one because
+        # RomM holds the library of states.
+        "state_slot": sess["emulator_obj"].state_slot,
         "started_at": sess.get("created_at"),
         "user": sess.get("user"),
         "viewers": [

@@ -16,7 +16,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane (localhost:8083)
   saves.py               save archive restore on activate, delta dump on exit
-  emulators/             emulator launchers (pcsx2, eden, shadps4, desktop)
+  emulators/             emulator launchers (pcsx2, retroarch, eden, shadps4, desktop)
 frontend/                vite vanilla-JS room interface
 ```
 
@@ -28,8 +28,9 @@ frontend/                vite vanilla-JS room interface
   routing per streaming connection. The room UI reassigns gamepads and
   mouse/keyboard by dragging icons onto users.
 * Save data flows through zip archives scoped to the emulator's save subtrees
-  (pcsx2: `memcards/`, `sstates/`; eden: `nand/user/save/` 
-  `nand/system/save/8000000000000010/`; shadps4: `home/1000/savedata/`).
+  (pcsx2: `memcards/`, `sstates/`; retroarch: `states/`, `saves/`; eden:
+  `nand/user/save/` `nand/system/save/8000000000000010/`; shadps4:
+  `home/1000/savedata/`).
   Activate restores an archive without
   rolling back newer files; exit zips everything modified since launch and
   uploads it to the callback origin. In dev mode nothing is uploaded the
@@ -56,7 +57,23 @@ frontend/                vite vanilla-JS room interface
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | path appended to the callback base URL when exit POSTs the save archive |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
+| `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | ceiling on one state file over the state-file routes; RomM caps the same transfer |
+| `BROKER_STATE_SCREENSHOT_MAX_BYTES` | `16777216` | ceiling on the frame served with a state; RomM caps the same transfer |
+| `PCSX2_STATE_SLOT` | `10` | the slot PCSX2 works in; 10 is its own autosave slot, which the per-emulator broker also used |
+| `RETROARCH_STATE_SLOT` | `0` | the slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file |
 | `BROKER_DEV_MODE` | unset | run from mounted source with uvicorn/vite hot reload; also disables the exit save upload (report-only) |
+
+## Deployment
+
+The container is meant to be served from a subfolder of the parent's origin, so
+the parent's player can see pointer events inside the stream iframe. Point a
+reverse proxy rule at the container's web port and set `SUBFOLDER` to the same
+path it is mounted at. The proxy must pass the prefix through rather than strip
+it, and must forward websocket upgrades.
+
+See [docs/reverse-proxy.md](docs/reverse-proxy.md) for the RomM config keys,
+recipes for nginx, Caddy and Traefik, why Zoraxy needs one of them behind it,
+how to verify a mount, and what running more than one container takes.
 
 ## Dev mode
 
@@ -104,6 +121,24 @@ shutdown followed by a save delta dump the game's own save data under the emulat
 persistence. `EDEN_STOP_WAIT` (default 15 s) controls how long the graceful
 stop gets before SIGKILL.
 
+`emulator: "retroarch"` is the general purpose launcher: one class covering
+every libretro core, with `rom.platform` picking the core (ngc and wii both
+map to `dolphin`, plus snes, n64, dc, saturn, psp, nds, 3ds, arcade and
+genesis). Missing cores are downloaded from the libretro buildbot into the
+user's own `libretro_directory`, which is where RetroArch also keeps the
+matching `.info` files: a core loaded from anywhere else has no core info and
+`GET_STATUS` then segfaults RetroArch mid-session. The user's config is never
+edited, only layered with `--appendconfig`.
+
+Save states are real, but RetroArch has no "save to slot n" command, so the
+broker parks the slot instead: it walks down to the -1 floor and back up to
+`RETROARCH_STATE_SLOT` (default 0). That runs once per launch and again only
+when a save lands elsewhere, which means the player moved the slot with their
+own hotkeys. The first save of a session costs about 3 s, the rest under 1 s.
+Loads use `LOAD_STATE_SLOT`, which is already absolute. Tunables:
+`RETROARCH_SLOT_STEP_DELAY` (0.1 s between presses) and
+`RETROARCH_SLOT_HOME_STEPS` (24 presses to reach the floor).
+
 `emulator: "shadps4"` launches the shadPS4 PlayStation 4 emulator. shadPS4
 has no save states either (`resume_slot` is ignored); the game's save data
 under `home/1000/savedata/` is the persistence. The binary is picked from
@@ -120,7 +155,18 @@ fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
 ### Launch a game with save data
 
 Add a `save` object: `archive` is a zip restored before launch, `resume_slot`
-loads that state slot once the VM is up. Both are optional and independent.
+loads a state once the VM is up. Both are optional and independent. Like the
+state routes, `resume_slot` resolves to the emulator's working slot rather than
+being honoured literally, so any value loads whatever that slot holds.
+
+PCSX2 empties its working slot at the start of activate, before the archive is
+restored. A `.p2s` is named for the disc it was taken from and the serial only
+comes off the running disc, so a file left over from an earlier session cannot
+be told apart from the current game's; RomM already holds those states, and
+clearing them is what stops the last player's save being served as this one's.
+Both the restore and the later resume push land afterwards, so neither is
+touched. The other emulators name a state after the loaded content and can tell
+a stale one apart on sight, so they need no equivalent.
 
 ```
 curl -k -X POST https://localhost:3001/streaming/api/session/activate \
@@ -160,6 +206,83 @@ Returns `{"status": "joined", "url": "/streaming/?token=<personal token>", ...}`
 409 when no session is up. `permission: "readonly"` for spectators. Re-joining
 the same user (by id, else username) replaces their old token.
 
+### Save and load state mid-session
+
+```
+curl -k -X POST https://localhost:3001/streaming/api/session/save-state \
+  -H 'X-Broker-Secret: <shared secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{ "slot": 3 }'
+```
+
+`/load-state` takes the same body. Both return
+`{"status": "saved"|"loaded"|"failed", "slot": N, ...}` and both are
+secret-only: the parent's backend is the caller, not the room UI.
+
+RomM is the library of states, so each emulator works in exactly one slot and
+resolves whatever `slot` is asked for to its own. The response echoes the slot
+it actually used, which is also the `state_slot` in the status response. The
+field is kept because the per-emulator brokers take it and because it is what
+the parent needs to read back, not because the broker keeps ten of anything.
+
+`400` means the running emulator has no save states at all (`desktop`, `eden`
+and `shadps4` persist through the game's own save data instead), `409` means
+there is no active session or the emulator process is gone. Which case applies
+is readable ahead of time from `supports_states` in the status response, so the
+parent does not need its own per-emulator table.
+
+A `"failed"` status is a real answer, not an error: for PCSX2 it means PINE
+never acked, and for either emulator it covers a load of a slot that holds no
+state file, or a save whose slot never appeared on disk.
+
+### Move a state file in or out
+
+```
+curl -k -X GET https://localhost:3001/streaming/api/session/state-file \
+  -H 'X-Broker-Secret: <shared secret>' -o state.bin
+
+curl -k -X PUT "https://localhost:3001/streaming/api/session/state-file?filename=NAME" \
+  -H 'X-Broker-Secret: <shared secret>' --data-binary @state.bin
+```
+
+This is how RomM becomes the datastore rather than the container: the GET
+follows a save so the state can be filed in the library, and the PUT sends any
+stored state back so a load or a resume can reach it. The GET reports the name
+in `X-State-Filename` and the slot in `X-State-Slot`.
+
+The PUT takes a name back and asks only whether the running emulator could have
+written it for the loaded game. The slot in the name is not part of that test:
+the library holds states captured under whatever slot was in use at the time,
+so the name is restamped into this broker's one working slot and the response
+reports the name it landed under. What is checked is identity, the PCSX2 serial
+or the RetroArch content basename, so a state for another game or another
+directory is still a `400` rather than a stray file in the save tree.
+
+The PUT needs a live session and returns `409` without one, since a state is
+only pushed in so a running emulator can reach it. The GET outlives the session:
+exit captures a state on its way out, and RomM can only come back for it once
+the teardown has answered, so refusing there was what left every exit state
+stranded in the container. The broker holds the exited session's state until the
+next activate clears the working slot, and answers `409` before the first
+session and `404` once the slot is empty. `413` on either side means the file is
+over `BROKER_STATE_FILE_MAX_BYTES` (256 MiB); RomM caps the same transfer, so
+raising one end alone only moves which end refuses.
+
+### Fetch the frame a state was taken at
+
+```
+curl -k -X GET https://localhost:3001/streaming/api/session/state-screenshot \
+  -H 'X-Broker-Secret: <shared secret>' -o state.png
+```
+
+This is what gives a stored state its thumbnail in RomM's resume picker. Only
+emulators that write the frame as its own file answer it: RetroArch saves a
+`<state file>.png` beside every state, so it serves that. PCSX2 embeds the frame
+inside the `.p2s` and returns `404`, which is the caller's cue to read it out of
+the state it already fetched rather than an error. It stays readable after exit
+on the same terms as the state itself, with `413` over
+`BROKER_STATE_SCREENSHOT_MAX_BYTES` (16 MiB).
+
 ### Exit
 
 From the room UI's exit button (controller token) or directly:
@@ -169,7 +292,8 @@ curl -k -X POST 'https://localhost:3001/streaming/api/session/exit?slot=10' \
   -H 'X-Broker-Secret: <shared secret>'
 ```
 
-Saves state to `slot`, stops the emulator, dumps the save delta, and uploads
+Saves state (into the working slot, whatever `slot` says), stops the emulator,
+dumps the save delta, and uploads
 it to the callback origin as multipart form data:
 `POST {base_url}{BROKER_SAVE_UPLOAD_PATH}` with an `archive` file part
 (zip, `{session_id}-{timestamp}.zip`) plus `session_id`, `emulator`, and

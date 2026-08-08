@@ -29,6 +29,12 @@ log = logging.getLogger(__name__)
 # }
 SESSION: Optional[dict] = None
 
+# What is left of the session that just exited: {"id", "rom", "emulator_obj"}.
+# RomM files the exit state in its library after the teardown has answered, so
+# the emulator that captured it has to outlive the session for the read routes
+# to find the file. Dropped at the next activate.
+LAST_EXIT: Optional[dict] = None
+
 ROOM: dict = {"controller": None, "viewers": {}}
 
 
@@ -44,7 +50,11 @@ def _session_id(raw) -> str:
 
 
 def new_session(payload: dict, emulator_obj, rom_file: str) -> dict:
-    global SESSION
+    global SESSION, LAST_EXIT
+    # The previous session's state is about to be cleared off the working slot,
+    # and serving it under this session's rom would file it against the wrong
+    # game, so the record goes before the new one is built.
+    LAST_EXIT = None
     SESSION = {
         "id": _session_id(payload.get("session_id")),
         "active": True,
@@ -67,8 +77,21 @@ def new_session(payload: dict, emulator_obj, rom_file: str) -> dict:
     return SESSION
 
 
-def clear_session() -> None:
-    global SESSION
+def retire_session() -> None:
+    """End the session, keeping what the state routes still have to answer with.
+
+    Exit captures a state and then tears the session down, but RomM only asks
+    for that state once the teardown has replied, so clearing outright is what
+    made every post-exit read a 409. Only the emulator is kept, and only the
+    read routes consult it: nothing here can be played, written to or resumed.
+    """
+    global SESSION, LAST_EXIT
+    if SESSION is not None:
+        LAST_EXIT = {
+            "id": SESSION["id"],
+            "rom": SESSION.get("rom") or {},
+            "emulator_obj": SESSION["emulator_obj"],
+        }
     SESSION = None
 
 
