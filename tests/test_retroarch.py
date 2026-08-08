@@ -127,6 +127,48 @@ class TestCoreAssets:
         assert not system.exists()
 
 
+class TestBrokerConfig:
+    """The per-launch overlay written on top of the user's own retroarch.cfg."""
+
+    @pytest.fixture(autouse=True)
+    def _dirs(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path)
+        monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "states")
+        monkeypatch.setattr(retroarch, "SAVE_DIR", tmp_path / "saves")
+        monkeypatch.setattr(retroarch, "BROKER_CFG", tmp_path / "broker.cfg")
+
+    def test_the_joypad_driver_is_pinned_off_udev(self):
+        """The Selkies pads all look like one device to udev, so it registers
+        none of them; linuxraw opens the js nodes the interposer hooks."""
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'input_joypad_driver = "linuxraw"' in cfg
+
+    def test_an_empty_driver_leaves_the_user_config_alone(self, monkeypatch):
+        monkeypatch.setattr(retroarch, "JOYPAD_DRIVER", "")
+
+        assert "input_joypad_driver" not in retroarch._write_broker_cfg().read_text()
+
+    def test_the_driver_is_overridable(self, monkeypatch):
+        monkeypatch.setattr(retroarch, "JOYPAD_DRIVER", "sdl2")
+
+        assert 'input_joypad_driver = "sdl2"' in retroarch._write_broker_cfg().read_text()
+
+    def test_the_stdin_channel_and_save_dirs_are_still_there(self):
+        """The overlay is what makes the session controllable at all."""
+        cfg = retroarch._write_broker_cfg().read_text()
+
+        assert 'stdin_cmd_enable = "true"' in cfg
+        assert f'savestate_directory = "{retroarch.STATE_DIR}"' in cfg
+        assert f'savefile_directory = "{retroarch.SAVE_DIR}"' in cfg
+
+    @pytest.mark.parametrize("thumbnail,expected", [(True, "true"), (False, "false")])
+    def test_thumbnails_follow_the_platform(self, thumbnail, expected):
+        cfg = retroarch._write_broker_cfg(thumbnail).read_text()
+
+        assert f'savestate_thumbnail_enable = "{expected}"' in cfg
+
+
 def test_extensions_and_save_subtrees_survive_the_load_as_tuples():
     """The launcher treats extensions as an ordered preference list and the
     save logic iterates the subtrees, so neither may come back as a raw list."""

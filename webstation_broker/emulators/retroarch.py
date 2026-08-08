@@ -133,6 +133,13 @@ STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
 SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
 CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", "180"))
+# The pads here are Selkies interposer sockets, not real devices, and the fake
+# libudev behind them gives every one the same identity. RetroArch's udev
+# joypad driver reads that as one device plugged eight times ("Device ID 0 is
+# already plugged") and ends up with no pads at all. linuxraw opens the js
+# nodes directly, which the interposer does hook, so there is nothing to
+# collide on. Set empty to leave the user's own driver alone.
+JOYPAD_DRIVER = os.environ.get("RETROARCH_JOYPAD_DRIVER", "linuxraw")
 
 # RomM platform slug -> libretro core, kept in retroarch_platforms.json next
 # to this module. Extensions order doubles as the preference order when a
@@ -237,7 +244,9 @@ def _ensure_core_assets(assets: dict[str, str]) -> None:
 
 def _write_broker_cfg(thumbnail: bool = True) -> Path:
     """Minimal per-launch config, applied *on top of* the user's config.
-    Only the stdin interface and the broker save dirs; nothing else."""
+
+    The stdin interface, the broker save dirs, and the joypad driver the
+    streamed pads need; nothing else."""
     RA_DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -254,6 +263,8 @@ def _write_broker_cfg(thumbnail: bool = True) -> Path:
         'confirm_quit = "false"\n'
         'quit_press_twice = "false"\n'
     )
+    if JOYPAD_DRIVER:
+        cfg += f'input_joypad_driver = "{JOYPAD_DRIVER}"\n'
     tmp = BROKER_CFG.with_suffix(".tmp")
     tmp.write_text(cfg)
     os.replace(tmp, BROKER_CFG)
