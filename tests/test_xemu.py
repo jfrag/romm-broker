@@ -5,6 +5,7 @@ libfatx compares path names byte for byte, and that detail is exactly what the
 inject and extract hooks have to get right.
 """
 
+import os
 import struct
 import tomllib
 from pathlib import Path
@@ -333,6 +334,41 @@ def test_an_unwritable_config_does_not_stop_the_launch(pinned, monkeypatch):
     monkeypatch.setattr(Path, "write_text", fail)
     xemu._pin_display_settings()
     assert _renderer_of(pinned) == "VULKAN"
+
+
+def _spawned_env(emulator, monkeypatch, tmp_path) -> dict:
+    """Launch with the process spawn stubbed out, and hand back the env xemu
+    would have been given."""
+    monkeypatch.setattr(xemu, "_reap_strays", lambda: None)
+    monkeypatch.setattr(xemu.Xemu, "stop", lambda self: None)
+    captured: list[dict] = []
+    monkeypatch.setattr(xemu.Xemu, "_spawn",
+                        lambda self, cmd, env: captured.append(env))
+    emulator.launch(_xiso(tmp_path / "g.iso"), None)
+    assert captured, "launch did not spawn xemu"
+    return captured[0]
+
+
+def test_software_gl_is_off_by_default(emulator, monkeypatch, tmp_path):
+    """CPU rendering is a workaround for broken drivers, not a default."""
+    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", False)
+    assert "LIBGL_ALWAYS_SOFTWARE" not in _spawned_env(emulator, monkeypatch, tmp_path)
+
+
+def test_software_gl_reaches_xemu_and_nothing_else(emulator, monkeypatch, tmp_path):
+    """Set on xemu's own launch env, so the rest of the container keeps the GPU."""
+    monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", True)
+    env = _spawned_env(emulator, monkeypatch, tmp_path)
+    assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
+    assert "LIBGL_ALWAYS_SOFTWARE" not in os.environ
+
+
+@pytest.mark.parametrize("setting,expected", [
+    ("1", True), ("true", True), ("YES", True), (" on ", True),
+    ("0", False), ("false", False), ("", False),
+])
+def test_the_software_gl_switch_reads_the_usual_spellings(setting, expected):
+    assert xemu._truthy(setting) is expected
 
 
 def test_launch_pins_the_display_settings_before_spawning(emulator, monkeypatch, tmp_path):

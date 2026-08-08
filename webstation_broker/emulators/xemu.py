@@ -50,6 +50,18 @@ XEMU_LOG_PATH = Path(os.environ.get("XEMU_LOG_PATH", "/config/xemu.log"))
 # to VULKAN where the driver is known good, or to KEEP to leave the file alone.
 XEMU_RENDERER = os.environ.get("XEMU_RENDERER", "OPENGL").strip().upper()
 
+# Which renderer xemu asks for and whether the driver can answer are separate
+# problems: on the AMD Renoir stack these containers run on, xemu aborts in
+# gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
+# XEMU_SOFTWARE_GL to render xemu on the CPU there, which the container-wide
+# LIBGL_ALWAYS_SOFTWARE cannot do without dragging every other emulator down
+# with it. Slow, so it stays off unless the host needs it.
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+XEMU_SOFTWARE_GL = _truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
+
 
 def _default_toml_path() -> Path:
     """xemu.toml lives in SDL's pref dir: $XDG_DATA_HOME/xemu/xemu, or
@@ -113,6 +125,13 @@ def _hdd_image_path() -> Path:
                   raw, FALLBACK_HDD_IMAGE)
         return FALLBACK_HDD_IMAGE
     return p
+
+
+def _launch_env() -> dict[str, str]:
+    env = base_launch_env()
+    if XEMU_SOFTWARE_GL:
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    return env
 
 
 _NEXT_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
@@ -578,7 +597,7 @@ class Xemu(Emulator):
         _pin_display_settings()
 
         log.info("launching xemu (rom=%s)", rom_path)
-        self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], base_launch_env())
+        self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
 
     def save_and_exit(self, slot: int) -> dict:
         self.stop()
