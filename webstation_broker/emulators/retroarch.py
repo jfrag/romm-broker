@@ -133,6 +133,10 @@ CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", 
 # folder holds several candidates.
 #
 # `savestate` is assumed true; only specialized cores opt out.
+#
+# `thumbnail` is assumed true. Cores that render on the GPU can deadlock
+# RetroArch's main loop on the framebuffer grab that follows a save, which
+# takes the stdin command channel down with it for the rest of the session.
 _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 
 
@@ -146,70 +150,6 @@ def _load_platforms() -> dict[str, dict]:
 
 
 PLATFORMS: dict[str, dict] = _load_platforms()
-#
-# `thumbnail` is assumed true. Cores that render on the GPU can deadlock
-# RetroArch's main loop on the framebuffer grab that follows a save, which
-# takes the stdin command channel down with it for the rest of the session.
-PLATFORMS: dict[str, dict] = {
-    "ngc": {
-        "core": "dolphin",
-        "thumbnail": False,
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "wii": {
-        "core": "dolphin",
-        "thumbnail": False,
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "snes": {
-        "core": "snes9x",
-        "extensions": (".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"),
-    },
-    "n64": {
-        "core": "mupen64plus_next",
-        "extensions": (".n64", ".z64", ".v64", ".rom", ".ndd"),
-    },
-    "dc": {
-        "core": "flycast",
-        "extensions": (".gdi", ".cdi", ".chd", ".cue", ".m3u", ".iso", ".bin"),
-    },
-    "saturn": {
-        "core": "yabasanshiro",
-        "extensions": (".cue", ".chd", ".iso", ".bin", ".m3u", ".ccd", ".toc"),
-    },
-    "psp": {
-        "core": "ppsspp",
-        "extensions": (".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"),
-    },
-    "nds": {
-        "core": "melonds",
-        "extensions": (".nds", ".srl"),
-    },
-    "3ds": {
-        "core": "citra",
-        "extensions": (".3ds", ".cci", ".cxi", ".cia", ".3dsx", ".app", ".srl"),
-    },
-    "arcade": {
-        "core": "fbneo",
-        "extensions": (".zip", ".7z", ".chd"),
-    },
-    "genesis": {
-        "core": "genesis_plus_gx",
-        "extensions": (".md", ".gen", ".smd", ".bin", ".sg", ".sms", ".gg", ".cue"),
-    },
-}
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _ADDON_RE = re.compile(
