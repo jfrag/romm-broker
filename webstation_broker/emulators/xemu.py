@@ -115,50 +115,63 @@ def _hdd_image_path() -> Path:
     return p
 
 
-_DISPLAY_HEADER_RE = re.compile(r"^\[display\][ \t]*$", re.MULTILINE)
 _NEXT_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
-_RENDERER_RE = re.compile(r"^renderer[ \t]*=.*$", re.MULTILINE)
 
 
-def _pin_renderer() -> None:
-    """Rewrite [display] renderer in xemu.toml to XEMU_RENDERER.
+def _pin_toml_key(text: str, section: str, key: str, value: str) -> str:
+    """Return `text` with `key = value` set under `[section]`, adding either if
+    it is missing.
 
     Edited as text rather than reparsed and dumped: tomllib only reads, and a
     round trip through a writer would flatten the comments and key order xemu
     maintains in the file it owns."""
-    if XEMU_RENDERER in ("", "KEEP"):
-        return
+    line = f"{key} = {value}"
+    header = re.search(rf"^\[{re.escape(section)}\][ \t]*$", text, re.MULTILINE)
+    if header is None:
+        return text.rstrip("\n") + f"\n\n[{section}]\n{line}\n"
+
+    body_start = header.end()
+    next_section = _NEXT_SECTION_RE.search(text, body_start)
+    body_end = next_section.start() if next_section else len(text)
+    body = text[body_start:body_end]
+    key_re = re.compile(rf"^{re.escape(key)}[ \t]*=.*$", re.MULTILINE)
+    if key_re.search(body):
+        # A replacement function, so a backslash in the value stays literal.
+        body = key_re.sub(lambda _: line, body, count=1)
+    else:
+        body = f"\n{line}" + body
+    return text[:body_start] + body + text[body_end:]
+
+
+def _pin_display_settings() -> None:
+    """Force the display settings a streamed session needs into xemu.toml.
+
+    xemu owns this file and rewrites it on exit, dropping every key that still
+    matches its own default, so neither setting survives a session on its own.
+    """
     try:
         text = XEMU_TOML.read_text(encoding="utf-8")
     except OSError as exc:
         # Nothing to pin on a container where xemu has never run; it writes the
-        # file on first exit, and its own default renderer is OpenGL.
-        log.debug("could not read %s to pin the renderer (%s)", XEMU_TOML, exc)
+        # file on first exit, and starts out on OpenGL anyway.
+        log.debug("could not read %s to pin display settings (%s)", XEMU_TOML, exc)
         return
 
-    line = f"renderer = '{XEMU_RENDERER}'"
-    header = _DISPLAY_HEADER_RE.search(text)
-    if header is None:
-        updated = text.rstrip("\n") + f"\n\n[display]\n{line}\n"
-    else:
-        body_start = header.end()
-        next_section = _NEXT_SECTION_RE.search(text, body_start)
-        body_end = next_section.start() if next_section else len(text)
-        body = text[body_start:body_end]
-        if _RENDERER_RE.search(body):
-            body = _RENDERER_RE.sub(line, body, count=1)
-        else:
-            body = f"\n{line}" + body
-        updated = text[:body_start] + body + text[body_end:]
+    updated = text
+    if XEMU_RENDERER not in ("", "KEEP"):
+        updated = _pin_toml_key(updated, "display", "renderer", f"'{XEMU_RENDERER}'")
+    # Every other emulator here is launched fullscreen with a command line flag.
+    # xemu has none, so its window size is a config key like anything else.
+    updated = _pin_toml_key(updated, "display.window", "fullscreen_on_startup", "true")
 
     if updated == text:
         return
     try:
         XEMU_TOML.write_text(updated, encoding="utf-8")
     except OSError as exc:
-        log.error("could not pin renderer in %s: %s", XEMU_TOML, exc)
+        log.error("could not pin display settings in %s: %s", XEMU_TOML, exc)
         return
-    log.info("pinned xemu renderer to %s", XEMU_RENDERER)
+    log.info("pinned xemu display settings in %s", XEMU_TOML)
 
 
 def _disc_number(rel: Path) -> int:
@@ -562,7 +575,7 @@ class Xemu(Emulator):
             log.warning("resume: save states are not supported on a raw HDD "
                         "image; slot %d ignored, booting fresh", resume_slot)
 
-        _pin_renderer()
+        _pin_display_settings()
 
         log.info("launching xemu (rom=%s)", rom_path)
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], base_launch_env())

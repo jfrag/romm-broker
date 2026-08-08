@@ -213,7 +213,7 @@ def test_a_failed_conversion_leaves_the_qcow2_playable(tmp_path, monkeypatch):
     assert image.read_bytes() == original
 
 
-# ── Renderer pin ─────────────────────────────────────────────────────────────
+# ── Display settings pin ─────────────────────────────────────────────────────
 
 
 # A config shaped like the one xemu writes: comments, several tables, and a
@@ -248,53 +248,79 @@ def _renderer_of(cfg: Path) -> str:
     return tomllib.loads(cfg.read_text())["display"]["renderer"]
 
 
+def _fullscreen_of(cfg: Path) -> bool:
+    return tomllib.loads(cfg.read_text())["display"]["window"]["fullscreen_on_startup"]
+
+
 def test_a_vulkan_config_is_pinned_back_to_opengl(pinned):
     pinned.write_text(FULL_TOML)
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
 
 
+def test_a_windowed_config_is_pinned_to_fullscreen(pinned):
+    pinned.write_text(FULL_TOML.replace(
+        "[display.quality]", "[display.window]\nfullscreen_on_startup = false\n\n[display.quality]"))
+    xemu._pin_display_settings()
+    assert _fullscreen_of(pinned) is True
+
+
 def test_pinning_leaves_the_rest_of_the_config_alone(pinned):
-    """The file belongs to xemu; the pin owns exactly one key in it."""
+    """The file belongs to xemu; the pin owns exactly two keys in it."""
     pinned.write_text(FULL_TOML)
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     after = pinned.read_text()
-    assert after == FULL_TOML.replace("renderer = 'VULKAN'", "renderer = 'OPENGL'")
+    assert after == (
+        FULL_TOML.replace("renderer = 'VULKAN'", "renderer = 'OPENGL'").rstrip("\n")
+        + "\n\n[display.window]\nfullscreen_on_startup = true\n"
+    )
     assert "# how the guest frame is fitted to the window" in after
     assert tomllib.loads(after)["display"]["quality"]["surface_scale"] == 1
 
 
 def test_a_display_section_without_a_renderer_gains_one(pinned):
     pinned.write_text("[display]\nui_scale = 2\n\n[sys]\nmem = 64\n")
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
     assert tomllib.loads(pinned.read_text())["sys"]["mem"] == 64
 
 
 def test_a_config_with_no_display_section_gains_one(pinned):
     pinned.write_text("[general]\nshow_welcome = false\n")
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
+    assert _fullscreen_of(pinned) is True
+
+
+def test_the_display_and_display_window_sections_stay_distinct(pinned):
+    """[display.window] is its own table, not a key inside [display]."""
+    pinned.write_text("[general]\nshow_welcome = false\n")
+    xemu._pin_display_settings()
+    display = tomllib.loads(pinned.read_text())["display"]
+    assert display["renderer"] == "OPENGL"
+    assert display["window"] == {"fullscreen_on_startup": True}
 
 
 def test_the_renderer_is_configurable_for_hardware_where_vulkan_works(pinned, monkeypatch):
     monkeypatch.setattr(xemu, "XEMU_RENDERER", "VULKAN")
     pinned.write_text("[display]\nrenderer = 'OPENGL'\n")
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert _renderer_of(pinned) == "VULKAN"
 
 
 @pytest.mark.parametrize("setting", ["KEEP", ""])
-def test_the_pin_can_be_turned_off(pinned, monkeypatch, setting):
+def test_the_renderer_pin_can_be_turned_off(pinned, monkeypatch, setting):
+    """Turning the renderer pin off leaves the renderer alone, not fullscreen."""
     monkeypatch.setattr(xemu, "XEMU_RENDERER", setting)
     pinned.write_text(FULL_TOML)
-    xemu._pin_renderer()
-    assert pinned.read_text() == FULL_TOML
+    xemu._pin_display_settings()
+    assert _renderer_of(pinned) == "VULKAN"
+    assert _fullscreen_of(pinned) is True
 
 
 def test_a_missing_config_is_not_created(pinned):
     """xemu writes the file itself, and its own default is already OpenGL."""
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert not pinned.exists()
 
 
@@ -305,11 +331,11 @@ def test_an_unwritable_config_does_not_stop_the_launch(pinned, monkeypatch):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(Path, "write_text", fail)
-    xemu._pin_renderer()
+    xemu._pin_display_settings()
     assert _renderer_of(pinned) == "VULKAN"
 
 
-def test_launch_pins_the_renderer_before_spawning(emulator, monkeypatch, tmp_path):
+def test_launch_pins_the_display_settings_before_spawning(emulator, monkeypatch, tmp_path):
     """The pin is worthless if a launch can get past it."""
     cfg = xemu.XEMU_TOML
     cfg.write_text(cfg.read_text() + "\n[display]\nrenderer = 'VULKAN'\n")
@@ -324,6 +350,7 @@ def test_launch_pins_the_renderer_before_spawning(emulator, monkeypatch, tmp_pat
     emulator.launch(_xiso(tmp_path / "g.iso"), None)
     assert spawned, "launch did not spawn xemu"
     assert _renderer_of(cfg) == "OPENGL"
+    assert _fullscreen_of(cfg) is True
 
 
 # ── FATX save sync ───────────────────────────────────────────────────────────
