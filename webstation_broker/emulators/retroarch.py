@@ -72,15 +72,15 @@ XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/sha
 RA_CONFIG_DIR = Path(os.environ.get("RETROARCH_CONFIG_DIR", str(Path.home() / ".config" / "retroarch")))
 
 
-def _configured_cores_dir() -> Path | None:
-    """`libretro_directory` from the user's RetroArch config."""
+def _configured_dir(setting: str) -> Path | None:
+    """A directory setting read out of the user's RetroArch config."""
     try:
         text = (RA_CONFIG_DIR / "retroarch.cfg").read_text(errors="replace")
     except OSError:
         return None
     for line in text.splitlines():
         key, sep, value = line.partition("=")
-        if sep and key.strip() == "libretro_directory":
+        if sep and key.strip() == setting:
             raw = value.strip().strip('"').strip()
             if raw and raw != "default":
                 return Path(os.path.expanduser(raw))
@@ -94,8 +94,14 @@ def _configured_cores_dir() -> Path | None:
 # desktop RetroArch without its in-app core downloader.
 CORES_DIR = Path(
     os.environ.get("RETROARCH_CORES_DIR")
-    or _configured_cores_dir()
+    or _configured_dir("libretro_directory")
     or Path(XDG_DATA_HOME) / "RetroArch" / "cores"
+)
+# Where cores look for the assets and firmware they cannot ship themselves.
+SYSTEM_DIR = Path(
+    os.environ.get("RETROARCH_SYSTEM_DIR")
+    or _configured_dir("system_directory")
+    or Path(XDG_DATA_HOME) / "RetroArch" / "system"
 )
 # Buildbot ships every core as <core>_libretro.so.zip;
 CORES_BASE_URL = os.environ.get(
@@ -137,6 +143,9 @@ CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", 
 # `thumbnail` is assumed true. Cores that render on the GPU can deadlock
 # RetroArch's main loop on the framebuffer grab that follows a save, which
 # takes the stdin command channel down with it for the rest of the session.
+#
+# `assets` maps a path under the RetroArch system dir to the directory on the
+# image holding those files, for cores that need data the .so does not carry.
 _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 
 
@@ -190,6 +199,40 @@ def _ensure_core(core: str) -> Path:
     os.replace(tmp, so)
     log.info("retroarch: core %s installed at %s", core, so)
     return so
+
+
+def _ensure_core_assets(assets: dict[str, str]) -> None:
+    """Link a core's asset directories into the RetroArch system dir.
+
+    Some cores need data files the buildbot .so does not carry: the ppsspp
+    core refuses to boot without PPSSPP's own asset tree. The container
+    already ships those alongside the standalone app, so this points the core
+    at them rather than downloading a second copy. Symlinks, so an image that
+    updates the app updates what the core reads too.
+
+    Best effort: a missing source is left alone, and the core reports the
+    missing asset itself, which is a clearer error than one raised here.
+    """
+    for target, source in assets.items():
+        src = Path(source)
+        dest = SYSTEM_DIR / target
+        if not src.is_dir():
+            log.warning("retroarch: asset source %s is missing, skipping %s", src, dest)
+            continue
+        if dest.exists() and not dest.is_symlink():
+            # Something real is already there; whoever put it there wins.
+            continue
+        try:
+            if dest.is_symlink():
+                if dest.readlink() == src:
+                    continue
+                dest.unlink()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(src, target_is_directory=True)
+        except OSError as exc:
+            log.error("retroarch: could not link assets %s -> %s: %s", dest, src, exc)
+            continue
+        log.info("retroarch: linked core assets %s -> %s", dest, src)
 
 
 def _write_broker_cfg(thumbnail: bool = True) -> Path:
@@ -520,6 +563,7 @@ class Retroarch(Emulator):
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
             )
         core = _ensure_core(info["core"])
+        _ensure_core_assets(info.get("assets", {}))
         cfg_path = _write_broker_cfg(info.get("thumbnail", True))
 
         binary = os.environ.get("RETROARCH_BIN", "retroarch")

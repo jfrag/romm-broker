@@ -103,6 +103,7 @@
   },
   "psp": {
     "core": "ppsspp",
+    "assets": {"PPSSPP/assets": "/usr/share/ppsspp/assets"},
     "extensions": [".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"]
   },
   "tg16": {
