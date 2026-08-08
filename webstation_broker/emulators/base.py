@@ -92,6 +92,12 @@ class Emulator:
         except ProcessLookupError:
             pass
 
+    def prepare_restore(self) -> None:
+        """Hook run before a save archive is extracted into save_root.
+        Default: nothing. Override to clear anything that would block the
+        restore: a process holding a save file open, or an existing file
+        the newer-file guard would wrongly keep over the archived one."""
+
     def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
         raise NotImplementedError
 
