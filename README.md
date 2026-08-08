@@ -75,6 +75,23 @@ See [docs/reverse-proxy.md](docs/reverse-proxy.md) for the RomM config keys,
 recipes for nginx, Caddy and Traefik, why Zoraxy needs one of them behind it,
 how to verify a mount, and what running more than one container takes.
 
+## Releases
+
+Versions are semver and cut by release-please off `master`. Conventional commit
+subjects drive the bump: `feat:` takes the minor, `fix:` the patch. The action
+opens a release pull request that carries the version into `pyproject.toml` and
+writes `CHANGELOG.md`; merging it tags `vX.Y.Z` and publishes the release.
+
+The image installs a release by source tarball, so nothing has to be attached to
+it:
+
+```
+https://github.com/romm-streaming/romm-broker/archive/refs/tags/vX.Y.Z.tar.gz
+```
+
+While the version is below 1.0.0 a breaking change still takes the minor. Going
+to 1.0.0 is a deliberate call, made with a `Release-As: 1.0.0` commit footer.
+
 ## Dev mode
 
 ```
