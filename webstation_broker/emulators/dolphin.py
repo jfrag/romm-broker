@@ -35,6 +35,10 @@ DOLPHIN_LOG_PATH = Path(os.environ.get("DOLPHIN_LOG_PATH", "/config/dolphin.log"
 # requested slot resolves to this one and the routes echo the effective slot.
 STATE_SLOT = int(os.environ.get("DOLPHIN_STATE_SLOT", "1"))
 
+# EXIDeviceType::MemoryCardFolder, the GC slot A device that keeps saves as
+# loose .gci files under GC/<region>/Card A rather than one .raw card image.
+GC_SLOT_A_DEVICE = 8
+
 # Dolphin's own defaults: Shift+F<n> saves slot n, F<n> loads it.
 SAVE_KEY = f"shift+F{STATE_SLOT}"
 LOAD_KEY = f"F{STATE_SLOT}"
@@ -325,6 +329,10 @@ class Dolphin(Emulator):
             # the render window, which is where the save hotkey has to land.
             "-C", "Dolphin.Analytics.PermissionAsked=True",
             "-C", "Dolphin.Analytics.Enabled=False",
+            # GCI folder, which is also Dolphin's own default. Pinned because
+            # the card sync has to know which layout it is reading, and a
+            # default that moved would silently change where saves live.
+            "-C", f"Dolphin.Core.SlotA={GC_SLOT_A_DEVICE}",
         ]
 
         # A state already on disk (restored from the save archive) loads at boot,
