@@ -44,6 +44,12 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
 XEMU_LOG_PATH = Path(os.environ.get("XEMU_LOG_PATH", "/config/xemu.log"))
 
+# Vulkan aborts xemu on the AMD Renoir/RADV stack these containers run on, and
+# the choice persists in xemu.toml, so one session spent switching renderers
+# leaves every later launch broken. Pinned before each launch; set XEMU_RENDERER
+# to VULKAN where the driver is known good, or to KEEP to leave the file alone.
+XEMU_RENDERER = os.environ.get("XEMU_RENDERER", "OPENGL").strip().upper()
+
 
 def _default_toml_path() -> Path:
     """xemu.toml lives in SDL's pref dir: $XDG_DATA_HOME/xemu/xemu, or
@@ -107,6 +113,52 @@ def _hdd_image_path() -> Path:
                   raw, FALLBACK_HDD_IMAGE)
         return FALLBACK_HDD_IMAGE
     return p
+
+
+_DISPLAY_HEADER_RE = re.compile(r"^\[display\][ \t]*$", re.MULTILINE)
+_NEXT_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
+_RENDERER_RE = re.compile(r"^renderer[ \t]*=.*$", re.MULTILINE)
+
+
+def _pin_renderer() -> None:
+    """Rewrite [display] renderer in xemu.toml to XEMU_RENDERER.
+
+    Edited as text rather than reparsed and dumped: tomllib only reads, and a
+    round trip through a writer would flatten the comments and key order xemu
+    maintains in the file it owns."""
+    if XEMU_RENDERER in ("", "KEEP"):
+        return
+    try:
+        text = XEMU_TOML.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Nothing to pin on a container where xemu has never run; it writes the
+        # file on first exit, and its own default renderer is OpenGL.
+        log.debug("could not read %s to pin the renderer (%s)", XEMU_TOML, exc)
+        return
+
+    line = f"renderer = '{XEMU_RENDERER}'"
+    header = _DISPLAY_HEADER_RE.search(text)
+    if header is None:
+        updated = text.rstrip("\n") + f"\n\n[display]\n{line}\n"
+    else:
+        body_start = header.end()
+        next_section = _NEXT_SECTION_RE.search(text, body_start)
+        body_end = next_section.start() if next_section else len(text)
+        body = text[body_start:body_end]
+        if _RENDERER_RE.search(body):
+            body = _RENDERER_RE.sub(line, body, count=1)
+        else:
+            body = f"\n{line}" + body
+        updated = text[:body_start] + body + text[body_end:]
+
+    if updated == text:
+        return
+    try:
+        XEMU_TOML.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        log.error("could not pin renderer in %s: %s", XEMU_TOML, exc)
+        return
+    log.info("pinned xemu renderer to %s", XEMU_RENDERER)
 
 
 def _disc_number(rel: Path) -> int:
@@ -509,6 +561,8 @@ class Xemu(Emulator):
         if resume_slot:
             log.warning("resume: save states are not supported on a raw HDD "
                         "image; slot %d ignored, booting fresh", resume_slot)
+
+        _pin_renderer()
 
         log.info("launching xemu (rom=%s)", rom_path)
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], base_launch_env())

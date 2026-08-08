@@ -6,6 +6,7 @@ inject and extract hooks have to get right.
 """
 
 import struct
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,119 @@ def test_a_failed_conversion_leaves_the_qcow2_playable(tmp_path, monkeypatch):
     monkeypatch.setattr(xemu.subprocess, "run", fake_run)
     assert xemu._ensure_raw_image(image) is False
     assert image.read_bytes() == original
+
+
+# ── Renderer pin ─────────────────────────────────────────────────────────────
+
+
+# A config shaped like the one xemu writes: comments, several tables, and a
+# [display.quality] subtable right after the [display] body the pin edits.
+FULL_TOML = """\
+[general]
+show_welcome = false
+
+[display]
+renderer = 'VULKAN'
+# how the guest frame is fitted to the window
+ui_scale = 2
+
+[display.quality]
+surface_scale = 1
+
+[sys.files]
+hdd_path = '/config/xemu/xbox_hdd.qcow2'
+"""
+
+
+@pytest.fixture
+def pinned(monkeypatch, tmp_path):
+    """Point the pin at a throwaway config and default it to OpenGL."""
+    cfg = tmp_path / "xemu.toml"
+    monkeypatch.setattr(xemu, "XEMU_TOML", cfg)
+    monkeypatch.setattr(xemu, "XEMU_RENDERER", "OPENGL")
+    return cfg
+
+
+def _renderer_of(cfg: Path) -> str:
+    return tomllib.loads(cfg.read_text())["display"]["renderer"]
+
+
+def test_a_vulkan_config_is_pinned_back_to_opengl(pinned):
+    pinned.write_text(FULL_TOML)
+    xemu._pin_renderer()
+    assert _renderer_of(pinned) == "OPENGL"
+
+
+def test_pinning_leaves_the_rest_of_the_config_alone(pinned):
+    """The file belongs to xemu; the pin owns exactly one key in it."""
+    pinned.write_text(FULL_TOML)
+    xemu._pin_renderer()
+    after = pinned.read_text()
+    assert after == FULL_TOML.replace("renderer = 'VULKAN'", "renderer = 'OPENGL'")
+    assert "# how the guest frame is fitted to the window" in after
+    assert tomllib.loads(after)["display"]["quality"]["surface_scale"] == 1
+
+
+def test_a_display_section_without_a_renderer_gains_one(pinned):
+    pinned.write_text("[display]\nui_scale = 2\n\n[sys]\nmem = 64\n")
+    xemu._pin_renderer()
+    assert _renderer_of(pinned) == "OPENGL"
+    assert tomllib.loads(pinned.read_text())["sys"]["mem"] == 64
+
+
+def test_a_config_with_no_display_section_gains_one(pinned):
+    pinned.write_text("[general]\nshow_welcome = false\n")
+    xemu._pin_renderer()
+    assert _renderer_of(pinned) == "OPENGL"
+
+
+def test_the_renderer_is_configurable_for_hardware_where_vulkan_works(pinned, monkeypatch):
+    monkeypatch.setattr(xemu, "XEMU_RENDERER", "VULKAN")
+    pinned.write_text("[display]\nrenderer = 'OPENGL'\n")
+    xemu._pin_renderer()
+    assert _renderer_of(pinned) == "VULKAN"
+
+
+@pytest.mark.parametrize("setting", ["KEEP", ""])
+def test_the_pin_can_be_turned_off(pinned, monkeypatch, setting):
+    monkeypatch.setattr(xemu, "XEMU_RENDERER", setting)
+    pinned.write_text(FULL_TOML)
+    xemu._pin_renderer()
+    assert pinned.read_text() == FULL_TOML
+
+
+def test_a_missing_config_is_not_created(pinned):
+    """xemu writes the file itself, and its own default is already OpenGL."""
+    xemu._pin_renderer()
+    assert not pinned.exists()
+
+
+def test_an_unwritable_config_does_not_stop_the_launch(pinned, monkeypatch):
+    pinned.write_text(FULL_TOML)
+
+    def fail(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "write_text", fail)
+    xemu._pin_renderer()
+    assert _renderer_of(pinned) == "VULKAN"
+
+
+def test_launch_pins_the_renderer_before_spawning(emulator, monkeypatch, tmp_path):
+    """The pin is worthless if a launch can get past it."""
+    cfg = xemu.XEMU_TOML
+    cfg.write_text(cfg.read_text() + "\n[display]\nrenderer = 'VULKAN'\n")
+    monkeypatch.setattr(xemu, "XEMU_RENDERER", "OPENGL")
+    monkeypatch.setattr(xemu, "_reap_strays", lambda: None)
+    monkeypatch.setattr(xemu.Xemu, "stop", lambda self: None)
+
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(xemu.Xemu, "_spawn",
+                        lambda self, cmd, env: spawned.append(cmd))
+
+    emulator.launch(_xiso(tmp_path / "g.iso"), None)
+    assert spawned, "launch did not spawn xemu"
+    assert _renderer_of(cfg) == "OPENGL"
 
 
 # ── FATX save sync ───────────────────────────────────────────────────────────
