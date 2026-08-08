@@ -275,7 +275,9 @@ def _disc_title_id(rom_path: Path) -> str | None:
             cert = fh.read(12)
             if len(cert) < 12:
                 return None
-            return f"{int.from_bytes(cert[8:12], 'little'):08x}"
+            # Uppercase because that is how the dashboard names the directory
+            # it creates, and a directory this code creates has to match.
+            return f"{int.from_bytes(cert[8:12], 'little'):08X}"
     except OSError as exc:
         log.warning("could not read %s for a title id: %s", rom_path, exc)
         return None
@@ -297,6 +299,24 @@ def _fatx_isdir(fs: Fatx, path: str) -> bool:
         return bool(fs.get_attr(path).is_directory)
     except AssertionError:
         return False
+
+
+def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
+    """Path of `parent`'s child directory matching `name` whatever its case.
+
+    libfatx compares names byte for byte, so a lookup has to use the case the
+    disk actually holds. Titles vary in how they case their save directories,
+    and the miss would be silent: nothing resolves, nothing is extracted, and
+    the session's saves stay behind in the image."""
+    wanted = name.lower()
+    try:
+        entries = list(fs.listdir(parent))
+    except (AssertionError, OSError):
+        return None
+    for attr in entries:
+        if attr.is_directory and attr.filename.lower() == wanted:
+            return f"{parent.rstrip('/')}/{attr.filename}"
+    return None
 
 
 # ── Provider ─────────────────────────────────────────────────────────────────
@@ -364,18 +384,26 @@ class Xemu(Emulator):
         if fs is None:
             return 0
         written = 0
-        ensured_dirs: set[str] = set()
+        # Directory paths as they exist on the image, keyed by the staged
+        # (case-bearing) components, so an archive whose case differs from the
+        # disk's lands in the existing directory instead of a twin beside it.
+        resolved: dict[tuple[str, ...], str] = {(): ""}
         for p in files:
             parts = p.relative_to(self.staging_dir).parts
-            fatx_path = "/" + "/".join(parts)
             try:
+                parent = ""
                 for i in range(1, len(parts)):
-                    d = "/" + "/".join(parts[:i])
-                    if d in ensured_dirs:
+                    key = parts[:i]
+                    if key in resolved:
+                        parent = resolved[key]
                         continue
-                    if not _fatx_isdir(fs, d):
-                        fs.mkdir(d)
-                    ensured_dirs.add(d)
+                    found = _fatx_find_dir(fs, parent or "/", parts[i - 1])
+                    if found is None:
+                        found = f"{parent}/{parts[i - 1]}"
+                        fs.mkdir(found)
+                    resolved[key] = found
+                    parent = found
+                fatx_path = f"{parent}/{parts[-1]}"
                 data = p.read_bytes()
                 fs.write(fatx_path, data)
                 # pyfatx write() never shrinks an existing file; drop the old
@@ -399,9 +427,19 @@ class Xemu(Emulator):
             return 0
         roots = []
         for top in ("UDATA", "TDATA"):
-            src = f"/{top}/{self._title_id}" if self._title_id else f"/{top}"
-            if _fatx_isdir(fs, src):
+            if not _fatx_isdir(fs, f"/{top}"):
+                continue
+            if not self._title_id:
+                roots.append(f"/{top}")
+                continue
+            src = _fatx_find_dir(fs, f"/{top}", self._title_id)
+            if src is None:
+                log.info("no /%s/%s on the HDD image", top, self._title_id)
+            else:
                 roots.append(src)
+        if not roots:
+            log.warning("no save directories found on %s for title %s; the "
+                        "archive will be empty", self.hdd_image, self._title_id or "<all>")
         extracted = 0
         for src in roots:
             for root, _dirs, filenames in fs.walk(src):
