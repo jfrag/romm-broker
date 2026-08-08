@@ -49,10 +49,11 @@ def test_the_dolphin_core_keeps_state_thumbnails_off(slug):
 
 def test_psp_declares_where_the_core_finds_its_assets():
     """The ppsspp core will not boot without PPSSPP's own asset tree, which the
-    buildbot .so does not carry."""
+    buildbot .so does not carry. It reads the files straight out of PPSSPP/, so
+    linking the tree one level deeper hides them from it."""
     assets = retroarch._platform_info("psp")["assets"]
 
-    assert assets["PPSSPP/assets"].endswith("/assets")
+    assert assets["PPSSPP"].endswith("/assets")
 
 
 class TestCoreAssets:
