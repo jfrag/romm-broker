@@ -146,6 +146,70 @@ def _load_platforms() -> dict[str, dict]:
 
 
 PLATFORMS: dict[str, dict] = _load_platforms()
+#
+# `thumbnail` is assumed true. Cores that render on the GPU can deadlock
+# RetroArch's main loop on the framebuffer grab that follows a save, which
+# takes the stdin command channel down with it for the rest of the session.
+PLATFORMS: dict[str, dict] = {
+    "ngc": {
+        "core": "dolphin",
+        "thumbnail": False,
+        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".chd", ".wad", ".dol", ".elf"),
+        "save_subtrees": (
+            "states",
+            "saves/dolphin-emu/User/GC",
+            "saves/dolphin-emu/User/Wii/title",
+            "saves/dolphin-emu/User/Wii/shared2",
+        ),
+    },
+    "wii": {
+        "core": "dolphin",
+        "thumbnail": False,
+        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"),
+        "save_subtrees": (
+            "states",
+            "saves/dolphin-emu/User/GC",
+            "saves/dolphin-emu/User/Wii/title",
+            "saves/dolphin-emu/User/Wii/shared2",
+        ),
+    },
+    "snes": {
+        "core": "snes9x",
+        "extensions": (".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"),
+    },
+    "n64": {
+        "core": "mupen64plus_next",
+        "extensions": (".n64", ".z64", ".v64", ".rom", ".ndd"),
+    },
+    "dc": {
+        "core": "flycast",
+        "extensions": (".gdi", ".cdi", ".chd", ".cue", ".m3u", ".iso", ".bin"),
+    },
+    "saturn": {
+        "core": "yabasanshiro",
+        "extensions": (".cue", ".chd", ".iso", ".bin", ".m3u", ".ccd", ".toc"),
+    },
+    "psp": {
+        "core": "ppsspp",
+        "extensions": (".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"),
+    },
+    "nds": {
+        "core": "melonds",
+        "extensions": (".nds", ".srl"),
+    },
+    "3ds": {
+        "core": "citra",
+        "extensions": (".3ds", ".cci", ".cxi", ".cia", ".3dsx", ".app", ".srl"),
+    },
+    "arcade": {
+        "core": "fbneo",
+        "extensions": (".zip", ".7z", ".chd"),
+    },
+    "genesis": {
+        "core": "genesis_plus_gx",
+        "extensions": (".md", ".gen", ".smd", ".bin", ".sg", ".sms", ".gg", ".cue"),
+    },
+}
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _ADDON_RE = re.compile(
@@ -188,7 +252,7 @@ def _ensure_core(core: str) -> Path:
     return so
 
 
-def _write_broker_cfg() -> Path:
+def _write_broker_cfg(thumbnail: bool = True) -> Path:
     """Minimal per-launch config, applied *on top of* the user's config.
     Only the stdin interface and the broker save dirs; nothing else."""
     RA_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -201,6 +265,7 @@ def _write_broker_cfg() -> Path:
         'savestate_auto_save = "false"\n'
         'savestate_auto_load = "false"\n'
         'savestate_auto_index = "false"\n'
+        f'savestate_thumbnail_enable = "{"true" if thumbnail else "false"}"\n'
         # The stdin QUIT must exit immediately, not arm a "press again"
         # confirmation.
         'confirm_quit = "false"\n'
@@ -515,7 +580,7 @@ class Retroarch(Emulator):
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
             )
         core = _ensure_core(info["core"])
-        cfg_path = _write_broker_cfg()
+        cfg_path = _write_broker_cfg(info.get("thumbnail", True))
 
         binary = os.environ.get("RETROARCH_BIN", "retroarch")
         if "/" not in binary and shutil.which(binary) is None:
