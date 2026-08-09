@@ -1,11 +1,15 @@
 """The HTTP surface RomM drives the container through."""
 
 import io
+import signal
 import zipfile
 
 import pytest
+from fastapi.testclient import TestClient
 
 from webstation_broker import session, settings
+from webstation_broker.app import create_app
+from webstation_broker.emulators import base
 
 from .conftest import PREFIX
 
@@ -490,6 +494,24 @@ def test_exit_carries_slot_zero_rather_than_falling_back_to_the_default(
     client.post(f"{API}/session/exit", params={"slot": 0})
 
     assert fake_emulator[0].exit_slots == [0]
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, ""])
+def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
+    prefix, pid_record, sleeper, monkeypatch
+):
+    """Exit answers 409 with no session, so a broker that comes back to an
+    orphan can only kill it at startup. Both app shapes are checked because
+    Starlette hands the lifespan to the served app, never to a mounted one."""
+    monkeypatch.setattr(settings, "PREFIX", prefix)
+    proc = sleeper()
+    base._record_pid("fake", proc.pid, ["/usr/bin/sleep", "60"])
+
+    with TestClient(create_app()):
+        pass
+
+    assert proc.wait(timeout=10) == -signal.SIGTERM
+    assert not pid_record.exists()
 
 
 def test_exiting_nothing_is_a_conflict(client):

@@ -60,29 +60,24 @@ def test_the_desktop_launcher_needs_no_rom():
     assert emulators.get_emulator("desktop").requires_rom is False
 
 
-@pytest.fixture
-def pid_record(monkeypatch, tmp_path):
-    """Point the pid record at tmp_path and hand back its path."""
-    path = tmp_path / "broker-emulator.json"
-    monkeypatch.setattr(base, "PID_FILE", path)
-    return path
+def _child_of(pid: int) -> int | None:
+    """The first process reporting `pid` as its parent, or None.
 
-
-@pytest.fixture
-def sleeper():
-    """A process in its own session, standing in for a running emulator."""
-    procs = []
-
-    def spawn():
-        proc = subprocess.Popen(["/usr/bin/sleep", "60"], start_new_session=True)
-        procs.append(proc)
-        return proc
-
-    yield spawn
-    for proc in procs:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
+    Read out of PPid rather than /proc/<pid>/task/<pid>/children, which needs a
+    kernel built with CONFIG_PROC_CHILDREN and is missing on some of them."""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        for line in status.splitlines():
+            if line.startswith("PPid:"):
+                if int(line.split()[1]) == pid:
+                    return int(entry.name)
+                break
+    return None
 
 
 def test_reaping_kills_an_emulator_an_earlier_broker_left_running(
@@ -116,13 +111,11 @@ def test_reaping_leaves_a_pid_that_leads_no_process_group_alone(pid_record):
     not a group leader is not the emulator, and killing its group would take
     down whatever unrelated process tree it belongs to."""
     parent = subprocess.Popen(["/bin/sh", "-c", "sleep 60; true"], start_new_session=True)
-    children = Path(f"/proc/{parent.pid}/task/{parent.pid}/children")
     try:
         deadline = time.monotonic() + 5.0
         child = None
         while child is None and time.monotonic() < deadline:
-            found = children.read_text().split()
-            child = int(found[0]) if found else None
+            child = _child_of(parent.pid)
             if child is None:
                 time.sleep(0.1)
         assert child is not None

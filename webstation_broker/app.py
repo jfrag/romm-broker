@@ -34,7 +34,13 @@ async def _lifespan(_app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    inner = FastAPI(title="webstation-broker", lifespan=_lifespan)
+    # The lifespan belongs to whichever app is actually served. Starlette never
+    # hands the lifespan scope to a mounted sub-app, so a startup hook on the
+    # inner app would silently never run behind a prefix.
+    prefixed = bool(settings.PREFIX)
+    inner = FastAPI(
+        title="webstation-broker", lifespan=None if prefixed else _lifespan
+    )
     inner.include_router(api.router)
     inner.include_router(room.router)
 
@@ -45,8 +51,8 @@ def create_app() -> FastAPI:
             name="frontend",
         )
 
-    if settings.PREFIX:
-        root = FastAPI()
+    if prefixed:
+        root = FastAPI(lifespan=_lifespan)
         root.mount(settings.PREFIX, inner)
         return root
     return inner
