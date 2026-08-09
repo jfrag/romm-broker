@@ -590,7 +590,7 @@ class Xemu(Emulator):
             else:
                 log.error("pre-launch: HDD image is not raw; restored saves were NOT injected")
 
-        if resume_slot:
+        if resume_slot is not None:
             log.warning("resume: save states are not supported on a raw HDD "
                         "image; slot %d ignored, booting fresh", resume_slot)
 

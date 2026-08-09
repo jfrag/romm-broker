@@ -351,7 +351,7 @@ class Rpcs3(Emulator):
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
         self._restoring = False
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "rpcs3 save states are unsupported, resume_slot %s ignored "
                 "(game resumes from its own save data)",

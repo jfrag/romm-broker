@@ -405,7 +405,7 @@ class Pcsx2(Emulator):
             [binary, "-batch", "-fullscreen", "--", str(rom_path)], base_launch_env()
         )
 
-        if resume_slot:
+        if resume_slot is not None:
             Thread(
                 target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
             ).start()

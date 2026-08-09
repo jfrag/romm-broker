@@ -119,7 +119,7 @@ class Shadps4(Emulator):
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "shadps4 has no save states, resume_slot %s ignored "
                 "(game resumes from its own save data)",

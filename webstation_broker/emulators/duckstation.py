@@ -214,8 +214,8 @@ class Duckstation(Emulator):
         _patch_ini()
 
         cmd = [os.environ.get("DUCKSTATION_BIN", "/opt/duckstation/AppRun"), "-batch", "-fullscreen"]
-        state = _newest_resume_state() if resume_slot else None
-        if resume_slot and state is None:
+        state = _newest_resume_state() if resume_slot is not None else None
+        if resume_slot is not None and state is None:
             log.warning("resume requested but no resume state in %s", SSTATE_DIR)
         if state is not None:
             cmd += ["-statefile", str(state)]

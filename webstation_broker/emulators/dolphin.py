@@ -337,7 +337,7 @@ class Dolphin(Emulator):
 
         # A state already on disk (restored from the save archive) loads at boot,
         # which is both more reliable than the hotkey and invisible to the player.
-        resume_path = _state_for_slot(STATE_SLOT) if resume_slot else None
+        resume_path = _state_for_slot(STATE_SLOT) if resume_slot is not None else None
         if resume_path is not None:
             cmd += ["-s", str(resume_path)]
 
@@ -347,7 +347,7 @@ class Dolphin(Emulator):
 
         # RomM pushes its resume pick after activate returns, so a slot that was
         # empty at launch can still fill. That one has to go in over the hotkey.
-        if resume_slot and resume_path is None:
+        if resume_slot is not None and resume_path is None:
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _deferred_load_state(self, seq: int) -> None:

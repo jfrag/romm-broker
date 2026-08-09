@@ -604,7 +604,9 @@ class Retroarch(Emulator):
         )
         self._spawn_ra(cmd, base_launch_env())
 
-        if resume_slot:
+        # Slot 0 is a real slot here, so the gate is on the request, not on the
+        # number: `if resume_slot` would drop every resume this broker asks for.
+        if resume_slot is not None:
             threading.Thread(
                 target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
             ).start()

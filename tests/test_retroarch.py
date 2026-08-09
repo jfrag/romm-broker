@@ -177,3 +177,50 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples():
         assert isinstance(info["extensions"], tuple), slug
         if "save_subtrees" in info:
             assert isinstance(info["save_subtrees"], tuple), slug
+
+
+class TestResumeGate:
+    """Slot 0 is this broker's only working slot, so a launch asking to resume
+    it must still start the deferred load."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_launch(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(retroarch, "_ensure_core", lambda name: tmp_path / f"{name}.so")
+        monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
+        monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
+        monkeypatch.setattr(retroarch.shutil, "which", lambda binary: "/usr/bin/retroarch")
+        monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
+        monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
+
+        started = []
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), daemon=False):
+                self.args = args
+
+            def start(self):
+                started.append(self.args)
+
+        monkeypatch.setattr(retroarch.threading, "Thread", FakeThread)
+        return started
+
+    def _launch(self, tmp_path, resume_slot):
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+        emu.launch(tmp_path / "game.sfc", resume_slot)
+        return emu
+
+    def test_slot_zero_still_defers_a_load(self, tmp_path, _stub_launch):
+        self._launch(tmp_path, 0)
+
+        assert [args[0] for args in _stub_launch] == [0]
+
+    def test_a_nonzero_slot_defers_a_load(self, tmp_path, _stub_launch):
+        self._launch(tmp_path, 3)
+
+        assert [args[0] for args in _stub_launch] == [3]
+
+    def test_no_resume_request_defers_nothing(self, tmp_path, _stub_launch):
+        self._launch(tmp_path, None)
+
+        assert _stub_launch == []
