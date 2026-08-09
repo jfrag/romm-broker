@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from . import callback, memcard, saves, selkies, session, settings
 from .emulators import get_emulator
+from .emulators.base import reap_orphan
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -150,6 +151,12 @@ async def activate(
             status_code=409,
             detail="a session is already active; exit it before activating a new one",
         )
+
+    # No session is active, so any emulator still running was left behind by an
+    # earlier broker process. Killing it here is the only way it ever gets
+    # killed: nothing else holds a handle on it, and launching over the top
+    # would leave two emulators sharing the screen and the audio sink.
+    await anyio.to_thread.run_sync(reap_orphan)
 
     emulator = get_emulator(body.emulator)
     if emulator is None:
@@ -306,8 +313,11 @@ async def invite(body: InviteIn, token: str = Query()):
     }
 
 
-async def _do_exit(save_slot: int) -> dict:
-    """Save state, stop the emulator, dump the save delta, and report."""
+async def _do_exit(save_slot: int | None) -> dict:
+    """Save state, stop the emulator, dump the save delta, and report.
+
+    `save_slot` of None exits without writing a state. The save dump still
+    runs: the game's own save data belongs to the player either way."""
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         raise HTTPException(status_code=409, detail="no active session")
@@ -405,14 +415,21 @@ async def exit_session(
     request: Request,
     x_broker_secret: Optional[str] = Header(default=None),
     token: Optional[str] = Query(default=None),
-    slot: int = Query(default=10, ge=1, le=10),
+    slot: int = Query(default=0, ge=0, le=10),
+    save: bool = Query(default=True),
 ):
-    """Accepts either the broker secret or the controller token."""
+    """Accepts either the broker secret or the controller token.
+
+    `save=0` is the stop that writes no state. Slot 0 is a real slot on this
+    broker, which is why the two are separate: there is no slot number left to
+    spend on meaning "do not save". A caller with no opinion on the slot gets
+    slot 0 too: every emulator here saves into its own working slot and echoes
+    back the one it used, so any other default would just be a lie in the log."""
     sess = session.SESSION
     is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
     if not is_controller:
         _check_secret(x_broker_secret)
-    return await _do_exit(slot)
+    return await _do_exit(slot if save else None)
 
 
 def _state_emulator():

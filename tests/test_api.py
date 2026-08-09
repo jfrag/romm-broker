@@ -463,6 +463,35 @@ def test_a_stranger_cannot_exit_someone_else_session(
     assert session.SESSION is not None
 
 
+def test_exit_with_save_off_writes_no_state_but_still_dumps_the_saves(
+    client, broker_dirs, fake_emulator, monkeypatch
+):
+    """A player leaving without saving gets no state written, and the game's
+    own save data still travels: that progress is theirs either way."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    (fake_emulator[0].save_root / "saves" / "card.bin").write_bytes(b"played")
+
+    body = client.post(f"{API}/session/exit", params={"save": "false"}).json()
+
+    assert fake_emulator[0].exit_slots == [None]
+    assert body["state_saved"] is False
+    assert body["state_slot"] is None
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/card.bin"]
+
+
+def test_exit_carries_slot_zero_rather_than_falling_back_to_the_default(
+    client, broker_dirs, fake_emulator
+):
+    """Slot 0 is a real slot here, so a request asking for it has to arrive as
+    0 and not be mistaken for "nothing was asked for"."""
+    _activate(client, broker_dirs)
+
+    client.post(f"{API}/session/exit", params={"slot": 0})
+
+    assert fake_emulator[0].exit_slots == [0]
+
+
 def test_exiting_nothing_is_a_conflict(client):
     assert client.post(f"{API}/session/exit").status_code == 409
 

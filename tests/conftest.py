@@ -76,6 +76,7 @@ class FakeEmulator(Emulator):
         self.cleared = False
         self.saved_slots = []
         self.loaded_slots = []
+        self.exit_slots = []
         self.running = True
         self.state_file: Path | None = None
 
@@ -111,8 +112,11 @@ class FakeEmulator(Emulator):
     def state_target(self, filename: str) -> Path | None:
         return self.state_file
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
+        self.exit_slots.append(slot)
         self.stop()
+        if slot is None:
+            return {"state_saved": False, "state_slot": None, "state_file": None}
         return {"state_saved": True, "state_slot": self.state_slot, "state_file": None}
 
 

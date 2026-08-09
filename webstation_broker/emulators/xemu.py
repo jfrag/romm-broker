@@ -599,7 +599,7 @@ class Xemu(Emulator):
         log.info("launching xemu (rom=%s)", rom_path)
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         self.stop()
         _reap_strays()
         extracted = 0

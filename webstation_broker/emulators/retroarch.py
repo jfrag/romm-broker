@@ -720,12 +720,12 @@ class Retroarch(Emulator):
             return existing
         return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
         if self.alive():
             info = _platform_info(self.platform)
-            if info is None or info.get("savestate", True):
+            if slot is not None and (info is None or info.get("savestate", True)):
                 saved = self.save_state(slot)
                 if saved:
                     p = self.state_path()
@@ -735,7 +735,11 @@ class Retroarch(Emulator):
             # Flush SRAM so the save dump ships current save data.
             self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
         self._quit()
-        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
+        return {
+            "state_saved": saved,
+            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_file": state_file,
+        }
 
     def _quit(self) -> None:
         proc = self._proc
@@ -748,7 +752,7 @@ class Retroarch(Emulator):
                 pass
             try:
                 proc.wait(timeout=QUIT_CONFIRM_GAP)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except subprocess.TimeoutExpired:
@@ -765,7 +769,7 @@ class Retroarch(Emulator):
                     pass
             try:
                 proc.wait(timeout=QUIT_WAIT)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except (BrokenPipeError, OSError):

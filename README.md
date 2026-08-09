@@ -54,6 +54,7 @@ frontend/                vite vanilla-JS room interface
 | `ROM_ROOT` | `/romm` | activate rejects rom paths outside this root |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | where exit writes save archives (always in dev mode, otherwise only when the upload fails) |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |
+| `BROKER_PID_FILE` | `/config/broker-emulator.json` | where the running emulator's pid is recorded so a restarted broker can still kill it |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | path appended to the callback base URL when exit POSTs the save archive |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
 | `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | ceiling on one state file over the state-file routes; RomM caps the same transfer |

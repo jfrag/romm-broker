@@ -1,5 +1,6 @@
 """Emulator interface and shared launch plumbing."""
 
+import json
 import logging
 import os
 import signal
@@ -10,6 +11,14 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
+
+# Where the running emulator's pid is recorded, so it can still be killed by a
+# broker process that never spawned it. Emulators are started in their own
+# session, so nothing else ties them to the broker: a broker restart (an s6
+# bounce, or uvicorn --reload picking up an edit mid-session) otherwise leaves
+# one playing with no handle on it, and the next launch stacks a second
+# emulator on top of the first.
+PID_FILE = Path(os.environ.get("BROKER_PID_FILE", "/config/broker-emulator.json"))
 
 
 def base_launch_env() -> dict[str, str]:
@@ -25,6 +34,81 @@ def base_launch_env() -> dict[str, str]:
             path = f"{path}:{extra}"
     env["PATH"] = path
     return env
+
+
+def _record_pid(name: str, pid: int, cmd: list[str]) -> None:
+    # Written through a temp file: the record exists for the case where the
+    # broker dies, and a broker that dies mid-write would otherwise leave
+    # half a line of JSON and no way to find the emulator it left behind.
+    tmp = PID_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps({"name": name, "pid": pid, "cmd": cmd}))
+        tmp.replace(PID_FILE)
+    except OSError as exc:
+        log.warning("could not record emulator pid: %s", exc)
+
+
+def _clear_pid_record() -> None:
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log.warning("could not clear emulator pid record: %s", exc)
+
+
+def _cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part for part in raw.decode(errors="replace").split("\0") if part]
+
+
+def reap_orphan() -> dict | None:
+    """Kill an emulator left running by an earlier broker process.
+
+    Only ever kills the pid the broker itself recorded, and only while that pid
+    is still running the command it was recorded with, so a recycled pid is
+    left alone. Returns what was killed, or None.
+    """
+    try:
+        record = json.loads(PID_FILE.read_text())
+    except (FileNotFoundError, ValueError):
+        return None
+    except OSError as exc:
+        log.warning("could not read emulator pid record: %s", exc)
+        return None
+
+    pid, cmd = record.get("pid"), record.get("cmd")
+    # An empty cmd would match the empty cmdline every dead pid reports, so a
+    # record that cannot identify its process is thrown away rather than acted
+    # on: the pid may belong to something else entirely by now.
+    if not isinstance(pid, int) or not cmd or _cmdline(pid) != cmd:
+        _clear_pid_record()
+        return None
+
+    try:
+        # Emulators are spawned with start_new_session, so the recorded pid is
+        # its own session and group leader. A pid that is not one is not the
+        # process that was recorded, whatever its cmdline says.
+        pgid = os.getpgid(pid)
+        if pgid != pid or _cmdline(pid) != cmd:
+            _clear_pid_record()
+            return None
+
+        log.warning("reaping orphaned %s (pid %d) from an earlier broker process",
+                    record.get("name", "emulator"), pid)
+        os.killpg(pgid, signal.SIGTERM)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and _cmdline(pid) == cmd:
+            time.sleep(0.2)
+        if _cmdline(pid) == cmd:
+            os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError) as exc:
+        log.warning("could not kill orphaned pid %d: %s", pid, exc)
+    _clear_pid_record()
+    return record
 
 
 class Emulator:
@@ -90,13 +174,23 @@ class Emulator:
         finally:
             if log_fh:
                 log_fh.close()
+        _record_pid(self.name, self._proc.pid, cmd)
 
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def _forget(self) -> None:
+        """Drop the handle on the emulator and the record of it on disk.
+
+        Every path that ends with the process gone has to go through here.
+        A graceful exit that only clears `_proc` leaves a record pointing at a
+        pid nobody owns, and the next broker start would hunt it."""
+        self._proc = None
+        _clear_pid_record()
+
     def stop(self) -> None:
         proc = self._proc
-        self._proc = None
+        self._forget()
         if proc is None or proc.poll() is not None:
             return
         log.info("stopping %s (pid %d)", self.name, proc.pid)
@@ -189,8 +283,13 @@ class Emulator:
             time.sleep(poll)
         return self.state_path() is not None
 
-    def save_and_exit(self, slot: int) -> dict:
-        """Save state (best effort) and stop. Default: nothing to save."""
+    def save_and_exit(self, slot: int | None) -> dict:
+        """Save state (best effort) and stop. Default: nothing to save.
+
+        A `slot` of None is an exit that writes no state. The game's own save
+        data is still flushed and shipped: not writing a state is the whole of
+        "exit without saving", and discarding an in-game save the player made
+        at a save point would be losing real progress."""
         self.stop()
         return {"state_saved": None, "state_slot": None, "state_file": None}
 

@@ -425,10 +425,10 @@ class Dolphin(Emulator):
         except OSError as exc:
             log.warning("could not drop the undo state buffer: %s", exc)
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
-        if self.alive():
+        if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
                 p = self.state_path()
@@ -437,7 +437,11 @@ class Dolphin(Emulator):
                     state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         self._drop_undo_buffer()
-        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
+        return {
+            "state_saved": saved,
+            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_file": state_file,
+        }
 
     def stop(self) -> None:
         # Invalidate any in-flight deferred state load before the kill.

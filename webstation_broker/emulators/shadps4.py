@@ -157,7 +157,7 @@ class Shadps4(Emulator):
                 proc.stdin.write(b"STOP\n")
                 proc.stdin.flush()
                 proc.wait(timeout=self.term_timeout)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except (BrokenPipeError, OSError):

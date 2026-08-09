@@ -7,11 +7,14 @@ mode vite serves the frontend instead.
 """
 
 import logging
+from contextlib import asynccontextmanager
 
+import anyio.to_thread
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from . import api, room, settings
+from .emulators.base import reap_orphan
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,8 +23,18 @@ logging.basicConfig(
 )
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # A fresh broker holds no session, so an emulator recorded by the process
+    # that came before is playing to nobody. Killing it here rather than at the
+    # next activate is what keeps it killable at all: exit answers 409 without a
+    # session, so otherwise the only way out is launching another game.
+    await anyio.to_thread.run_sync(reap_orphan)
+    yield
+
+
 def create_app() -> FastAPI:
-    inner = FastAPI(title="webstation-broker")
+    inner = FastAPI(title="webstation-broker", lifespan=_lifespan)
     inner.include_router(api.router)
     inner.include_router(room.router)
 
