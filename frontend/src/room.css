@@ -522,6 +522,25 @@ iframe {
   gap: 10px;
 }
 
+.sidebar-invite-section h3 {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--sidebar-header-color);
+}
+
+/* .control-btn is a fixed 45px circle sized for a single icon. These carry a
+   full label instead, in 18 languages, so drop the circular geometry and let
+   the button grow to whatever the text needs. */
+.sidebar-invite-section .invite-copy {
+  width: 100%;
+  height: auto;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
 .theme-toggle {
   width: 40px;
   height: 20px;
@@ -1594,4 +1613,21 @@ iframe {
 }
 #exit-report.hidden {
     display: none;
+}
+
+/* Solo sessions: the room is one person, so chat, webcam and mic are noise.
+   Game volume and the session controls stay. Presence reveals these again the
+   moment a second person connects.
+   The whole video bar goes, gamepad assignment box included. That box only
+   exists to drag pads onto other people, and the lone host already holds
+   gamepad 1 from new_session, so solo it assigns nothing. Keeping the bar for
+   it would cost 200px of game view (#video-grid is min-height 200px and
+   flex-shrink 0) with no toggle handle left to collapse it. */
+body.solo-mode #toggle-mic-btn,
+body.solo-mode #toggle-video-btn,
+body.solo-mode #chat-form-container,
+body.solo-mode #sidebar-main-content,
+body.solo-mode #video-grid,
+body.solo-mode #video-toggle-handle {
+  display: none;
 }

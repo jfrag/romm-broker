@@ -41,6 +41,7 @@ const en = {
         lockResolution: 'Lock/Unlock Resolution',
         resizeClient: 'Resize to Client',
         exitSession: 'Exit Game',
+        invite: 'Invite someone to this session',
     },
     usernamePrompt: {
         title: 'Welcome!',
@@ -67,6 +68,9 @@ const en = {
         participant: 'Collaboration User Invite',
         readonly: 'Read Only User Invite',
         readonlyParticipantView: 'Read Only Invite',
+        heading: 'Invite someone',
+        copied: 'Link copied',
+        failed: 'Could not create an invite link',
     },
     disconnect: {
         title: 'Disconnected',
@@ -122,6 +126,7 @@ const es = {
         gamingMode: 'Modo Juego',
         lockResolution: 'Bloquear/Desbloquear resolución',
         resizeClient: 'Redimensionar al cliente',
+        invite: 'Invitar a alguien a esta sesión',
     },
     usernamePrompt: {
         title: '¡Bienvenido!',
@@ -148,6 +153,9 @@ const es = {
         participant: 'Invitación de Colaborador',
         readonly: 'Invitación de Solo Lectura',
         readonlyParticipantView: 'Invitación de Solo Lectura',
+        heading: 'Invitar a alguien',
+        copied: 'Enlace copiado',
+        failed: 'No se pudo crear un enlace de invitación',
     },
     disconnect: {
         title: 'Desconectado',
@@ -203,6 +211,7 @@ const zh = {
         gamingMode: '游戏模式',
         lockResolution: '锁定/解锁分辨率',
         resizeClient: '调整为客户端大小',
+        invite: '邀请他人加入此会话',
     },
     usernamePrompt: {
         title: '欢迎！',
@@ -229,6 +238,9 @@ const zh = {
         participant: '协作用户邀请',
         readonly: '只读用户邀请',
         readonlyParticipantView: '只读邀请',
+        heading: '邀请他人',
+        copied: '链接已复制',
+        failed: '无法创建邀请链接',
     },
     disconnect: {
         title: '已断开连接',
@@ -284,6 +296,7 @@ const hi = {
         gamingMode: 'गेमिंग मोड',
         lockResolution: 'रिज़ॉल्यूशन लॉक/अनलॉक करें',
         resizeClient: 'क्लाइंट के आकार में बदलें',
+        invite: 'किसी को इस सत्र में आमंत्रित करें',
     },
     usernamePrompt: {
         title: 'स्वागत है!',
@@ -310,6 +323,9 @@ const hi = {
         participant: 'सहयोग उपयोगकर्ता आमंत्रण',
         readonly: 'केवल पढ़ने के लिए उपयोगकर्ता आमंत्रण',
         readonlyParticipantView: 'केवल पढ़ने के लिए आमंत्रण',
+        heading: 'किसी को आमंत्रित करें',
+        copied: 'लिंक कॉपी हो गया',
+        failed: 'आमंत्रण लिंक नहीं बनाया जा सका',
     },
     disconnect: {
         title: 'डिस्कनेक्ट हो गया',
@@ -365,6 +381,7 @@ const pt = {
         gamingMode: 'Modo Jogo',
         lockResolution: 'Bloquear/Desbloquear Resolução',
         resizeClient: 'Redimensionar para o Cliente',
+        invite: 'Convidar alguém para esta sessão',
     },
     usernamePrompt: {
         title: 'Bem-vindo(a)!',
@@ -391,6 +408,9 @@ const pt = {
         participant: 'Convite de Colaborador',
         readonly: 'Convite de Usuário Somente Leitura',
         readonlyParticipantView: 'Convite Somente Leitura',
+        heading: 'Convidar alguém',
+        copied: 'Link copiado',
+        failed: 'Não foi possível criar um link de convite',
     },
     disconnect: {
         title: 'Desconectado',
@@ -446,6 +466,7 @@ const fr = {
         gamingMode: 'Mode Jeu',
         lockResolution: 'Verrouiller/Déverrouiller la résolution',
         resizeClient: 'Redimensionner au client',
+        invite: 'Inviter quelqu\'un à cette session',
     },
     usernamePrompt: {
         title: 'Bienvenue !',
@@ -472,6 +493,9 @@ const fr = {
         participant: 'Invitation de Collaborateur',
         readonly: 'Invitation d\'Utilisateur en Lecture Seule',
         readonlyParticipantView: 'Invitation en Lecture Seule',
+        heading: 'Inviter quelqu\'un',
+        copied: 'Lien copié',
+        failed: 'Impossible de créer un lien d\'invitation',
     },
     disconnect: {
         title: 'Déconnecté',
@@ -527,6 +551,7 @@ const ru = {
         gamingMode: 'Игровой режим',
         lockResolution: 'Заблокировать/Разблокировать разрешение',
         resizeClient: 'Изменить размер под клиента',
+        invite: 'Пригласить кого-то в этот сеанс',
     },
     usernamePrompt: {
         title: 'Добро пожаловать!',
@@ -553,6 +578,9 @@ const ru = {
         participant: 'Приглашение для участника совместной работы',
         readonly: 'Приглашение для пользователя с правами только на чтение',
         readonlyParticipantView: 'Приглашение только для чтения',
+        heading: 'Пригласить кого-то',
+        copied: 'Ссылка скопирована',
+        failed: 'Не удалось создать ссылку-приглашение',
     },
     disconnect: {
         title: 'Отключено',
@@ -608,6 +636,7 @@ const de = {
         gamingMode: 'Gaming-Modus',
         lockResolution: 'Auflösung sperren/entsperren',
         resizeClient: 'Größe an Client anpassen',
+        invite: 'Jemanden zu dieser Sitzung einladen',
     },
     usernamePrompt: {
         title: 'Willkommen!',
@@ -634,6 +663,9 @@ const de = {
         participant: 'Einladung für Kollaborationsbenutzer',
         readonly: 'Einladung für Benutzer mit Leseberechtigung',
         readonlyParticipantView: 'Einladung mit Leseberechtigung',
+        heading: 'Jemanden einladen',
+        copied: 'Link kopiert',
+        failed: 'Einladungslink konnte nicht erstellt werden',
     },
     disconnect: {
         title: 'Verbindung getrennt',
@@ -689,6 +721,7 @@ const tr = {
         gamingMode: 'Oyun Modu',
         lockResolution: 'Çözünürlüğü Kilitle/Kilidini Aç',
         resizeClient: 'İstemciye Göre Yeniden Boyutlandır',
+        invite: 'Birini bu oturuma davet et',
     },
     usernamePrompt: {
         title: 'Hoş geldiniz!',
@@ -715,6 +748,9 @@ const tr = {
         participant: 'İşbirliği Kullanıcı Daveti',
         readonly: 'Salt Okunur Kullanıcı Daveti',
         readonlyParticipantView: 'Salt Okunur Davet',
+        heading: 'Birini davet et',
+        copied: 'Bağlantı kopyalandı',
+        failed: 'Davet bağlantısı oluşturulamadı',
     },
     disconnect: {
         title: 'Bağlantı Kesildi',
@@ -770,6 +806,7 @@ const it = {
         gamingMode: 'Modalità Gioco',
         lockResolution: 'Blocca/Sblocca risoluzione',
         resizeClient: 'Ridimensiona al client',
+        invite: 'Invita qualcuno a questa sessione',
     },
     usernamePrompt: {
         title: 'Benvenuto!',
@@ -796,6 +833,9 @@ const it = {
         participant: 'Invito Utente Collaboratore',
         readonly: 'Invito Utente Sola Lettura',
         readonlyParticipantView: 'Invito Sola Lettura',
+        heading: 'Invita qualcuno',
+        copied: 'Link copiato',
+        failed: 'Impossibile creare un link di invito',
     },
     disconnect: {
         title: 'Disconnesso',
@@ -851,6 +891,7 @@ const nl = {
         gamingMode: 'Gamingmodus',
         lockResolution: 'Resolutie vergrendelen/ontgrendelen',
         resizeClient: 'Formaat aanpassen aan client',
+        invite: 'Nodig iemand uit voor deze sessie',
     },
     usernamePrompt: {
         title: 'Welkom!',
@@ -877,6 +918,9 @@ const nl = {
         participant: 'Uitnodiging voor samenwerkingsgebruiker',
         readonly: 'Uitnodiging voor alleen-lezen gebruiker',
         readonlyParticipantView: 'Alleen-lezen uitnodiging',
+        heading: 'Iemand uitnodigen',
+        copied: 'Link gekopieerd',
+        failed: 'Kon geen uitnodigingslink maken',
     },
     disconnect: {
         title: 'Verbinding verbroken',
@@ -932,6 +976,7 @@ const ar = {
         gamingMode: 'وضع الألعاب',
         lockResolution: 'قفل/إلغاء قفل الدقة',
         resizeClient: 'تغيير الحجم ليناسب العميل',
+        invite: 'دعوة شخص ما إلى هذه الجلسة',
     },
     usernamePrompt: {
         title: 'أهلاً بك!',
@@ -958,6 +1003,9 @@ const ar = {
         participant: 'دعوة مستخدم متعاون',
         readonly: 'دعوة مستخدم للقراءة فقط',
         readonlyParticipantView: 'دعوة للقراءة فقط',
+        heading: 'دعوة شخص ما',
+        copied: 'تم نسخ الرابط',
+        failed: 'تعذر إنشاء رابط الدعوة',
     },
     disconnect: {
         title: 'انقطع الاتصال',
@@ -1013,6 +1061,7 @@ const ko = {
         gamingMode: '게임 모드',
         lockResolution: '해상도 잠금/잠금 해제',
         resizeClient: '클라이언트에 맞게 크기 조정',
+        invite: '이 세션에 누군가를 초대',
     },
     usernamePrompt: {
         title: '환영합니다!',
@@ -1039,6 +1088,9 @@ const ko = {
         participant: '협업 사용자 초대',
         readonly: '읽기 전용 사용자 초대',
         readonlyParticipantView: '읽기 전용 초대',
+        heading: '초대하기',
+        copied: '링크가 복사되었습니다',
+        failed: '초대 링크를 생성할 수 없습니다',
     },
     disconnect: {
         title: '연결 끊김',
@@ -1094,6 +1146,7 @@ const ja = {
         gamingMode: 'ゲーミングモード',
         lockResolution: '解像度をロック/ロック解除',
         resizeClient: 'クライアントに合わせてサイズ変更',
+        invite: 'このセッションに誰かを招待',
     },
     usernamePrompt: {
         title: 'ようこそ！',
@@ -1120,6 +1173,9 @@ const ja = {
         participant: 'コラボレーションユーザー招待',
         readonly: '読み取り専用ユーザー招待',
         readonlyParticipantView: '読み取り専用招待',
+        heading: '招待する',
+        copied: 'リンクをコピーしました',
+        failed: '招待リンクを作成できませんでした',
     },
     disconnect: {
         title: '切断されました',
@@ -1175,6 +1231,7 @@ const vi = {
         gamingMode: 'Chế độ chơi game',
         lockResolution: 'Khóa/Mở khóa độ phân giải',
         resizeClient: 'Thay đổi kích thước theo máy khách',
+        invite: 'Mời ai đó vào phiên này',
     },
     usernamePrompt: {
         title: 'Chào mừng!',
@@ -1201,6 +1258,9 @@ const vi = {
         participant: 'Lời mời người dùng cộng tác',
         readonly: 'Lời mời người dùng chỉ đọc',
         readonlyParticipantView: 'Lời mời chỉ đọc',
+        heading: 'Mời ai đó',
+        copied: 'Đã sao chép liên kết',
+        failed: 'Không thể tạo liên kết mời',
     },
     disconnect: {
         title: 'Đã ngắt kết nối',
@@ -1256,6 +1316,7 @@ const th = {
         gamingMode: 'โหมดเกม',
         lockResolution: 'ล็อก/ปลดล็อกความละเอียด',
         resizeClient: 'ปรับขนาดตามไคลเอนต์',
+        invite: 'เชิญใครสักคนเข้าร่วมเซสชันนี้',
     },
     usernamePrompt: {
         title: 'ยินดีต้อนรับ!',
@@ -1282,6 +1343,9 @@ const th = {
         participant: 'คำเชิญผู้ใช้ร่วมทำงาน',
         readonly: 'คำเชิญผู้ใช้แบบอ่านอย่างเดียว',
         readonlyParticipantView: 'คำเชิญแบบอ่านอย่างเดียว',
+        heading: 'เชิญใครสักคน',
+        copied: 'คัดลอกลิงก์แล้ว',
+        failed: 'ไม่สามารถสร้างลิงก์คำเชิญได้',
     },
     disconnect: {
         title: 'ตัดการเชื่อมต่อแล้ว',
@@ -1337,6 +1401,7 @@ const fil = {
         gamingMode: 'Gaming Mode',
         lockResolution: 'I-lock/I-unlock ang Resolusyon',
         resizeClient: 'I-resize sa Client',
+        invite: 'Mag-imbita ng isang tao sa session na ito',
     },
     usernamePrompt: {
         title: 'Maligayang pagdating!',
@@ -1363,6 +1428,9 @@ const fil = {
         participant: 'Imbitasyon ng Gumagamit ng Kolaborasyon',
         readonly: 'Imbitasyon ng Gumagamit na Read Only',
         readonlyParticipantView: 'Imbitasyon na Read Only',
+        heading: 'Mag-imbita ng isang tao',
+        copied: 'Nakopya ang link',
+        failed: 'Hindi malikha ang invite link',
     },
     disconnect: {
         title: 'Nadiskonekta',
@@ -1418,6 +1486,7 @@ const da = {
         gamingMode: 'Spiltilstand',
         lockResolution: 'Lås/Lås op for opløsning',
         resizeClient: 'Tilpas størrelse til klient',
+        invite: 'Inviter nogen til denne session',
     },
     usernamePrompt: {
         title: 'Velkommen!',
@@ -1444,6 +1513,9 @@ const da = {
         participant: 'Invitation til samarbejdsbruger',
         readonly: 'Invitation til skrivebeskyttet bruger',
         readonlyParticipantView: 'Skrivebeskyttet invitation',
+        heading: 'Inviter nogen',
+        copied: 'Link kopieret',
+        failed: 'Kunne ikke oprette et invitationslink',
     },
     disconnect: {
         title: 'Forbindelse afbrudt',

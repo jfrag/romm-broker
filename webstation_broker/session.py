@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 # {
 #   "id", "active", "created_at",
 #   "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
-#   "save": {...} | None, "callback": {...} | None,
+#   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
 #   "controller_token",
 #   "viewers": [{"token","slot","mk_control","username","permission"}...],
 #   "controller_slot", "mk_owner_token", "designated_speaker",
@@ -65,6 +65,7 @@ def new_session(payload: dict, emulator_obj, rom_file: str) -> dict:
         "rom_file": rom_file,
         "save": payload.get("save"),
         "callback": payload.get("callback"),
+        "multiplayer": bool(payload.get("multiplayer")),
         "controller_token": secrets.token_urlsafe(16),
         "viewers": [],
         # The controller starts with gamepad 1.

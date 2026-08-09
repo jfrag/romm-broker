@@ -148,6 +148,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.title = COLLAB_DATA.gameName || t('pageTitle');
     document.getElementById('session-frame').dataset.src = COLLAB_DATA.iframeSrc;
 
+    // A solo session hides chat, webcam and mic: nobody is there to use them.
+    // The flag only sets the baseline. Presence can reveal the comms surface
+    // but never hide it, so someone arriving on an invite link into a session
+    // launched as singleplayer still lands somewhere they can talk.
+    const applyCommsVisibility = (viewers) => {
+        const onlineCount = Array.isArray(viewers)
+            ? viewers.filter((u) => u.online).length
+            : 0;
+        const visible = Boolean(COLLAB_DATA.multiplayer) || onlineCount > 1;
+        document.body.classList.toggle('solo-mode', !visible);
+    };
+    applyCommsVisibility(null);
+
     if (COLLAB_DATA.userPermission === 'readonly') {
         const localContainer = document.getElementById('local-user-container');
         if (localContainer) {
@@ -186,6 +199,44 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (isIframeMuted) iframe.contentWindow.postMessage({ type: 'setMute', value: true }, '*');
         }
     };
+
+    // RomM's control bar sits outside this frame and cannot reach the stream
+    // across origins, so its volume and mute arrive here as messages and take
+    // the same path as the sidebar's own controls. Announcing on load is how
+    // the parent learns it has somewhere to send them.
+    const syncAudioControls = () => {
+        if (iframeMuteBtn) {
+            iframeMuteBtn.querySelector('i').className = isIframeMuted
+                ? 'fas fa-volume-mute'
+                : 'fas fa-volume-up';
+        }
+        if (iframeVolumeSlider) {
+            iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
+        }
+    };
+
+    window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const data = event.data;
+        if (!data || typeof data !== 'object') return;
+        if (data.type === 'setVolume') {
+            const value = Number(data.value);
+            if (!Number.isFinite(value)) return;
+            lastKnownVolume = Math.min(1, Math.max(0, value));
+            localStorage.setItem('collab_iframe_volume', lastKnownVolume);
+            isIframeMuted = lastKnownVolume === 0;
+        } else if (data.type === 'setMute') {
+            isIframeMuted = Boolean(data.value);
+        } else {
+            return;
+        }
+        syncAudioControls();
+        sendVolumeToIframe();
+    });
+
+    if (window.parent !== window) {
+        window.parent.postMessage({ type: 'roomReady' }, '*');
+    }
 
     const handlePageInteraction = () => {
         setTimeout(sendVolumeToIframe, 500);
@@ -1028,6 +1079,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         return;
                     }
                     currentUserState = data.viewers;
+                    applyCommsVisibility(data.viewers);
                     const controllerUser = data.viewers.find(u => u.permission === 'controller');
                     const waitingOverlay = document.getElementById('waiting-overlay');
                     const iframe = document.getElementById('session-frame');
@@ -1263,6 +1315,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     </div>
                     <button id="reload-stream-btn" class="settings-button" title="${t('tooltips.reloadStream')}"><i class="fas fa-sync"></i></button>
                     <button id="settings-btn" class="settings-button"><i class="fas fa-cog"></i></button>
+                    ${isController ? `<button id="invite-btn" class="settings-button" title="${t('tooltips.invite')}"><i class="fas fa-user-plus"></i></button>` : ''}
                     ${isController ? `<button id="exit-session-btn" class="settings-button exit-button" title="${t('tooltips.exitSession')}"><i class="fas fa-power-off"></i></button>` : ''}
                 </div>
             </div>
@@ -1280,6 +1333,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                     <input type="range" id="iframe-volume-slider" min="0" max="1" step="0.01" value="1" title="${t('tooltips.sessionVolume')}">
                 </div>
             </div>
+            ${isController ? `
+            <div id="invite-section" class="sidebar-invite-section hidden">
+                <h3>${t('inviteLinks.heading')}</h3>
+                <button class="control-btn invite-copy" data-permission="participant">${t('inviteLinks.participant')}</button>
+                <button class="control-btn invite-copy" data-permission="readonly">${t('inviteLinks.readonly')}</button>
+            </div>` : ''}
             <div id="sidebar-main-content" class="sidebar-content"></div>
             <div id="chat-reply-banner"></div>
             <div id="chat-form-container">
@@ -1386,6 +1445,52 @@ document.addEventListener('DOMContentLoaded', async () => {
             populateDeviceLists();
             settingsModalOverlay.classList.remove('hidden')
         });
+        const inviteBtn = sidebarEl.querySelector('#invite-btn');
+        const inviteSection = sidebarEl.querySelector('#invite-section');
+        if (inviteBtn && inviteSection) {
+            inviteBtn.addEventListener('click', () => {
+                inviteSection.classList.toggle('hidden');
+            });
+            // Each mint is a real seat in the session and the backend cannot
+            // dedup a user-less invite, so cache per permission rather than
+            // minting again on every click and leaving a trail of offline
+            // users behind.
+            const inviteUrls = {};
+            inviteSection.querySelectorAll('.invite-copy').forEach((button) => {
+                const label = button.textContent;
+                let resetTimer = null;
+                const flash = (text) => {
+                    button.textContent = text;
+                    clearTimeout(resetTimer);
+                    resetTimer = setTimeout(() => {
+                        button.textContent = label;
+                    }, 2000);
+                };
+                button.addEventListener('click', async () => {
+                    const permission = button.dataset.permission;
+                    try {
+                        if (!inviteUrls[permission]) {
+                            const resp = await fetch(
+                                `api/session/invite?token=${encodeURIComponent(COLLAB_DATA.userToken)}`,
+                                {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ permission }),
+                                }
+                            );
+                            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                            const invited = await resp.json();
+                            inviteUrls[permission] = new URL(invited.url, window.location.href).href;
+                        }
+                        await navigator.clipboard.writeText(inviteUrls[permission]);
+                        flash(t('inviteLinks.copied'));
+                    } catch (err) {
+                        console.error('[Invite] failed:', err);
+                        flash(t('inviteLinks.failed'));
+                    }
+                });
+            });
+        }
         const exitBtn = sidebarEl.querySelector('#exit-session-btn');
         if (exitBtn) {
             exitBtn.addEventListener('click', async () => {
@@ -1960,10 +2065,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     setTimeout(toggleSidebar, 500);
 
-    // Show the chrome briefly, then retract the sidebar and video bar so the
-    // stream lands full-view.
+    // Show the chrome briefly, then retract it so the stream lands full-view.
+    // The sidebar always goes: it is a slide-over panel that would sit on top
+    // of the game. The video bar stays in a multiplayer room, because faces
+    // are the point of the mode and the handle that brings it back is easy to
+    // miss.
     setTimeout(() => {
         if (isSidebarVisible) toggleSidebar();
-        if (isVideoGridVisible) toggleVideoGrid();
+        if (isVideoGridVisible && document.body.classList.contains('solo-mode')) {
+            toggleVideoGrid();
+        }
     }, 2500);
 });

@@ -48,6 +48,10 @@ class JoinIn(BaseModel):
     permission: str = "participant"
 
 
+class InviteIn(BaseModel):
+    permission: str = "participant"
+
+
 class StateIn(BaseModel):
     # RomM is the library of states, so the emulator works in a single slot and
     # resolves whatever is asked for to it. The bound is kept only to reject
@@ -63,6 +67,11 @@ class ActivateIn(BaseModel):
     rom: Optional[RomIn] = None
     save: Optional[SaveIn] = None
     callback: Optional[CallbackIn] = None
+    # Decided once, on RomM's launch screen, and fixed for the life of the
+    # session. It governs whether RomM advertises this session for joining and
+    # whether the room shows its comms surface while the host is alone. The
+    # invite route ignores it: a link always works.
+    multiplayer: bool = False
 
 
 def _ct_eq(a: str, b: str) -> bool:
@@ -210,6 +219,13 @@ async def activate(
         payload, emulator, str(rom_file) if rom_file else None
     )
 
+    log.info(
+        "session %s started: emulator=%s multiplayer=%s",
+        sess["id"],
+        body.emulator,
+        sess["multiplayer"],
+    )
+
     resume_slot = save.resume_slot if save else None
     await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
     # Baseline after launch: the exit dump only ships files this session wrote.
@@ -227,27 +243,62 @@ async def activate(
     }
 
 
+async def _mint_viewer(permission: str, user: Optional[dict]) -> dict:
+    """Add a seat to the running session and publish it to the control plane.
+
+    Shared by the RomM-facing join route and the controller's invite route so
+    token creation, the selkies push and the room broadcast stay in one place.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session to join")
+
+    if permission not in ("participant", "readonly"):
+        raise HTTPException(
+            status_code=422, detail="permission must be participant or readonly"
+        )
+
+    viewer = session.add_viewer(permission, user)
+    await selkies.push_tokens(sess)
+    await session.broadcast_state()
+    return viewer
+
+
 @router.post("/api/session/join")
 async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=None)):
     """Add a user to the running session. Membership policy belongs to the
     caller; whoever is sent gets a personal token and landing URL."""
     _check_secret(x_broker_secret)
 
+    viewer = await _mint_viewer(body.permission, body.user)
     sess = session.SESSION
-    if sess is None or not sess.get("active"):
-        raise HTTPException(status_code=409, detail="no active session to join")
-
-    if body.permission not in ("participant", "readonly"):
-        raise HTTPException(
-            status_code=422, detail="permission must be participant or readonly"
-        )
-
-    viewer = session.add_viewer(body.permission, body.user)
-    await selkies.push_tokens(sess)
-    await session.broadcast_state()
-
     return {
         "status": "joined",
+        "session_id": sess["id"],
+        "permission": body.permission,
+        "username": viewer["username"],
+        "url": _landing_url(viewer["token"]),
+    }
+
+
+@router.post("/api/session/invite")
+async def invite(body: InviteIn, token: str = Query()):
+    """The controller mints a seat for someone they will send a link to.
+
+    The room frontend does not hold the broker secret, so this is gated on the
+    controller token the same way the exit route is. The session's multiplayer
+    flag is deliberately not consulted: a link the host went out of their way
+    to copy should work whichever way they set the switch.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    if not _ct_eq(token, sess["controller_token"]):
+        raise HTTPException(status_code=403, detail="controller token required")
+
+    viewer = await _mint_viewer(body.permission, None)
+    return {
+        "status": "invited",
         "session_id": sess["id"],
         "permission": body.permission,
         "username": viewer["username"],
@@ -642,6 +693,7 @@ async def status():
         "emulator": sess["emulator"],
         "rom": sess.get("rom"),
         "rom_file": sess.get("rom_file"),
+        "multiplayer": bool(sess.get("multiplayer")),
         "emulator_alive": sess["emulator_obj"].alive(),
         # The emulator class is the authority on what it can do, so RomM reads
         # this rather than keeping its own per-emulator table.
@@ -787,6 +839,7 @@ async def context(token: Optional[str] = Query(default=None)):
         "gameName": (sess.get("rom") or {}).get("name")
         or sess["emulator_obj"].display_name,
         "controllerName": (sess.get("user") or {}).get("display_name") or "Controller",
+        "multiplayer": bool(sess.get("multiplayer")),
         # Relative to the page base; the selkies client reads the token from
         # its query string.
         "iframeSrc": f"stream/?token={token}",

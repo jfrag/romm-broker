@@ -465,3 +465,105 @@ def test_a_stranger_cannot_exit_someone_else_session(
 
 def test_exiting_nothing_is_a_conflict(client):
     assert client.post(f"{API}/session/exit").status_code == 409
+
+
+def test_activate_records_a_multiplayer_session(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs, multiplayer=True)
+
+    assert session.SESSION["multiplayer"] is True
+
+
+def test_activate_defaults_to_a_solo_session(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+
+    assert session.SESSION["multiplayer"] is False
+
+
+def test_context_tells_the_room_which_kind_of_session_it_is(
+    client, broker_dirs, fake_emulator
+):
+    _activate(client, broker_dirs, multiplayer=True)
+    token = session.SESSION["controller_token"]
+
+    body = client.get(f"{API}/session/context", params={"token": token}).json()
+
+    assert body["multiplayer"] is True
+
+
+def test_context_reports_a_solo_session_as_such(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    body = client.get(f"{API}/session/context", params={"token": token}).json()
+
+    assert body["multiplayer"] is False
+
+
+def test_the_controller_can_mint_an_invite_link(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    body = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "participant"},
+    ).json()
+
+    assert body["url"] != f"{PREFIX}/?token={token}"
+    assert len(session.SESSION["viewers"]) == 1
+
+
+def test_an_invite_works_on_a_solo_session(client, broker_dirs, fake_emulator):
+    """The switch governs discovery and comms, never the link."""
+    _activate(client, broker_dirs, multiplayer=False)
+    token = session.SESSION["controller_token"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_a_viewer_cannot_mint_invites(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    viewer = client.post(
+        f"{API}/session/join", json={"permission": "participant"}
+    ).json()
+    viewer_token = session.SESSION["viewers"][0]["token"]
+    assert viewer["username"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": viewer_token},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_inviting_into_nothing_is_a_conflict(client):
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": "whatever"},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 409
+
+
+def test_an_invite_with_an_unknown_permission_is_refused(
+    client, broker_dirs, fake_emulator
+):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "admin"},
+    )
+
+    assert response.status_code == 422
