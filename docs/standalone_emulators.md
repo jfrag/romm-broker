@@ -148,3 +148,23 @@ Finish with your preferred graphics settings and test a game.
 > all settings stick, and the controller profile menus are half broken: click
 > the down arrows, click into the dropdowns, and navigate them with the
 > keyboard to get them to behave.
+
+## Azahar
+
+Controllers are pre-configured for Azahar. Open it from the desktop, set
+graphics and audio to your liking, and test a game to confirm.
+
+Azahar stops rendering when the display resizes underneath it in fullscreen,
+and the display resizes every time you resize your browser window. Single game
+launches therefore start it windowed, which is not affected. Keep that in mind
+on the desktop as well: if you put Azahar into fullscreen yourself and then
+resize the browser, the picture freezes and you have to leave fullscreen to get
+it back.
+
+> **Special note:** For 3DS, the RetroArch core is the better option and is
+> what a `3ds` launch uses by default. Azahar exposes no way for the broker to
+> reach it from outside the process, so a standalone session has no save states
+> and shuts down with a kill rather than a clean exit, meaning only what the
+> game already wrote to its own save survives. The RetroArch core supports both
+> save states and a proper exit. Use standalone Azahar when you want its own
+> interface, and pick `retroarch` otherwise.

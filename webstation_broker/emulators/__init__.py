@@ -1,3 +1,4 @@
+from .azahar import Azahar
 from .base import Emulator
 from .cemu import Cemu
 from .desktop import Desktop
@@ -15,6 +16,7 @@ REGISTRY: dict[str, type[Emulator]] = {
     "duckstation": Duckstation,
     "dolphin": Dolphin,
     "cemu": Cemu,
+    "azahar": Azahar,
     "eden": Eden,
     "shadps4": Shadps4,
     "retroarch": Retroarch,
