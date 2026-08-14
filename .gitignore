@@ -16,3 +16,6 @@ frontend/dist/
 .vscode/
 *.swp
 .DS_Store
+
+# Subagent-driven-development scratch workspaces
+.superpowers/
