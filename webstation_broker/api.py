@@ -712,6 +712,10 @@ async def status():
         "rom_file": sess.get("rom_file"),
         "multiplayer": bool(sess.get("multiplayer")),
         "emulator_alive": sess["emulator_obj"].alive(),
+        # Set only by emulators with their own boot-verification signal (PCSX2
+        # today, via PINE). Passive: RomM decides what to do about it, this
+        # route only reports it.
+        "boot_failed": sess["emulator_obj"].boot_failed,
         # The emulator class is the authority on what it can do, so RomM reads
         # this rather than keeping its own per-emulator table.
         "supports_states": sess["emulator_obj"].supports_states,
