@@ -195,3 +195,27 @@ def test_boot_watchdog_runs_and_can_flag_a_hang_with_no_resume_slot(monkeypatch,
 
     assert emu.boot_failed is True
     assert load_calls == []
+
+
+def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(monkeypatch, tmp_path):
+    """Verify launch() unconditionally spawns the boot watchdog thread,
+    including when resume_slot=None. Regression test: ensures the
+    'if resume_slot is not None:' guard is never accidentally restored."""
+    started = []
+    monkeypatch.setattr(pcsx2, "_patch_ini", lambda: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: None)
+
+    def mock_thread(target, args, daemon):
+        """Capture Thread calls and record (target.__name__, args)."""
+        started.append((target.__name__, args))
+        return type("MockThread", (), {"start": lambda s: None})()
+
+    monkeypatch.setattr(pcsx2, "Thread", mock_thread)
+    emu = pcsx2.Pcsx2()
+
+    emu.launch(tmp_path / "g.iso", None)
+
+    assert len(started) == 1
+    assert started[0][0] == "_boot_watchdog"
+    assert started[0][1] == (None, emu._launch_seq)
