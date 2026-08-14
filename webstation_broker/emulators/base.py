@@ -148,6 +148,10 @@ class Emulator:
 
     def __init__(self):
         self._proc: subprocess.Popen | None = None
+        # Set by an emulator that can tell its process is alive but never
+        # reached a running game — the boot-error-dialog case. Passive signal
+        # only: the broker surfaces it and takes no action of its own.
+        self.boot_failed: bool = False
 
     def _spawn(self, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False) -> None:
         """Start the app in its own process group with output captured.

@@ -32,6 +32,9 @@ def test_every_emulator_declares_what_the_routes_read_off_it(name):
     assert emu.name and emu.display_name
     assert isinstance(emu.save_subtrees, tuple)
     assert isinstance(emu.rom_extensions, tuple)
+    # Boot-failure detection is a base-class field every emulator carries,
+    # even though only Pcsx2 populates it today (2026-08-14 boot-failure spec).
+    assert emu.boot_failed is False
     # A state slot of 0 means the routes have nowhere to put a state, so an
     # emulator that claims states has to name one.
     if emu.supports_states:
