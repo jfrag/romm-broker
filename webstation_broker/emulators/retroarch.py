@@ -132,6 +132,15 @@ STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 # step count has to outrun any slot the player could have cycled to.
 SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
 SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
+# Disc tray timings. The settle is not optional: RetroArch drops a disc index
+# change that arrives while the tray is still opening, and the failure is
+# silent (the old disc stays mounted).
+DISC_TRAY_SETTLE = float(os.environ.get("RETROARCH_DISC_TRAY_SETTLE", "1.5"))
+DISC_STEP_DELAY = float(os.environ.get("RETROARCH_DISC_STEP_DELAY", "0.1"))
+# How long a swap waits for the core to report a running game. A mid-session
+# swap answers on the first poll; a swap issued right after launch waits out
+# the boot.
+DISC_SWAP_WAIT = float(os.environ.get("RETROARCH_DISC_SWAP_WAIT", "90.0"))
 CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", "180"))
 # The pads here are Selkies interposer sockets, not real devices, and the fake
 # libudev behind them gives every one the same identity. RetroArch's udev
@@ -386,6 +395,34 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
+def _m3u_entries(playlist: Path) -> list[Path]:
+    """Disc paths a .m3u lists, in playlist order, resolved absolute.
+
+    Entry order is the order RetroArch assigns disc indices in, so the list
+    index is the number of DISK_NEXT presses from the first disc.
+    """
+    try:
+        text = playlist.read_text(errors="replace")
+    except OSError:
+        return []
+    entries: list[Path] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append((playlist.parent / line).resolve())
+    return entries
+
+
+def _m3u_index_for_path(playlist: Path, target: Path) -> int | None:
+    """Disc index `target` occupies in `playlist`, or None if unlisted."""
+    wanted = target.resolve()
+    for index, entry in enumerate(_m3u_entries(playlist)):
+        if entry == wanted:
+            return index
+    return None
+
+
 def _pick_rom_file(candidates, base: Path, extensions: tuple[str, ...]) -> Path | None:
     ranked = []
     for p in candidates:
@@ -440,6 +477,11 @@ class Retroarch(Emulator):
         self._stdout_buf = bytearray()
         self._stdout_lock = threading.Lock()
         self._reader: threading.Thread | None = None
+        # The playlist this session booted, and where its tray currently sits.
+        # RetroArch has no way to read the mounted disc back, so the broker
+        # remembers what it did and steps relative to that.
+        self._playlist: Path | None = None
+        self._disc_index: int = 0
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -586,6 +628,8 @@ class Retroarch(Emulator):
         self._slot_homed = False
         self._launch_seq += 1
         seq = self._launch_seq
+        self._playlist = rom_path if rom_path.suffix.lower() == ".m3u" else None
+        self._disc_index = 0
 
         cmd = [
             binary,

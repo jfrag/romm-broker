@@ -225,6 +225,27 @@ class TestResumeGate:
 
         assert _stub_launch == []
 
+    def test_launching_a_playlist_records_it_and_starts_on_disc_zero(self, tmp_path):
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("Game (Disc 1).chd\n")
+
+        emulator.launch(playlist, None)
+
+        assert emulator._playlist == playlist
+        assert emulator._disc_index == 0
+
+    def test_launching_a_bare_disc_records_no_playlist(self, tmp_path):
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        disc = tmp_path / "Game.chd"
+        disc.write_bytes(b"x")
+
+        emulator.launch(disc, None)
+
+        assert emulator._playlist is None
+
 
 class TestPlaylistPreference:
     """A folder holding a playlist and its discs boots the playlist, because
@@ -249,3 +270,37 @@ class TestPlaylistPreference:
         emulator = retroarch.Retroarch()
         emulator.platform = "dc"
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
+
+
+class TestPlaylistHelpers:
+    """Reading a .m3u the way RetroArch does: one relative path per line,
+    comments and blanks skipped, order is the disc order."""
+
+    def test_entries_resolve_against_the_playlist_directory(self, tmp_path):
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
+        assert retroarch._m3u_entries(playlist) == [
+            (tmp_path / "Game (Disc 1).chd").resolve(),
+            (tmp_path / "Game (Disc 2).chd").resolve(),
+        ]
+
+    def test_comments_and_blank_lines_are_skipped(self, tmp_path):
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("# a comment\n\nGame (Disc 1).chd\n\n")
+        assert retroarch._m3u_entries(playlist) == [
+            (tmp_path / "Game (Disc 1).chd").resolve()
+        ]
+
+    def test_an_unreadable_playlist_yields_no_entries(self, tmp_path):
+        assert retroarch._m3u_entries(tmp_path / "missing.m3u") == []
+
+    def test_index_finds_the_matching_entry(self, tmp_path):
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
+        target = tmp_path / "Game (Disc 2).chd"
+        assert retroarch._m3u_index_for_path(playlist, target) == 1
+
+    def test_index_is_none_for_a_disc_the_playlist_does_not_list(self, tmp_path):
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text("Game (Disc 1).chd\n")
+        assert retroarch._m3u_index_for_path(playlist, tmp_path / "Other.chd") is None
