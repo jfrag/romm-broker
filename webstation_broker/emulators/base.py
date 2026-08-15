@@ -124,6 +124,10 @@ class Emulator:
     # only persistence is the game's own save data leave this off, so the state
     # routes refuse instead of silently doing nothing.
     supports_states: bool = False
+    # Whether the emulator can change the mounted disc without restarting.
+    # Off by default so the swap route refuses instead of silently doing
+    # nothing on an emulator that has no tray.
+    supports_disc_swap: bool = False
     # The one slot the broker saves into. RomM is the library of states: every
     # save is pulled out of the container and every stored state is pushed back
     # into this slot, so nothing here needs to address more than one. Requested
@@ -299,4 +303,9 @@ class Emulator:
 
     def resolve_rom_file(self, path: Path) -> Path | None:
         """File the emulator should boot for `path` (folder or file)."""
+        raise NotImplementedError
+
+    def swap_disc(self, path: Path) -> bool:
+        """Mount `path` in place of the running disc. Only called when
+        supports_disc_swap. True once the new disc is in the tray."""
         raise NotImplementedError

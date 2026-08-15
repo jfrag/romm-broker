@@ -174,3 +174,12 @@ def test_stopping_clears_the_record_so_the_next_launch_reaps_nothing(
     emu.stop()
 
     assert not pid_record.exists()
+
+
+def test_an_emulator_does_not_support_disc_swap_by_default():
+    assert base.Emulator.supports_disc_swap is False
+
+
+def test_swapping_a_disc_on_the_base_class_is_not_implemented():
+    with pytest.raises(NotImplementedError):
+        base.Emulator().swap_disc(Path("/romm/game/disc2.chd"))
