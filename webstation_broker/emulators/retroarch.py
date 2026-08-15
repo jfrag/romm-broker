@@ -684,14 +684,17 @@ class Retroarch(Emulator):
             "resume: retroarch never reported PLAYING, slot %d not loaded", slot
         )
 
-    def _wait_until_playing(self, deadline: float) -> bool:
+    def _wait_until_playing(self, deadline: float, seq: int) -> bool:
         """Block until the core reports a running game, or `deadline` passes.
 
         A tray command sent before the content is up is dropped, and there is
-        no error to catch when it is.
+        no error to catch when it is. `seq` is the launch generation this
+        wait belongs to, checked the same way `_deferred_load_state` checks
+        `_launch_seq`, so a relaunch during the wait ends it rather than
+        letting a stale wait later act on the new session.
         """
         while time.monotonic() < deadline:
-            if not self.alive():
+            if self._launch_seq != seq or not self.alive():
                 return False
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
@@ -716,7 +719,8 @@ class Retroarch(Emulator):
             return False
         if index == self._disc_index:
             return True
-        if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT):
+        seq = self._launch_seq
+        if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT, seq):
             log.warning("disc swap: core never reported a running game")
             return False
 
@@ -727,6 +731,13 @@ class Retroarch(Emulator):
             self._send("DISK_NEXT")
             time.sleep(DISC_STEP_DELAY)
         self._send("DISK_EJECT_TOGGLE")
+        # The wait can outlast the session it started for (a relaunch bumps
+        # _launch_seq) or the core can die mid-sequence; either way nothing
+        # confirms the commands above actually landed, so the tracked index
+        # only moves once both are still true.
+        if self._launch_seq != seq or not self.alive():
+            log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+            return False
         self._disc_index = index
         log.info("disc swap: now on index %d (%s)", index, path.name)
         return True

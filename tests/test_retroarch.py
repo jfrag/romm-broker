@@ -371,5 +371,45 @@ class TestSwapDisc:
         monkeypatch.setattr(emulator, "_send", lambda *a, **k: None)
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
 
+    def test_a_core_that_dies_mid_swap_does_not_commit_the_index(self, emulator, monkeypatch):
+        """The tray commands after PLAYING have no reply to confirm delivery,
+        so a death partway through must not leave the tracked index pointing
+        at a disc that was never actually mounted."""
+        state = {"alive": True}
+        monkeypatch.setattr(emulator, "alive", lambda: state["alive"])
+
+        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+            emulator.sent.append(cmd)
+            if cmd == "GET_STATUS":
+                return "GET_STATUS PLAYING dc,Game,0"
+            if cmd == "DISK_NEXT":
+                state["alive"] = False
+            return None
+
+        monkeypatch.setattr(emulator, "_send", fake_send)
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        assert emulator._disc_index == 0
+
+    def test_a_relaunch_during_the_wait_does_not_clobber_the_new_sessions_index(
+        self, emulator, monkeypatch
+    ):
+        """A swap outliving the session it was issued for must not stomp the
+        disc index a fresh launch() already reset, the same hazard
+        _deferred_load_state guards against with _launch_seq."""
+
+        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+            emulator.sent.append(cmd)
+            if cmd == "GET_STATUS":
+                # A relaunch races the wait and wins: a new session starts and
+                # resets tracking exactly as Retroarch.launch() does.
+                emulator._launch_seq += 1
+                emulator._disc_index = 0
+                return "GET_STATUS PLAYING dc,Game,0"
+            return None
+
+        monkeypatch.setattr(emulator, "_send", fake_send)
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        assert emulator._disc_index == 0
+
     def test_the_class_advertises_disc_swap(self):
         assert retroarch.Retroarch.supports_disc_swap is True
