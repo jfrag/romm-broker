@@ -22,6 +22,8 @@ replies to *stdout*. Commands:
   SAVE_FILES           -> "OK" / "NO" (newline-terminated)
   GET_STATUS           -> "GET_STATUS PLAYING <core_id>,<basename>\n"
                           or "GET_STATUS CONTENTLESS"
+  DISK_EJECT_TOGGLE  open or close the virtual tray
+  DISK_NEXT          step to the next disc in the loaded playlist
   QUIT                 -> no reply; queued for the runloop
 
 Saves are confirmed on the filesystem instead of from a reply.
@@ -462,6 +464,7 @@ class Retroarch(Emulator):
     save_root = RA_DATA_DIR
     log_path = RA_LOG_PATH
     supports_states = True
+    supports_disc_swap = True
     state_slot = STATE_SLOT
     state_dir = STATE_DIR
     # QUIT walks a graceful core teardown; give it room before SIGTERM.
@@ -680,6 +683,53 @@ class Retroarch(Emulator):
         log.warning(
             "resume: retroarch never reported PLAYING, slot %d not loaded", slot
         )
+
+    def _wait_until_playing(self, deadline: float) -> bool:
+        """Block until the core reports a running game, or `deadline` passes.
+
+        A tray command sent before the content is up is dropped, and there is
+        no error to catch when it is.
+        """
+        while time.monotonic() < deadline:
+            if not self.alive():
+                return False
+            reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
+            if reply and reply.startswith("GET_STATUS PLAYING"):
+                return True
+            time.sleep(1.0)
+        return False
+
+    def swap_disc(self, path: Path) -> bool:
+        """Mount the playlist entry at `path` without restarting the core.
+
+        Stepping is relative and wraps, because the command protocol has
+        DISK_NEXT but no way to set an index or read the current one back.
+        """
+        playlist = self._playlist
+        if playlist is None or not self.alive():
+            log.warning("disc swap: no playlist loaded for this session")
+            return False
+        entries = _m3u_entries(playlist)
+        index = _m3u_index_for_path(playlist, path)
+        if not entries or index is None:
+            log.warning("disc swap: %s is not listed in %s", path, playlist)
+            return False
+        if index == self._disc_index:
+            return True
+        if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT):
+            log.warning("disc swap: core never reported a running game")
+            return False
+
+        steps = (index - self._disc_index) % len(entries)
+        self._send("DISK_EJECT_TOGGLE")
+        time.sleep(DISC_TRAY_SETTLE)
+        for _ in range(steps):
+            self._send("DISK_NEXT")
+            time.sleep(DISC_STEP_DELAY)
+        self._send("DISK_EJECT_TOGGLE")
+        self._disc_index = index
+        log.info("disc swap: now on index %d (%s)", index, path.name)
+        return True
 
     def _home_state_slot(self) -> None:
         """Park RetroArch's current state slot on STATE_SLOT.

@@ -304,3 +304,72 @@ class TestPlaylistHelpers:
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("Game (Disc 1).chd\n")
         assert retroarch._m3u_index_for_path(playlist, tmp_path / "Other.chd") is None
+
+
+class TestSwapDisc:
+    """Driving the tray over the command protocol."""
+
+    @pytest.fixture
+    def emulator(self, tmp_path, monkeypatch):
+        """A Retroarch that looks alive and records commands instead of
+        writing them to a process."""
+        monkeypatch.setattr(retroarch, "DISC_TRAY_SETTLE", 0)
+        monkeypatch.setattr(retroarch, "DISC_STEP_DELAY", 0)
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        emulator.sent = []
+
+        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+            emulator.sent.append(cmd)
+            if cmd == "GET_STATUS":
+                return "GET_STATUS PLAYING dc,Game,0"
+            return None
+
+        monkeypatch.setattr(emulator, "_send", fake_send)
+        monkeypatch.setattr(emulator, "alive", lambda: True)
+
+        playlist = tmp_path / "Game.m3u"
+        playlist.write_text(
+            "Game (Disc 1).chd\nGame (Disc 2).chd\nGame (Disc 3).chd\n"
+        )
+        emulator._playlist = playlist
+        emulator._disc_index = 0
+        emulator.tmp_path = tmp_path
+        return emulator
+
+    def test_swapping_forward_ejects_steps_and_closes(self, emulator):
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is True
+        assert emulator.sent == [
+            "GET_STATUS",
+            "DISK_EJECT_TOGGLE",
+            "DISK_NEXT",
+            "DISK_EJECT_TOGGLE",
+        ]
+        assert emulator._disc_index == 1
+
+    def test_swapping_backward_wraps_around_the_playlist(self, emulator):
+        emulator._disc_index = 2
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is True
+        # From index 2 to index 1 is two forward steps through a 3-disc list.
+        assert emulator.sent.count("DISK_NEXT") == 2
+        assert emulator._disc_index == 1
+
+    def test_swapping_to_the_mounted_disc_leaves_the_tray_alone(self, emulator):
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 1).chd") is True
+        assert "DISK_EJECT_TOGGLE" not in emulator.sent
+
+    def test_a_disc_outside_the_playlist_is_refused(self, emulator):
+        assert emulator.swap_disc(emulator.tmp_path / "Other.chd") is False
+        assert "DISK_EJECT_TOGGLE" not in emulator.sent
+
+    def test_a_session_with_no_playlist_cannot_swap(self, emulator):
+        emulator._playlist = None
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+
+    def test_a_core_that_never_reports_playing_is_refused(self, emulator, monkeypatch):
+        monkeypatch.setattr(retroarch, "DISC_SWAP_WAIT", 0)
+        monkeypatch.setattr(emulator, "_send", lambda *a, **k: None)
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+
+    def test_the_class_advertises_disc_swap(self):
+        assert retroarch.Retroarch.supports_disc_swap is True
