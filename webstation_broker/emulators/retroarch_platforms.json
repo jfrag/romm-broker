@@ -87,7 +87,7 @@
   },
   "segacd": {
     "core": "genesis_plus_gx",
-    "extensions": [".cue", ".chd", ".iso", ".m3u"]
+    "extensions": [".m3u", ".cue", ".chd", ".iso"]
   },
   "sega32": {
     "core": "picodrive",
@@ -95,11 +95,11 @@
   },
   "dc": {
     "core": "flycast",
-    "extensions": [".gdi", ".cdi", ".chd", ".cue", ".m3u", ".iso", ".bin"]
+    "extensions": [".m3u", ".gdi", ".cdi", ".chd", ".cue", ".iso", ".bin"]
   },
   "saturn": {
     "core": "yabasanshiro",
-    "extensions": [".cue", ".chd", ".iso", ".bin", ".m3u", ".ccd", ".toc"]
+    "extensions": [".m3u", ".cue", ".chd", ".iso", ".bin", ".ccd", ".toc"]
   },
   "psp": {
     "core": "ppsspp",
@@ -116,7 +116,7 @@
   },
   "turbografx-cd": {
     "core": "mednafen_pce",
-    "extensions": [".cue", ".chd", ".ccd", ".m3u", ".toc"]
+    "extensions": [".m3u", ".cue", ".chd", ".ccd", ".toc"]
   },
   "neogeoaes": {
     "core": "fbneo",
@@ -189,7 +189,7 @@
   },
   "dos": {
     "core": "dosbox_pure",
-    "extensions": [".dosz", ".zip", ".m3u", ".iso", ".cue", ".exe", ".com", ".bat", ".conf"]
+    "extensions": [".m3u", ".dosz", ".zip", ".iso", ".cue", ".exe", ".com", ".bat", ".conf"]
   },
   "amiga": {
     "core": "puae",

@@ -224,3 +224,28 @@ class TestResumeGate:
         self._launch(tmp_path, None)
 
         assert _stub_launch == []
+
+
+class TestPlaylistPreference:
+    """A folder holding a playlist and its discs boots the playlist, because
+    the disc-swap commands step through playlist entries."""
+
+    @pytest.mark.parametrize(
+        "platform", ["dc", "saturn", "segacd", "turbografx-cd", "dos"]
+    )
+    def test_m3u_is_the_first_choice_on_every_disc_platform(self, platform):
+        info = retroarch._platform_info(platform)
+        assert info is not None
+        assert info["extensions"][0] == ".m3u"
+
+    def test_a_folder_with_a_playlist_and_discs_picks_the_playlist(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
+        game = tmp_path / "Game"
+        game.mkdir()
+        (game / "Game.m3u").write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
+        (game / "Game (Disc 1).chd").write_bytes(b"1")
+        (game / "Game (Disc 2).chd").write_bytes(b"2")
+
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
