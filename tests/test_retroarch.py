@@ -1,6 +1,8 @@
 """RetroArch's platform table: the map that decides which core a claim loads."""
 
 import json
+import logging
+import threading
 
 import pytest
 
@@ -294,6 +296,12 @@ class TestPlaylistHelpers:
     def test_an_unreadable_playlist_yields_no_entries(self, tmp_path):
         assert retroarch._m3u_entries(tmp_path / "missing.m3u") == []
 
+    def test_an_unreadable_playlist_logs_a_warning(self, tmp_path, caplog):
+        missing = tmp_path / "missing.m3u"
+        with caplog.at_level(logging.WARNING):
+            retroarch._m3u_entries(missing)
+        assert str(missing) in caplog.text
+
     def test_index_finds_the_matching_entry(self, tmp_path):
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
@@ -413,3 +421,131 @@ class TestSwapDisc:
 
     def test_the_class_advertises_disc_swap(self):
         assert retroarch.Retroarch.supports_disc_swap is True
+
+    def test_no_playlist_and_a_dead_core_are_reported_differently(
+        self, emulator, monkeypatch, caplog
+    ):
+        """A dead core is a different failure than an unloaded playlist, and
+        reporting "no playlist" for a dead core is actively misleading."""
+        playlist = emulator._playlist
+
+        with caplog.at_level(logging.WARNING):
+            emulator._playlist = None
+            assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        no_playlist_message = caplog.text
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING):
+            emulator._playlist = playlist
+            monkeypatch.setattr(emulator, "alive", lambda: False)
+            assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        dead_core_message = caplog.text
+
+        assert no_playlist_message != dead_core_message
+        assert "playlist" in no_playlist_message.lower()
+        assert "playlist" not in dead_core_message.lower()
+
+    def test_a_relaunch_during_the_tray_settle_aborts_before_the_next_command(
+        self, emulator, monkeypatch
+    ):
+        """A relaunch landing right after the eject must not let the sequence
+        keep sending commands (DISK_NEXT, the closing eject) to the new
+        process's stdin, which reads self._proc live."""
+
+        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+            emulator.sent.append(cmd)
+            if cmd == "GET_STATUS":
+                return "GET_STATUS PLAYING dc,Game,0"
+            if cmd == "DISK_EJECT_TOGGLE":
+                emulator._launch_seq += 1
+            return None
+
+        monkeypatch.setattr(emulator, "_send", fake_send)
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        assert emulator.sent == ["GET_STATUS", "DISK_EJECT_TOGGLE"]
+        assert emulator._disc_index == 0
+
+    def test_a_second_concurrent_swap_is_refused(self, emulator):
+        """A swap already holding the tray lock must make a second swap fail
+        fast rather than queue up behind the multi-second sequence."""
+        emulator._disc_lock.acquire()
+        try:
+            assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+        finally:
+            emulator._disc_lock.release()
+        assert emulator.sent == []
+
+    def test_concurrent_swaps_do_not_interleave_the_tray_sequence(
+        self, emulator, monkeypatch
+    ):
+        """The loser of the race must fail before touching the tray, so the
+        winner's EJECT / NEXT / EJECT sequence is never split up by another
+        thread's commands landing in the middle of it."""
+        entered_sequence = threading.Event()
+        release_winner = threading.Event()
+
+        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+            emulator.sent.append(cmd)
+            if cmd == "GET_STATUS":
+                return "GET_STATUS PLAYING dc,Game,0"
+            if cmd == "DISK_EJECT_TOGGLE" and emulator.sent.count("DISK_EJECT_TOGGLE") == 1:
+                # Mid-sequence: let the loser attempt its own swap here.
+                entered_sequence.set()
+                release_winner.wait(timeout=2)
+            return None
+
+        monkeypatch.setattr(emulator, "_send", fake_send)
+
+        results = {}
+
+        def winner():
+            results["winner"] = emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd")
+
+        t = threading.Thread(target=winner)
+        t.start()
+        assert entered_sequence.wait(timeout=2)
+
+        results["loser"] = emulator.swap_disc(emulator.tmp_path / "Game (Disc 3).chd")
+        release_winner.set()
+        t.join(timeout=2)
+
+        assert results["winner"] is True
+        assert results["loser"] is False
+        # The loser's refusal injected nothing: the recorded sequence is
+        # exactly the winner's, uninterrupted.
+        assert emulator.sent == [
+            "GET_STATUS",
+            "DISK_EJECT_TOGGLE",
+            "DISK_NEXT",
+            "DISK_EJECT_TOGGLE",
+        ]
+        assert emulator._disc_index == 1
+
+    def test_a_swap_is_refused_while_a_deferred_resume_holds_the_lock(
+        self, emulator, monkeypatch
+    ):
+        """The tray lock also excludes _deferred_load_state: a LOAD_STATE
+        landing inside a swap's tray-settle window is the collision it
+        guards against, and the same holds in reverse."""
+        monkeypatch.setattr(retroarch, "RESUME_LOAD_SETTLE", 0)
+        entered_lock = threading.Event()
+        release_resume = threading.Event()
+
+        def fake_wait_for_state(deadline):
+            entered_lock.set()
+            release_resume.wait(timeout=2)
+            return True
+
+        monkeypatch.setattr(emulator, "wait_for_state", fake_wait_for_state)
+        monkeypatch.setattr(emulator, "load_state", lambda slot: True)
+
+        t = threading.Thread(
+            target=emulator._deferred_load_state, args=(0, emulator._launch_seq)
+        )
+        t.start()
+        assert entered_lock.wait(timeout=2)
+
+        assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
+
+        release_resume.set()
+        t.join(timeout=2)

@@ -405,7 +405,8 @@ def _m3u_entries(playlist: Path) -> list[Path]:
     """
     try:
         text = playlist.read_text(errors="replace")
-    except OSError:
+    except OSError as exc:
+        log.warning("retroarch: could not read playlist %s: %s", playlist, exc)
         return []
     entries: list[Path] = []
     for line in text.splitlines():
@@ -485,6 +486,10 @@ class Retroarch(Emulator):
         # remembers what it did and steps relative to that.
         self._playlist: Path | None = None
         self._disc_index: int = 0
+        # Serializes swap_disc against itself and against the deferred resume
+        # load: both poll for PLAYING and then act on the live process, and a
+        # LOAD_STATE landing inside a tray-settle window is the collision.
+        self._disc_lock = threading.Lock()
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -667,17 +672,23 @@ class Retroarch(Emulator):
                 return
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
-                time.sleep(RESUME_LOAD_SETTLE)
-                if not self.wait_for_state(deadline):
-                    log.warning("resume: slot %d never got a state file", slot)
-                    return
-                if self._launch_seq != seq:
-                    return
-                log.info(
-                    "resume: load of slot %d %s",
-                    slot,
-                    "delivered" if self.load_state(slot) else "failed",
-                )
+                # Shares the tray lock with swap_disc: both poll for PLAYING
+                # and then act, and a LOAD_STATE landing inside a swap's tray
+                # settle is the collision this guards against.
+                with self._disc_lock:
+                    if self._launch_seq != seq or not self.alive():
+                        return
+                    time.sleep(RESUME_LOAD_SETTLE)
+                    if not self.wait_for_state(deadline):
+                        log.warning("resume: slot %d never got a state file", slot)
+                        return
+                    if self._launch_seq != seq:
+                        return
+                    log.info(
+                        "resume: load of slot %d %s",
+                        slot,
+                        "delivered" if self.load_state(slot) else "failed",
+                    )
                 return
             time.sleep(1.0)
         log.warning(
@@ -709,8 +720,11 @@ class Retroarch(Emulator):
         DISK_NEXT but no way to set an index or read the current one back.
         """
         playlist = self._playlist
-        if playlist is None or not self.alive():
+        if playlist is None:
             log.warning("disc swap: no playlist loaded for this session")
+            return False
+        if not self.alive():
+            log.warning("disc swap: core is not running")
             return False
         entries = _m3u_entries(playlist)
         index = _m3u_index_for_path(playlist, path)
@@ -719,28 +733,46 @@ class Retroarch(Emulator):
             return False
         if index == self._disc_index:
             return True
-        seq = self._launch_seq
-        if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT, seq):
-            log.warning("disc swap: core never reported a running game")
-            return False
 
-        steps = (index - self._disc_index) % len(entries)
-        self._send("DISK_EJECT_TOGGLE")
-        time.sleep(DISC_TRAY_SETTLE)
-        for _ in range(steps):
-            self._send("DISK_NEXT")
-            time.sleep(DISC_STEP_DELAY)
-        self._send("DISK_EJECT_TOGGLE")
-        # The wait can outlast the session it started for (a relaunch bumps
-        # _launch_seq) or the core can die mid-sequence; either way nothing
-        # confirms the commands above actually landed, so the tracked index
-        # only moves once both are still true.
-        if self._launch_seq != seq or not self.alive():
-            log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+        # Non-blocking: a second swap (or a resume load) already driving the
+        # tray must fail fast rather than queue up behind a multi-second
+        # sequence and then interleave with it.
+        if not self._disc_lock.acquire(blocking=False):
+            log.warning("disc swap: another disc swap or resume is already in progress")
             return False
-        self._disc_index = index
-        log.info("disc swap: now on index %d (%s)", index, path.name)
-        return True
+        try:
+            seq = self._launch_seq
+            if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT, seq):
+                log.warning("disc swap: core never reported a running game")
+                return False
+            if self._launch_seq != seq:
+                log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
+
+            steps = (index - self._disc_index) % len(entries)
+            self._send("DISK_EJECT_TOGGLE")
+            time.sleep(DISC_TRAY_SETTLE)
+            for _ in range(steps):
+                # Re-checked between every step: a relaunch landing here must
+                # not keep sending DISK_NEXT into the new process's stdin.
+                if self._launch_seq != seq:
+                    break
+                self._send("DISK_NEXT")
+                time.sleep(DISC_STEP_DELAY)
+            if self._launch_seq == seq:
+                self._send("DISK_EJECT_TOGGLE")
+            # The wait can outlast the session it started for (a relaunch bumps
+            # _launch_seq) or the core can die mid-sequence; either way nothing
+            # confirms the commands above actually landed, so the tracked index
+            # only moves once both are still true.
+            if self._launch_seq != seq or not self.alive():
+                log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
+            self._disc_index = index
+            log.info("disc swap: now on index %d (%s)", index, path.name)
+            return True
+        finally:
+            self._disc_lock.release()
 
     def _home_state_slot(self) -> None:
         """Park RetroArch's current state slot on STATE_SLOT.
