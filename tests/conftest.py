@@ -98,6 +98,7 @@ class FakeEmulator(Emulator):
     display_name = "Fake"
     rom_extensions = (".iso",)
     supports_states = True
+    supports_disc_swap = True
     state_slot = 3
 
     def __init__(self):
@@ -109,6 +110,8 @@ class FakeEmulator(Emulator):
         self.exit_slots = []
         self.running = True
         self.state_file: Path | None = None
+        self.swapped_discs: list[Path] = []
+        self.swap_ok = True
 
     def alive(self) -> bool:
         return self.running
@@ -148,6 +151,10 @@ class FakeEmulator(Emulator):
         if slot is None:
             return {"state_saved": False, "state_slot": None, "state_file": None}
         return {"state_saved": True, "state_slot": self.state_slot, "state_file": None}
+
+    def swap_disc(self, path):
+        self.swapped_discs.append(path)
+        return self.swap_ok
 
 
 @pytest.fixture

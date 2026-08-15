@@ -60,6 +60,13 @@ class StateIn(BaseModel):
     slot: int = Field(default=0, ge=0, le=10)
 
 
+class DiscIn(BaseModel):
+    # Absolute container path to the disc file, which RomM builds from the
+    # RomFile it resolved. Validated against ROM_ROOT the same way activate
+    # validates its rom path.
+    path: str
+
+
 class ActivateIn(BaseModel):
     session_id: Optional[str] = None
     user: Optional[dict] = None
@@ -448,6 +455,22 @@ def _state_emulator():
     return emulator
 
 
+def _swap_emulator():
+    """The running emulator, if it is in a position to change discs."""
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    emulator = sess["emulator_obj"]
+    if not emulator.supports_disc_swap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} cannot swap discs",
+        )
+    if not emulator.alive():
+        raise HTTPException(status_code=409, detail="emulator is not running")
+    return emulator
+
+
 def _readable_emulator():
     """The emulator whose state files can be read right now.
 
@@ -486,6 +509,28 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         "slot": slot,
         "loaded": loaded,
     }
+
+
+@router.post("/api/session/swap-disc")
+async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _swap_emulator()
+    try:
+        disc_path = Path(body.path).resolve()
+    except OSError:
+        raise HTTPException(status_code=400, detail="invalid disc path")
+    if not disc_path.is_relative_to(settings.ROM_ROOT):
+        raise HTTPException(
+            status_code=400, detail=f"disc path must live under {settings.ROM_ROOT}"
+        )
+    if not disc_path.exists():
+        raise HTTPException(status_code=404, detail="disc path does not exist")
+
+    swapped = await anyio.to_thread.run_sync(emulator.swap_disc, disc_path)
+    if not swapped:
+        raise HTTPException(status_code=502, detail="emulator refused the disc swap")
+    log.info("disc swapped to %s", disc_path.name)
+    return {"status": "ok", "path": str(disc_path)}
 
 
 def _header_token(value: str, fallback: str) -> str:

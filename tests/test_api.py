@@ -619,3 +619,87 @@ def test_an_invite_with_an_unknown_permission_is_refused(
     )
 
     assert response.status_code == 422
+
+
+class TestSwapDisc:
+    """Changing the mounted disc mid-session."""
+
+    def _disc(self, broker_dirs, name="Game (Disc 2).chd"):
+        disc = broker_dirs["roms"] / name
+        disc.write_bytes(b"disc")
+        return disc
+
+    def _session(self, secret_client, broker_dirs):
+        """Activate a session on the secret-guarded client.
+
+        `_activate` sends no secret header of its own, so the header goes on
+        the client first, the way test_the_right_secret_gets_through does.
+        """
+        secret_client.headers["X-Broker-Secret"] = "s3cret"
+        assert _activate(secret_client, broker_dirs).status_code == 200
+
+    def test_a_swap_reaches_the_emulator(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        disc = self._disc(broker_dirs)
+        r = secret_client.post(
+            f"{API}/session/swap-disc", json={"path": str(disc)}
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert fake_emulator[0].swapped_discs == [disc.resolve()]
+
+    def test_a_refused_swap_is_a_bad_gateway(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        fake_emulator[0].swap_ok = False
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 502
+
+    def test_a_disc_outside_the_rom_root_is_rejected(
+        self, secret_client, broker_dirs, fake_emulator, tmp_path
+    ):
+        self._session(secret_client, broker_dirs)
+        outside = tmp_path / "elsewhere.chd"
+        outside.write_bytes(b"x")
+        r = secret_client.post(
+            f"{API}/session/swap-disc", json={"path": str(outside)}
+        )
+        assert r.status_code == 400
+
+    def test_a_missing_disc_is_a_not_found(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(broker_dirs["roms"] / "nope.chd")},
+        )
+        assert r.status_code == 404
+
+    def test_an_emulator_without_a_tray_is_refused(
+        self, secret_client, broker_dirs, fake_emulator
+    ):
+        self._session(secret_client, broker_dirs)
+        fake_emulator[0].supports_disc_swap = False
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 400
+
+    def test_no_session_means_no_swap(self, secret_client, broker_dirs):
+        secret_client.headers["X-Broker-Secret"] = "s3cret"
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 409
+
+    def test_the_route_needs_the_broker_secret(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        del secret_client.headers["X-Broker-Secret"]
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 403
