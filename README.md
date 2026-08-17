@@ -16,7 +16,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   session.py             single-session state, room broadcast, gamepad/MK assignment
   selkies.py             token pushes to the selkies control plane (localhost:8083)
   saves.py               save archive restore on activate, delta dump on exit
-  emulators/             emulator launchers (pcsx2, retroarch, eden, shadps4, desktop)
+  emulators/             emulator launchers (pcsx2, retroarch, shadps4, desktop)
 frontend/                vite vanilla-JS room interface
 ```
 
@@ -28,8 +28,7 @@ frontend/                vite vanilla-JS room interface
   routing per streaming connection. The room UI reassigns gamepads and
   mouse/keyboard by dragging icons onto users.
 * Save data flows through zip archives scoped to the emulator's save subtrees
-  (pcsx2: `memcards/`, `sstates/`; retroarch: `states/`, `saves/`; eden:
-  `nand/user/save/` `nand/system/save/8000000000000010/`; shadps4:
+  (pcsx2: `memcards/`, `sstates/`; retroarch: `states/`, `saves/`; shadps4:
   `home/1000/savedata/`).
   Activate restores an archive without
   rolling back newer files; exit zips everything modified since launch and
@@ -55,6 +54,7 @@ frontend/                vite vanilla-JS room interface
 | `ROM_ROOT` | `/romm` | activate rejects rom paths outside this root |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | where exit writes save archives (always in dev mode, otherwise only when the upload fails) |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |
+| `BROKER_PID_FILE` | `/config/broker-emulator.json` | where the running emulator's pid is recorded so a restarted broker can still kill it |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | path appended to the callback base URL when exit POSTs the save archive |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
 | `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | ceiling on one state file over the state-file routes; RomM caps the same transfer |
@@ -131,12 +131,6 @@ streaming. Returns 409 if a session is already active.
 
 `rom.path` may be a file or a game folder; the broker picks the best bootable
 disc image (disc number first, then format ranking, chd > iso > ...).
-
-`emulator: "eden"` launches the Eden Switch emulator the same way. Eden has
-no save states: `resume_slot` is ignored, and exit performs a graceful
-shutdown followed by a save delta dump the game's own save data under the emulated NAND is the
-persistence. `EDEN_STOP_WAIT` (default 15 s) controls how long the graceful
-stop gets before SIGKILL.
 
 `emulator: "retroarch"` is the general purpose launcher: one class covering
 every libretro core, with `rom.platform` picking the core (ngc and wii both
@@ -242,8 +236,8 @@ it actually used, which is also the `state_slot` in the status response. The
 field is kept because the per-emulator brokers take it and because it is what
 the parent needs to read back, not because the broker keeps ten of anything.
 
-`400` means the running emulator has no save states at all (`desktop`, `eden`
-and `shadps4` persist through the game's own save data instead), `409` means
+`400` means the running emulator has no save states at all (`desktop` and
+`shadps4` persist through the game's own save data instead), `409` means
 there is no active session or the emulator process is gone. Which case applies
 is readable ahead of time from `supports_states` in the status response, so the
 parent does not need its own per-emulator table.

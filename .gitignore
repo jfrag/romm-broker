@@ -6,6 +6,7 @@ __pycache__/
 venv/
 build/
 dist/
+uv.lock
 
 # Frontend
 node_modules/
@@ -16,3 +17,6 @@ frontend/dist/
 .vscode/
 *.swp
 .DS_Store
+
+# Subagent-driven-development scratch workspaces
+.superpowers/

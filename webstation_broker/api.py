@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from . import callback, memcard, saves, selkies, session, settings
 from .emulators import get_emulator
+from .emulators.base import reap_orphan
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -48,11 +49,22 @@ class JoinIn(BaseModel):
     permission: str = "participant"
 
 
+class InviteIn(BaseModel):
+    permission: str = "participant"
+
+
 class StateIn(BaseModel):
     # RomM is the library of states, so the emulator works in a single slot and
     # resolves whatever is asked for to it. The bound is kept only to reject
     # obvious garbage, and 0 is the other brokers' "use your default slot".
     slot: int = Field(default=0, ge=0, le=10)
+
+
+class DiscIn(BaseModel):
+    # Absolute container path to the disc file, which RomM builds from the
+    # RomFile it resolved. Validated against ROM_ROOT the same way activate
+    # validates its rom path.
+    path: str
 
 
 class ActivateIn(BaseModel):
@@ -63,6 +75,11 @@ class ActivateIn(BaseModel):
     rom: Optional[RomIn] = None
     save: Optional[SaveIn] = None
     callback: Optional[CallbackIn] = None
+    # Decided once, on RomM's launch screen, and fixed for the life of the
+    # session. It governs whether RomM advertises this session for joining and
+    # whether the room shows its comms surface while the host is alone. The
+    # invite route ignores it: a link always works.
+    multiplayer: bool = False
 
 
 def _ct_eq(a: str, b: str) -> bool:
@@ -142,6 +159,12 @@ async def activate(
             detail="a session is already active; exit it before activating a new one",
         )
 
+    # No session is active, so any emulator still running was left behind by an
+    # earlier broker process. Killing it here is the only way it ever gets
+    # killed: nothing else holds a handle on it, and launching over the top
+    # would leave two emulators sharing the screen and the audio sink.
+    await anyio.to_thread.run_sync(reap_orphan)
+
     emulator = get_emulator(body.emulator)
     if emulator is None:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
@@ -210,6 +233,13 @@ async def activate(
         payload, emulator, str(rom_file) if rom_file else None
     )
 
+    log.info(
+        "session %s started: emulator=%s multiplayer=%s",
+        sess["id"],
+        body.emulator,
+        sess["multiplayer"],
+    )
+
     resume_slot = save.resume_slot if save else None
     await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
     # Baseline after launch: the exit dump only ships files this session wrote.
@@ -227,25 +257,35 @@ async def activate(
     }
 
 
+async def _mint_viewer(permission: str, user: Optional[dict]) -> dict:
+    """Add a seat to the running session and publish it to the control plane.
+
+    Shared by the RomM-facing join route and the controller's invite route so
+    token creation, the selkies push and the room broadcast stay in one place.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session to join")
+
+    if permission not in ("participant", "readonly"):
+        raise HTTPException(
+            status_code=422, detail="permission must be participant or readonly"
+        )
+
+    viewer = session.add_viewer(permission, user)
+    await selkies.push_tokens(sess)
+    await session.broadcast_state()
+    return viewer
+
+
 @router.post("/api/session/join")
 async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=None)):
     """Add a user to the running session. Membership policy belongs to the
     caller; whoever is sent gets a personal token and landing URL."""
     _check_secret(x_broker_secret)
 
+    viewer = await _mint_viewer(body.permission, body.user)
     sess = session.SESSION
-    if sess is None or not sess.get("active"):
-        raise HTTPException(status_code=409, detail="no active session to join")
-
-    if body.permission not in ("participant", "readonly"):
-        raise HTTPException(
-            status_code=422, detail="permission must be participant or readonly"
-        )
-
-    viewer = session.add_viewer(body.permission, body.user)
-    await selkies.push_tokens(sess)
-    await session.broadcast_state()
-
     return {
         "status": "joined",
         "session_id": sess["id"],
@@ -255,8 +295,36 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
     }
 
 
-async def _do_exit(save_slot: int) -> dict:
-    """Save state, stop the emulator, dump the save delta, and report."""
+@router.post("/api/session/invite")
+async def invite(body: InviteIn, token: str = Query()):
+    """The controller mints a seat for someone they will send a link to.
+
+    The room frontend does not hold the broker secret, so this is gated on the
+    controller token the same way the exit route is. The session's multiplayer
+    flag is deliberately not consulted: a link the host went out of their way
+    to copy should work whichever way they set the switch.
+    """
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    if not _ct_eq(token, sess["controller_token"]):
+        raise HTTPException(status_code=403, detail="controller token required")
+
+    viewer = await _mint_viewer(body.permission, None)
+    return {
+        "status": "invited",
+        "session_id": sess["id"],
+        "permission": body.permission,
+        "username": viewer["username"],
+        "url": _landing_url(viewer["token"]),
+    }
+
+
+async def _do_exit(save_slot: int | None) -> dict:
+    """Save state, stop the emulator, dump the save delta, and report.
+
+    `save_slot` of None exits without writing a state. The save dump still
+    runs: the game's own save data belongs to the player either way."""
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         raise HTTPException(status_code=409, detail="no active session")
@@ -354,14 +422,21 @@ async def exit_session(
     request: Request,
     x_broker_secret: Optional[str] = Header(default=None),
     token: Optional[str] = Query(default=None),
-    slot: int = Query(default=10, ge=1, le=10),
+    slot: int = Query(default=0, ge=0, le=10),
+    save: bool = Query(default=True),
 ):
-    """Accepts either the broker secret or the controller token."""
+    """Accepts either the broker secret or the controller token.
+
+    `save=0` is the stop that writes no state. Slot 0 is a real slot on this
+    broker, which is why the two are separate: there is no slot number left to
+    spend on meaning "do not save". A caller with no opinion on the slot gets
+    slot 0 too: every emulator here saves into its own working slot and echoes
+    back the one it used, so any other default would just be a lie in the log."""
     sess = session.SESSION
     is_controller = bool(sess and token and _ct_eq(token, sess["controller_token"]))
     if not is_controller:
         _check_secret(x_broker_secret)
-    return await _do_exit(slot)
+    return await _do_exit(slot if save else None)
 
 
 def _state_emulator():
@@ -374,6 +449,22 @@ def _state_emulator():
         raise HTTPException(
             status_code=400,
             detail=f"{emulator.display_name} has no save states",
+        )
+    if not emulator.alive():
+        raise HTTPException(status_code=409, detail="emulator is not running")
+    return emulator
+
+
+def _swap_emulator():
+    """The running emulator, if it is in a position to change discs."""
+    sess = session.SESSION
+    if sess is None or not sess.get("active"):
+        raise HTTPException(status_code=409, detail="no active session")
+    emulator = sess["emulator_obj"]
+    if not emulator.supports_disc_swap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{emulator.display_name} cannot swap discs",
         )
     if not emulator.alive():
         raise HTTPException(status_code=409, detail="emulator is not running")
@@ -418,6 +509,28 @@ async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(defa
         "slot": slot,
         "loaded": loaded,
     }
+
+
+@router.post("/api/session/swap-disc")
+async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+    emulator = _swap_emulator()
+    try:
+        disc_path = Path(body.path).resolve()
+    except OSError:
+        raise HTTPException(status_code=400, detail="invalid disc path")
+    if not disc_path.is_relative_to(settings.ROM_ROOT):
+        raise HTTPException(
+            status_code=400, detail=f"disc path must live under {settings.ROM_ROOT}"
+        )
+    if not disc_path.exists():
+        raise HTTPException(status_code=404, detail="disc path does not exist")
+
+    swapped = await anyio.to_thread.run_sync(emulator.swap_disc, disc_path)
+    if not swapped:
+        raise HTTPException(status_code=502, detail="emulator refused the disc swap")
+    log.info("disc swapped to %s", disc_path.name)
+    return {"status": "ok", "path": str(disc_path)}
 
 
 def _header_token(value: str, fallback: str) -> str:
@@ -642,7 +755,12 @@ async def status():
         "emulator": sess["emulator"],
         "rom": sess.get("rom"),
         "rom_file": sess.get("rom_file"),
+        "multiplayer": bool(sess.get("multiplayer")),
         "emulator_alive": sess["emulator_obj"].alive(),
+        # Set only by emulators with their own boot-verification signal (PCSX2
+        # today, via PINE). Passive: RomM decides what to do about it, this
+        # route only reports it.
+        "boot_failed": sess["emulator_obj"].boot_failed,
         # The emulator class is the authority on what it can do, so RomM reads
         # this rather than keeping its own per-emulator table.
         "supports_states": sess["emulator_obj"].supports_states,
@@ -787,6 +905,7 @@ async def context(token: Optional[str] = Query(default=None)):
         "gameName": (sess.get("rom") or {}).get("name")
         or sess["emulator_obj"].display_name,
         "controllerName": (sess.get("user") or {}).get("display_name") or "Controller",
+        "multiplayer": bool(sess.get("multiplayer")),
         # Relative to the page base; the selkies client reads the token from
         # its query string.
         "iframeSrc": f"stream/?token={token}",

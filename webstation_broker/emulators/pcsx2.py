@@ -396,6 +396,7 @@ class Pcsx2(Emulator):
         self.stop()
         _patch_ini()
         self._ensure_folder_card()
+        self.boot_failed = False  # every launch starts clean
         self._launch_seq += 1
         seq = self._launch_seq
 
@@ -405,19 +406,28 @@ class Pcsx2(Emulator):
             [binary, "-batch", "-fullscreen", "--", str(rom_path)], base_launch_env()
         )
 
-        if resume_slot:
-            Thread(
-                target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
-            ).start()
+        # Always: the watchdog verifies boot, and delivers a state only if one
+        # was asked for.
+        Thread(
+            target=self._boot_watchdog, args=(resume_slot, seq), daemon=True
+        ).start()
 
-    def _deferred_load_state(self, slot: int, seq: int) -> None:
-        """Load `slot` once the freshly launched game's VM reports running."""
+    def _boot_watchdog(self, slot: int | None, seq: int) -> None:
+        """Verify the freshly launched game reaches a running VM, and deliver a
+        deferred state load if one was asked for.
+
+        A process that is still alive when the deadline passes without the VM
+        ever running is the boot-error-dialog case: PCSX2 does not exit, so
+        nothing else in the broker would ever notice."""
         deadline = time.monotonic() + RESUME_LOAD_WAIT
         while time.monotonic() < deadline:
             if self._launch_seq != seq:
-                log.info("resume: launch superseded, slot %d load abandoned", slot)
+                log.info("boot watchdog: launch superseded, abandoning")
                 return
             if _pine_emu_status() == 0:
+                # Booted. Everything from here is the pre-existing resume path.
+                if slot is None:
+                    return
                 time.sleep(RESUME_LOAD_SETTLE)
                 if not self.wait_for_state(deadline):
                     log.warning("resume: slot %d never got a state file", slot)
@@ -428,7 +438,18 @@ class Pcsx2(Emulator):
                 log.info("resume: deferred load of slot %d %s", slot, "delivered" if ok else "failed")
                 return
             time.sleep(1.0)
-        log.warning("resume: VM never reached running state, slot %d not loaded", slot)
+
+        # Deadline passed without a running VM.
+        if self._launch_seq != seq:
+            return
+        if self.alive():
+            self.boot_failed = True
+            log.warning(
+                "boot watchdog: VM never reached running state and pcsx2 is "
+                "still alive — treating as a boot failure"
+            )
+        else:
+            log.warning("boot watchdog: pcsx2 exited before the VM ever ran")
 
     def save_state(self, slot: int) -> bool:
         """`slot` is what RomM asked for and is ignored: this saves into
@@ -484,10 +505,10 @@ class Pcsx2(Emulator):
             return existing if restamped == existing.name else None
         return SSTATE_DIR / restamped
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
-        if self.alive():
+        if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
                 p = self.state_path()
@@ -495,9 +516,14 @@ class Pcsx2(Emulator):
                     st = p.stat()
                     state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
-        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
+        return {
+            "state_saved": saved,
+            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_file": state_file,
+        }
 
     def stop(self) -> None:
-        # Invalidate any in-flight deferred state load before the kill.
+        # Invalidate any in-flight boot watchdog (and any state load it might
+        # still deliver) before the kill.
         self._launch_seq += 1
         super().stop()

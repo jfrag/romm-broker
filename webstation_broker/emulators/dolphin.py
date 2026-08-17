@@ -337,7 +337,7 @@ class Dolphin(Emulator):
 
         # A state already on disk (restored from the save archive) loads at boot,
         # which is both more reliable than the hotkey and invisible to the player.
-        resume_path = _state_for_slot(STATE_SLOT) if resume_slot else None
+        resume_path = _state_for_slot(STATE_SLOT) if resume_slot is not None else None
         if resume_path is not None:
             cmd += ["-s", str(resume_path)]
 
@@ -347,7 +347,7 @@ class Dolphin(Emulator):
 
         # RomM pushes its resume pick after activate returns, so a slot that was
         # empty at launch can still fill. That one has to go in over the hotkey.
-        if resume_slot and resume_path is None:
+        if resume_slot is not None and resume_path is None:
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _deferred_load_state(self, seq: int) -> None:
@@ -425,10 +425,10 @@ class Dolphin(Emulator):
         except OSError as exc:
             log.warning("could not drop the undo state buffer: %s", exc)
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
-        if self.alive():
+        if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
                 p = self.state_path()
@@ -437,7 +437,11 @@ class Dolphin(Emulator):
                     state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         self._drop_undo_buffer()
-        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
+        return {
+            "state_saved": saved,
+            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_file": state_file,
+        }
 
     def stop(self) -> None:
         # Invalidate any in-flight deferred state load before the kill.

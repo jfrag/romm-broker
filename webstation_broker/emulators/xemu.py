@@ -44,6 +44,24 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
 XEMU_LOG_PATH = Path(os.environ.get("XEMU_LOG_PATH", "/config/xemu.log"))
 
+# Vulkan aborts xemu on the AMD Renoir/RADV stack these containers run on, and
+# the choice persists in xemu.toml, so one session spent switching renderers
+# leaves every later launch broken. Pinned before each launch; set XEMU_RENDERER
+# to VULKAN where the driver is known good, or to KEEP to leave the file alone.
+XEMU_RENDERER = os.environ.get("XEMU_RENDERER", "OPENGL").strip().upper()
+
+# Which renderer xemu asks for and whether the driver can answer are separate
+# problems: on the AMD Renoir stack these containers run on, xemu aborts in
+# gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
+# XEMU_SOFTWARE_GL to render xemu on the CPU there, which the container-wide
+# LIBGL_ALWAYS_SOFTWARE cannot do without dragging every other emulator down
+# with it. Slow, so it stays off unless the host needs it.
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+XEMU_SOFTWARE_GL = _truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
+
 
 def _default_toml_path() -> Path:
     """xemu.toml lives in SDL's pref dir: $XDG_DATA_HOME/xemu/xemu, or
@@ -107,6 +125,72 @@ def _hdd_image_path() -> Path:
                   raw, FALLBACK_HDD_IMAGE)
         return FALLBACK_HDD_IMAGE
     return p
+
+
+def _launch_env() -> dict[str, str]:
+    env = base_launch_env()
+    if XEMU_SOFTWARE_GL:
+        env["LIBGL_ALWAYS_SOFTWARE"] = "1"
+    return env
+
+
+_NEXT_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
+
+
+def _pin_toml_key(text: str, section: str, key: str, value: str) -> str:
+    """Return `text` with `key = value` set under `[section]`, adding either if
+    it is missing.
+
+    Edited as text rather than reparsed and dumped: tomllib only reads, and a
+    round trip through a writer would flatten the comments and key order xemu
+    maintains in the file it owns."""
+    line = f"{key} = {value}"
+    header = re.search(rf"^\[{re.escape(section)}\][ \t]*$", text, re.MULTILINE)
+    if header is None:
+        return text.rstrip("\n") + f"\n\n[{section}]\n{line}\n"
+
+    body_start = header.end()
+    next_section = _NEXT_SECTION_RE.search(text, body_start)
+    body_end = next_section.start() if next_section else len(text)
+    body = text[body_start:body_end]
+    key_re = re.compile(rf"^{re.escape(key)}[ \t]*=.*$", re.MULTILINE)
+    if key_re.search(body):
+        # A replacement function, so a backslash in the value stays literal.
+        body = key_re.sub(lambda _: line, body, count=1)
+    else:
+        body = f"\n{line}" + body
+    return text[:body_start] + body + text[body_end:]
+
+
+def _pin_display_settings() -> None:
+    """Force the display settings a streamed session needs into xemu.toml.
+
+    xemu owns this file and rewrites it on exit, dropping every key that still
+    matches its own default, so neither setting survives a session on its own.
+    """
+    try:
+        text = XEMU_TOML.read_text(encoding="utf-8")
+    except OSError as exc:
+        # Nothing to pin on a container where xemu has never run; it writes the
+        # file on first exit, and starts out on OpenGL anyway.
+        log.debug("could not read %s to pin display settings (%s)", XEMU_TOML, exc)
+        return
+
+    updated = text
+    if XEMU_RENDERER not in ("", "KEEP"):
+        updated = _pin_toml_key(updated, "display", "renderer", f"'{XEMU_RENDERER}'")
+    # Every other emulator here is launched fullscreen with a command line flag.
+    # xemu has none, so its window size is a config key like anything else.
+    updated = _pin_toml_key(updated, "display.window", "fullscreen_on_startup", "true")
+
+    if updated == text:
+        return
+    try:
+        XEMU_TOML.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        log.error("could not pin display settings in %s: %s", XEMU_TOML, exc)
+        return
+    log.info("pinned xemu display settings in %s", XEMU_TOML)
 
 
 def _disc_number(rel: Path) -> int:
@@ -275,7 +359,9 @@ def _disc_title_id(rom_path: Path) -> str | None:
             cert = fh.read(12)
             if len(cert) < 12:
                 return None
-            return f"{int.from_bytes(cert[8:12], 'little'):08x}"
+            # Uppercase because that is how the dashboard names the directory
+            # it creates, and a directory this code creates has to match.
+            return f"{int.from_bytes(cert[8:12], 'little'):08X}"
     except OSError as exc:
         log.warning("could not read %s for a title id: %s", rom_path, exc)
         return None
@@ -297,6 +383,24 @@ def _fatx_isdir(fs: Fatx, path: str) -> bool:
         return bool(fs.get_attr(path).is_directory)
     except AssertionError:
         return False
+
+
+def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
+    """Path of `parent`'s child directory matching `name` whatever its case.
+
+    libfatx compares names byte for byte, so a lookup has to use the case the
+    disk actually holds. Titles vary in how they case their save directories,
+    and the miss would be silent: nothing resolves, nothing is extracted, and
+    the session's saves stay behind in the image."""
+    wanted = name.lower()
+    try:
+        entries = list(fs.listdir(parent))
+    except (AssertionError, OSError):
+        return None
+    for attr in entries:
+        if attr.is_directory and attr.filename.lower() == wanted:
+            return f"{parent.rstrip('/')}/{attr.filename}"
+    return None
 
 
 # ── Provider ─────────────────────────────────────────────────────────────────
@@ -364,18 +468,26 @@ class Xemu(Emulator):
         if fs is None:
             return 0
         written = 0
-        ensured_dirs: set[str] = set()
+        # Directory paths as they exist on the image, keyed by the staged
+        # (case-bearing) components, so an archive whose case differs from the
+        # disk's lands in the existing directory instead of a twin beside it.
+        resolved: dict[tuple[str, ...], str] = {(): ""}
         for p in files:
             parts = p.relative_to(self.staging_dir).parts
-            fatx_path = "/" + "/".join(parts)
             try:
+                parent = ""
                 for i in range(1, len(parts)):
-                    d = "/" + "/".join(parts[:i])
-                    if d in ensured_dirs:
+                    key = parts[:i]
+                    if key in resolved:
+                        parent = resolved[key]
                         continue
-                    if not _fatx_isdir(fs, d):
-                        fs.mkdir(d)
-                    ensured_dirs.add(d)
+                    found = _fatx_find_dir(fs, parent or "/", parts[i - 1])
+                    if found is None:
+                        found = f"{parent}/{parts[i - 1]}"
+                        fs.mkdir(found)
+                    resolved[key] = found
+                    parent = found
+                fatx_path = f"{parent}/{parts[-1]}"
                 data = p.read_bytes()
                 fs.write(fatx_path, data)
                 # pyfatx write() never shrinks an existing file; drop the old
@@ -399,9 +511,19 @@ class Xemu(Emulator):
             return 0
         roots = []
         for top in ("UDATA", "TDATA"):
-            src = f"/{top}/{self._title_id}" if self._title_id else f"/{top}"
-            if _fatx_isdir(fs, src):
+            if not _fatx_isdir(fs, f"/{top}"):
+                continue
+            if not self._title_id:
+                roots.append(f"/{top}")
+                continue
+            src = _fatx_find_dir(fs, f"/{top}", self._title_id)
+            if src is None:
+                log.info("no /%s/%s on the HDD image", top, self._title_id)
+            else:
                 roots.append(src)
+        if not roots:
+            log.warning("no save directories found on %s for title %s; the "
+                        "archive will be empty", self.hdd_image, self._title_id or "<all>")
         extracted = 0
         for src in roots:
             for root, _dirs, filenames in fs.walk(src):
@@ -468,14 +590,16 @@ class Xemu(Emulator):
             else:
                 log.error("pre-launch: HDD image is not raw; restored saves were NOT injected")
 
-        if resume_slot:
+        if resume_slot is not None:
             log.warning("resume: save states are not supported on a raw HDD "
                         "image; slot %d ignored, booting fresh", resume_slot)
 
-        log.info("launching xemu (rom=%s)", rom_path)
-        self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], base_launch_env())
+        _pin_display_settings()
 
-    def save_and_exit(self, slot: int) -> dict:
+        log.info("launching xemu (rom=%s)", rom_path)
+        self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
+
+    def save_and_exit(self, slot: int | None) -> dict:
         self.stop()
         _reap_strays()
         extracted = 0

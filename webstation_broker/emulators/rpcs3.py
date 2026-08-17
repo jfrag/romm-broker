@@ -351,7 +351,7 @@ class Rpcs3(Emulator):
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
         self._restoring = False
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "rpcs3 save states are unsupported, resume_slot %s ignored "
                 "(game resumes from its own save data)",
@@ -380,7 +380,7 @@ class Rpcs3(Emulator):
         )
         self._spawn([_rpcs3_bin(), "--no-gui", "--fullscreen", str(boot)], _launch_env())
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         self.stop()
         # The dump ships files newer than the session baseline. A save is a
         # directory tree the game rewrites only partially, and sibling dirs

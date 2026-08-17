@@ -119,7 +119,7 @@ class Shadps4(Emulator):
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "shadps4 has no save states, resume_slot %s ignored "
                 "(game resumes from its own save data)",
@@ -157,7 +157,7 @@ class Shadps4(Emulator):
                 proc.stdin.write(b"STOP\n")
                 proc.stdin.flush()
                 proc.wait(timeout=self.term_timeout)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except (BrokenPipeError, OSError):

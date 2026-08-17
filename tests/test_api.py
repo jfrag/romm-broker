@@ -1,11 +1,15 @@
 """The HTTP surface RomM drives the container through."""
 
 import io
+import signal
 import zipfile
 
 import pytest
+from fastapi.testclient import TestClient
 
 from webstation_broker import session, settings
+from webstation_broker.app import create_app
+from webstation_broker.emulators import base
 
 from .conftest import PREFIX
 
@@ -161,6 +165,7 @@ def test_status_reports_what_romm_reads_off_the_running_session(
     assert body["session_id"] == "sess-1"
     assert body["emulator"] == "fake"
     assert body["emulator_alive"] is True
+    assert body["boot_failed"] is False
     assert body["supports_states"] is True
     assert body["state_slot"] == 3
 
@@ -463,5 +468,238 @@ def test_a_stranger_cannot_exit_someone_else_session(
     assert session.SESSION is not None
 
 
+def test_exit_with_save_off_writes_no_state_but_still_dumps_the_saves(
+    client, broker_dirs, fake_emulator, monkeypatch
+):
+    """A player leaving without saving gets no state written, and the game's
+    own save data still travels: that progress is theirs either way."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    (fake_emulator[0].save_root / "saves" / "card.bin").write_bytes(b"played")
+
+    body = client.post(f"{API}/session/exit", params={"save": "false"}).json()
+
+    assert fake_emulator[0].exit_slots == [None]
+    assert body["state_saved"] is False
+    assert body["state_slot"] is None
+    assert [f["path"] for f in body["save_dump"]["files"]] == ["saves/card.bin"]
+
+
+def test_exit_carries_slot_zero_rather_than_falling_back_to_the_default(
+    client, broker_dirs, fake_emulator
+):
+    """Slot 0 is a real slot here, so a request asking for it has to arrive as
+    0 and not be mistaken for "nothing was asked for"."""
+    _activate(client, broker_dirs)
+
+    client.post(f"{API}/session/exit", params={"slot": 0})
+
+    assert fake_emulator[0].exit_slots == [0]
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, ""])
+def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
+    prefix, pid_record, sleeper, monkeypatch
+):
+    """Exit answers 409 with no session, so a broker that comes back to an
+    orphan can only kill it at startup. Both app shapes are checked because
+    Starlette hands the lifespan to the served app, never to a mounted one."""
+    monkeypatch.setattr(settings, "PREFIX", prefix)
+    proc = sleeper()
+    base._record_pid("fake", proc.pid, ["/usr/bin/sleep", "60"])
+
+    with TestClient(create_app()):
+        pass
+
+    assert proc.wait(timeout=10) == -signal.SIGTERM
+    assert not pid_record.exists()
+
+
 def test_exiting_nothing_is_a_conflict(client):
     assert client.post(f"{API}/session/exit").status_code == 409
+
+
+def test_activate_records_a_multiplayer_session(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs, multiplayer=True)
+
+    assert session.SESSION["multiplayer"] is True
+
+
+def test_activate_defaults_to_a_solo_session(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+
+    assert session.SESSION["multiplayer"] is False
+
+
+def test_context_tells_the_room_which_kind_of_session_it_is(
+    client, broker_dirs, fake_emulator
+):
+    _activate(client, broker_dirs, multiplayer=True)
+    token = session.SESSION["controller_token"]
+
+    body = client.get(f"{API}/session/context", params={"token": token}).json()
+
+    assert body["multiplayer"] is True
+
+
+def test_context_reports_a_solo_session_as_such(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    body = client.get(f"{API}/session/context", params={"token": token}).json()
+
+    assert body["multiplayer"] is False
+
+
+def test_the_controller_can_mint_an_invite_link(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    body = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "participant"},
+    ).json()
+
+    assert body["url"] != f"{PREFIX}/?token={token}"
+    assert len(session.SESSION["viewers"]) == 1
+
+
+def test_an_invite_works_on_a_solo_session(client, broker_dirs, fake_emulator):
+    """The switch governs discovery and comms, never the link."""
+    _activate(client, broker_dirs, multiplayer=False)
+    token = session.SESSION["controller_token"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_a_viewer_cannot_mint_invites(client, broker_dirs, fake_emulator):
+    _activate(client, broker_dirs)
+    viewer = client.post(
+        f"{API}/session/join", json={"permission": "participant"}
+    ).json()
+    viewer_token = session.SESSION["viewers"][0]["token"]
+    assert viewer["username"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": viewer_token},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_inviting_into_nothing_is_a_conflict(client):
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": "whatever"},
+        json={"permission": "participant"},
+    )
+
+    assert response.status_code == 409
+
+
+def test_an_invite_with_an_unknown_permission_is_refused(
+    client, broker_dirs, fake_emulator
+):
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+
+    response = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "admin"},
+    )
+
+    assert response.status_code == 422
+
+
+class TestSwapDisc:
+    """Changing the mounted disc mid-session."""
+
+    def _disc(self, broker_dirs, name="Game (Disc 2).chd"):
+        disc = broker_dirs["roms"] / name
+        disc.write_bytes(b"disc")
+        return disc
+
+    def _session(self, secret_client, broker_dirs):
+        """Activate a session on the secret-guarded client.
+
+        `_activate` sends no secret header of its own, so the header goes on
+        the client first, the way test_the_right_secret_gets_through does.
+        """
+        secret_client.headers["X-Broker-Secret"] = "s3cret"
+        assert _activate(secret_client, broker_dirs).status_code == 200
+
+    def test_a_swap_reaches_the_emulator(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        disc = self._disc(broker_dirs)
+        r = secret_client.post(
+            f"{API}/session/swap-disc", json={"path": str(disc)}
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "ok"
+        assert fake_emulator[0].swapped_discs == [disc.resolve()]
+
+    def test_a_refused_swap_is_a_bad_gateway(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        fake_emulator[0].swap_ok = False
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 502
+
+    def test_a_disc_outside_the_rom_root_is_rejected(
+        self, secret_client, broker_dirs, fake_emulator, tmp_path
+    ):
+        self._session(secret_client, broker_dirs)
+        outside = tmp_path / "elsewhere.chd"
+        outside.write_bytes(b"x")
+        r = secret_client.post(
+            f"{API}/session/swap-disc", json={"path": str(outside)}
+        )
+        assert r.status_code == 400
+
+    def test_a_missing_disc_is_a_not_found(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(broker_dirs["roms"] / "nope.chd")},
+        )
+        assert r.status_code == 404
+
+    def test_an_emulator_without_a_tray_is_refused(
+        self, secret_client, broker_dirs, fake_emulator
+    ):
+        self._session(secret_client, broker_dirs)
+        fake_emulator[0].supports_disc_swap = False
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 400
+
+    def test_no_session_means_no_swap(self, secret_client, broker_dirs):
+        secret_client.headers["X-Broker-Secret"] = "s3cret"
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 409
+
+    def test_the_route_needs_the_broker_secret(self, secret_client, broker_dirs, fake_emulator):
+        self._session(secret_client, broker_dirs)
+        del secret_client.headers["X-Broker-Secret"]
+        r = secret_client.post(
+            f"{API}/session/swap-disc",
+            json={"path": str(self._disc(broker_dirs))},
+        )
+        assert r.status_code == 403

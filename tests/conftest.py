@@ -6,6 +6,7 @@ emulator modules read their paths at import time into module globals, which is
 why the redirect is a monkeypatch of those globals rather than of the env.
 """
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import selkies, session, settings
 from webstation_broker.app import create_app
+from webstation_broker.emulators import base
 from webstation_broker.emulators.base import Emulator
 
 PREFIX = settings.PREFIX
@@ -47,6 +49,34 @@ def no_selkies(monkeypatch):
     monkeypatch.setattr(selkies, "clear_tokens", _clear)
 
 
+@pytest.fixture(autouse=True)
+def pid_record(monkeypatch, tmp_path):
+    """Point the emulator pid record at tmp_path and hand back its path.
+
+    Autouse because the app reaps whatever the record names at startup, and a
+    developer box running the broker has a real one naming a real emulator."""
+    path = tmp_path / "broker-emulator.json"
+    monkeypatch.setattr(base, "PID_FILE", path)
+    return path
+
+
+@pytest.fixture
+def sleeper():
+    """A process in its own session, standing in for a running emulator."""
+    procs = []
+
+    def spawn():
+        proc = subprocess.Popen(["/usr/bin/sleep", "60"], start_new_session=True)
+        procs.append(proc)
+        return proc
+
+    yield spawn
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
 @pytest.fixture
 def broker_dirs(monkeypatch, tmp_path):
     """Point the ROM root and the archive directories at tmp_path."""
@@ -68,6 +98,7 @@ class FakeEmulator(Emulator):
     display_name = "Fake"
     rom_extensions = (".iso",)
     supports_states = True
+    supports_disc_swap = True
     state_slot = 3
 
     def __init__(self):
@@ -76,8 +107,11 @@ class FakeEmulator(Emulator):
         self.cleared = False
         self.saved_slots = []
         self.loaded_slots = []
+        self.exit_slots = []
         self.running = True
         self.state_file: Path | None = None
+        self.swapped_discs: list[Path] = []
+        self.swap_ok = True
 
     def alive(self) -> bool:
         return self.running
@@ -111,9 +145,16 @@ class FakeEmulator(Emulator):
     def state_target(self, filename: str) -> Path | None:
         return self.state_file
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
+        self.exit_slots.append(slot)
         self.stop()
+        if slot is None:
+            return {"state_saved": False, "state_slot": None, "state_file": None}
         return {"state_saved": True, "state_slot": self.state_slot, "state_file": None}
+
+    def swap_disc(self, path):
+        self.swapped_discs.append(path)
+        return self.swap_ok
 
 
 @pytest.fixture

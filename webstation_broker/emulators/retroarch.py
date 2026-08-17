@@ -22,6 +22,8 @@ replies to *stdout*. Commands:
   SAVE_FILES           -> "OK" / "NO" (newline-terminated)
   GET_STATUS           -> "GET_STATUS PLAYING <core_id>,<basename>\n"
                           or "GET_STATUS CONTENTLESS"
+  DISK_EJECT_TOGGLE  open or close the virtual tray
+  DISK_NEXT          step to the next disc in the loaded playlist
   QUIT                 -> no reply; queued for the runloop
 
 Saves are confirmed on the filesystem instead of from a reply.
@@ -72,15 +74,15 @@ XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/sha
 RA_CONFIG_DIR = Path(os.environ.get("RETROARCH_CONFIG_DIR", str(Path.home() / ".config" / "retroarch")))
 
 
-def _configured_cores_dir() -> Path | None:
-    """`libretro_directory` from the user's RetroArch config."""
+def _configured_dir(setting: str) -> Path | None:
+    """A directory setting read out of the user's RetroArch config."""
     try:
         text = (RA_CONFIG_DIR / "retroarch.cfg").read_text(errors="replace")
     except OSError:
         return None
     for line in text.splitlines():
         key, sep, value = line.partition("=")
-        if sep and key.strip() == "libretro_directory":
+        if sep and key.strip() == setting:
             raw = value.strip().strip('"').strip()
             if raw and raw != "default":
                 return Path(os.path.expanduser(raw))
@@ -94,8 +96,14 @@ def _configured_cores_dir() -> Path | None:
 # desktop RetroArch without its in-app core downloader.
 CORES_DIR = Path(
     os.environ.get("RETROARCH_CORES_DIR")
-    or _configured_cores_dir()
+    or _configured_dir("libretro_directory")
     or Path(XDG_DATA_HOME) / "RetroArch" / "cores"
+)
+# Where cores look for the assets and firmware they cannot ship themselves.
+SYSTEM_DIR = Path(
+    os.environ.get("RETROARCH_SYSTEM_DIR")
+    or _configured_dir("system_directory")
+    or Path(XDG_DATA_HOME) / "RetroArch" / "system"
 )
 # Buildbot ships every core as <core>_libretro.so.zip;
 CORES_BASE_URL = os.environ.get(
@@ -128,13 +136,36 @@ STATE_SLOT = int(os.environ.get("RETROARCH_STATE_SLOT", "0"))
 # step count has to outrun any slot the player could have cycled to.
 SLOT_STEP_DELAY = float(os.environ.get("RETROARCH_SLOT_STEP_DELAY", "0.1"))
 SLOT_HOME_STEPS = int(os.environ.get("RETROARCH_SLOT_HOME_STEPS", "24"))
+# Disc tray timings. The settle is not optional: RetroArch drops a disc index
+# change that arrives while the tray is still opening, and the failure is
+# silent (the old disc stays mounted).
+DISC_TRAY_SETTLE = float(os.environ.get("RETROARCH_DISC_TRAY_SETTLE", "1.5"))
+DISC_STEP_DELAY = float(os.environ.get("RETROARCH_DISC_STEP_DELAY", "0.1"))
+# How long a swap waits for the core to report a running game. A mid-session
+# swap answers on the first poll; a swap issued right after launch waits out
+# the boot.
+DISC_SWAP_WAIT = float(os.environ.get("RETROARCH_DISC_SWAP_WAIT", "90.0"))
 CORE_DOWNLOAD_TIMEOUT = float(os.environ.get("RETROARCH_CORE_DOWNLOAD_TIMEOUT", "180"))
+# The pads here are Selkies interposer sockets, not real devices, and the fake
+# libudev behind them gives every one the same identity. RetroArch's udev
+# joypad driver reads that as one device plugged eight times ("Device ID 0 is
+# already plugged") and ends up with no pads at all. linuxraw opens the js
+# nodes directly, which the interposer does hook, so there is nothing to
+# collide on. Set empty to leave the user's own driver alone.
+JOYPAD_DRIVER = os.environ.get("RETROARCH_JOYPAD_DRIVER", "linuxraw")
 
 # RomM platform slug -> libretro core, kept in retroarch_platforms.json next
 # to this module. Extensions order doubles as the preference order when a
 # folder holds several candidates.
 #
 # `savestate` is assumed true; only specialized cores opt out.
+#
+# `thumbnail` is assumed true. Cores that render on the GPU can deadlock
+# RetroArch's main loop on the framebuffer grab that follows a save, which
+# takes the stdin command channel down with it for the rest of the session.
+#
+# `assets` maps a path under the RetroArch system dir to the directory on the
+# image holding those files, for cores that need data the .so does not carry.
 _PLATFORMS_FILE = Path(__file__).with_name("retroarch_platforms.json")
 
 
@@ -148,85 +179,6 @@ def _load_platforms() -> dict[str, dict]:
 
 
 PLATFORMS: dict[str, dict] = _load_platforms()
-#
-# `thumbnail` is assumed true. Cores that render on the GPU can deadlock
-# RetroArch's main loop on the framebuffer grab that follows a save, which
-# takes the stdin command channel down with it for the rest of the session.
-PLATFORMS: dict[str, dict] = {
-    "ngc": {
-        "core": "dolphin",
-        "thumbnail": False,
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "wii": {
-        "core": "dolphin",
-        "thumbnail": False,
-        "extensions": (".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"),
-        "save_subtrees": (
-            "states",
-            "saves/dolphin-emu/User/GC",
-            "saves/dolphin-emu/User/Wii/title",
-            "saves/dolphin-emu/User/Wii/shared2",
-        ),
-    },
-    "snes": {
-        "core": "snes9x",
-        "extensions": (".sfc", ".smc", ".fig", ".swc", ".st", ".gd3", ".gd7", ".dx2", ".bs", ".bin"),
-    },
-    "n64": {
-        "core": "mupen64plus_next",
-        "extensions": (".n64", ".z64", ".v64", ".rom", ".ndd"),
-    },
-    "dc": {
-        "core": "flycast",
-        "extensions": (".gdi", ".cdi", ".chd", ".cue", ".m3u", ".iso", ".bin"),
-    },
-    "saturn": {
-        "core": "yabasanshiro",
-        "extensions": (".cue", ".chd", ".iso", ".bin", ".m3u", ".ccd", ".toc"),
-    },
-    "psp": {
-        "core": "ppsspp",
-        "extensions": (".iso", ".cso", ".pbp", ".chd", ".elf", ".prx"),
-    },
-    "nds": {
-        "core": "melonds",
-        "extensions": (".nds", ".srl"),
-    },
-    # The buildbot does not carry this core, so it comes from the Azahar
-    # project's own releases. It nests its 3DS data under <savefile dir>/Azahar
-    # rather than writing into the flat saves dir, which is what the spelled
-    # out subtrees follow; the rest of that tree is config, cache and shaders.
-    # No .cia, common as that format is for 3DS: the core declares none, since
-    # a CIA is an installable package rather than something it can boot.
-    "3ds": {
-        "core": "azahar",
-        "core_source": {
-            "github_release": "azahar-emu/azahar",
-            "asset": r"azahar-libretro-linux-x86_64-.*\.zip",
-        },
-        "extensions": (".3ds", ".cci", ".zcci", ".cxi", ".zcxi", ".app", ".3dsx", ".z3dsx", ".elf", ".axf"),
-        "save_subtrees": (
-            "states",
-            "saves/Azahar/sdmc/Nintendo 3DS",
-            "saves/Azahar/nand/data",
-        ),
-    },
-    "arcade": {
-        "core": "fbneo",
-        "extensions": (".zip", ".7z", ".chd"),
-    },
-    "genesis": {
-        "core": "genesis_plus_gx",
-        "extensions": (".md", ".gen", ".smd", ".bin", ".sg", ".sms", ".gg", ".cue"),
-    },
-}
 
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _ADDON_RE = re.compile(
@@ -309,9 +261,45 @@ def _ensure_core(core: str, source: dict | None = None) -> Path:
     return so
 
 
+def _ensure_core_assets(assets: dict[str, str]) -> None:
+    """Link a core's asset directories into the RetroArch system dir.
+
+    Some cores need data files the buildbot .so does not carry: the ppsspp
+    core refuses to boot without PPSSPP's own asset tree. The container
+    already ships those alongside the standalone app, so this points the core
+    at them rather than downloading a second copy. Symlinks, so an image that
+    updates the app updates what the core reads too.
+
+    Best effort: a missing source is left alone, and the core reports the
+    missing asset itself, which is a clearer error than one raised here.
+    """
+    for target, source in assets.items():
+        src = Path(source)
+        dest = SYSTEM_DIR / target
+        if not src.is_dir():
+            log.warning("retroarch: asset source %s is missing, skipping %s", src, dest)
+            continue
+        if dest.exists() and not dest.is_symlink():
+            # Something real is already there; whoever put it there wins.
+            continue
+        try:
+            if dest.is_symlink():
+                if dest.readlink() == src:
+                    continue
+                dest.unlink()
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.symlink_to(src, target_is_directory=True)
+        except OSError as exc:
+            log.error("retroarch: could not link assets %s -> %s: %s", dest, src, exc)
+            continue
+        log.info("retroarch: linked core assets %s -> %s", dest, src)
+
+
 def _write_broker_cfg(thumbnail: bool = True) -> Path:
     """Minimal per-launch config, applied *on top of* the user's config.
-    Only the stdin interface and the broker save dirs; nothing else."""
+
+    The stdin interface, the broker save dirs, and the joypad driver the
+    streamed pads need; nothing else."""
     RA_DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -328,6 +316,8 @@ def _write_broker_cfg(thumbnail: bool = True) -> Path:
         'confirm_quit = "false"\n'
         'quit_press_twice = "false"\n'
     )
+    if JOYPAD_DRIVER:
+        cfg += f'input_joypad_driver = "{JOYPAD_DRIVER}"\n'
     tmp = BROKER_CFG.with_suffix(".tmp")
     tmp.write_text(cfg)
     os.replace(tmp, BROKER_CFG)
@@ -449,6 +439,35 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
+def _m3u_entries(playlist: Path) -> list[Path]:
+    """Disc paths a .m3u lists, in playlist order, resolved absolute.
+
+    Entry order is the order RetroArch assigns disc indices in, so the list
+    index is the number of DISK_NEXT presses from the first disc.
+    """
+    try:
+        text = playlist.read_text(errors="replace")
+    except OSError as exc:
+        log.warning("retroarch: could not read playlist %s: %s", playlist, exc)
+        return []
+    entries: list[Path] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entries.append((playlist.parent / line).resolve())
+    return entries
+
+
+def _m3u_index_for_path(playlist: Path, target: Path) -> int | None:
+    """Disc index `target` occupies in `playlist`, or None if unlisted."""
+    wanted = target.resolve()
+    for index, entry in enumerate(_m3u_entries(playlist)):
+        if entry == wanted:
+            return index
+    return None
+
+
 def _pick_rom_file(candidates, base: Path, extensions: tuple[str, ...]) -> Path | None:
     ranked = []
     for p in candidates:
@@ -488,6 +507,7 @@ class Retroarch(Emulator):
     save_root = RA_DATA_DIR
     log_path = RA_LOG_PATH
     supports_states = True
+    supports_disc_swap = True
     state_slot = STATE_SLOT
     state_dir = STATE_DIR
     # QUIT walks a graceful core teardown; give it room before SIGTERM.
@@ -503,6 +523,15 @@ class Retroarch(Emulator):
         self._stdout_buf = bytearray()
         self._stdout_lock = threading.Lock()
         self._reader: threading.Thread | None = None
+        # The playlist this session booted, and where its tray currently sits.
+        # RetroArch has no way to read the mounted disc back, so the broker
+        # remembers what it did and steps relative to that.
+        self._playlist: Path | None = None
+        self._disc_index: int = 0
+        # Serializes swap_disc against itself and against the deferred resume
+        # load: both poll for PLAYING and then act on the live process, and a
+        # LOAD_STATE landing inside a tray-settle window is the collision.
+        self._disc_lock = threading.Lock()
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -637,6 +666,7 @@ class Retroarch(Emulator):
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
             )
         core = _ensure_core(info["core"], info.get("core_source"))
+        _ensure_core_assets(info.get("assets", {}))
         cfg_path = _write_broker_cfg(info.get("thumbnail", True))
 
         binary = os.environ.get("RETROARCH_BIN", "retroarch")
@@ -648,6 +678,8 @@ class Retroarch(Emulator):
         self._slot_homed = False
         self._launch_seq += 1
         seq = self._launch_seq
+        self._playlist = rom_path if rom_path.suffix.lower() == ".m3u" else None
+        self._disc_index = 0
 
         cmd = [
             binary,
@@ -666,7 +698,9 @@ class Retroarch(Emulator):
         )
         self._spawn_ra(cmd, base_launch_env())
 
-        if resume_slot:
+        # Slot 0 is a real slot here, so the gate is on the request, not on the
+        # number: `if resume_slot` would drop every resume this broker asks for.
+        if resume_slot is not None:
             threading.Thread(
                 target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
             ).start()
@@ -680,22 +714,107 @@ class Retroarch(Emulator):
                 return
             reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
             if reply and reply.startswith("GET_STATUS PLAYING"):
-                time.sleep(RESUME_LOAD_SETTLE)
-                if not self.wait_for_state(deadline):
-                    log.warning("resume: slot %d never got a state file", slot)
-                    return
-                if self._launch_seq != seq:
-                    return
-                log.info(
-                    "resume: load of slot %d %s",
-                    slot,
-                    "delivered" if self.load_state(slot) else "failed",
-                )
+                # Shares the tray lock with swap_disc: both poll for PLAYING
+                # and then act, and a LOAD_STATE landing inside a swap's tray
+                # settle is the collision this guards against.
+                with self._disc_lock:
+                    if self._launch_seq != seq or not self.alive():
+                        return
+                    time.sleep(RESUME_LOAD_SETTLE)
+                    if not self.wait_for_state(deadline):
+                        log.warning("resume: slot %d never got a state file", slot)
+                        return
+                    if self._launch_seq != seq:
+                        return
+                    log.info(
+                        "resume: load of slot %d %s",
+                        slot,
+                        "delivered" if self.load_state(slot) else "failed",
+                    )
                 return
             time.sleep(1.0)
         log.warning(
             "resume: retroarch never reported PLAYING, slot %d not loaded", slot
         )
+
+    def _wait_until_playing(self, deadline: float, seq: int) -> bool:
+        """Block until the core reports a running game, or `deadline` passes.
+
+        A tray command sent before the content is up is dropped, and there is
+        no error to catch when it is. `seq` is the launch generation this
+        wait belongs to, checked the same way `_deferred_load_state` checks
+        `_launch_seq`, so a relaunch during the wait ends it rather than
+        letting a stale wait later act on the new session.
+        """
+        while time.monotonic() < deadline:
+            if self._launch_seq != seq or not self.alive():
+                return False
+            reply = self._send("GET_STATUS", wait_prefix="GET_STATUS", timeout=2.0)
+            if reply and reply.startswith("GET_STATUS PLAYING"):
+                return True
+            time.sleep(1.0)
+        return False
+
+    def swap_disc(self, path: Path) -> bool:
+        """Mount the playlist entry at `path` without restarting the core.
+
+        Stepping is relative and wraps, because the command protocol has
+        DISK_NEXT but no way to set an index or read the current one back.
+        """
+        playlist = self._playlist
+        if playlist is None:
+            log.warning("disc swap: no playlist loaded for this session")
+            return False
+        if not self.alive():
+            log.warning("disc swap: core is not running")
+            return False
+        entries = _m3u_entries(playlist)
+        index = _m3u_index_for_path(playlist, path)
+        if not entries or index is None:
+            log.warning("disc swap: %s is not listed in %s", path, playlist)
+            return False
+        if index == self._disc_index:
+            return True
+
+        # Non-blocking: a second swap (or a resume load) already driving the
+        # tray must fail fast rather than queue up behind a multi-second
+        # sequence and then interleave with it.
+        if not self._disc_lock.acquire(blocking=False):
+            log.warning("disc swap: another disc swap or resume is already in progress")
+            return False
+        try:
+            seq = self._launch_seq
+            if not self._wait_until_playing(time.monotonic() + DISC_SWAP_WAIT, seq):
+                log.warning("disc swap: core never reported a running game")
+                return False
+            if self._launch_seq != seq:
+                log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
+
+            steps = (index - self._disc_index) % len(entries)
+            self._send("DISK_EJECT_TOGGLE")
+            time.sleep(DISC_TRAY_SETTLE)
+            for _ in range(steps):
+                # Re-checked between every step: a relaunch landing here must
+                # not keep sending DISK_NEXT into the new process's stdin.
+                if self._launch_seq != seq:
+                    break
+                self._send("DISK_NEXT")
+                time.sleep(DISC_STEP_DELAY)
+            if self._launch_seq == seq:
+                self._send("DISK_EJECT_TOGGLE")
+            # The wait can outlast the session it started for (a relaunch bumps
+            # _launch_seq) or the core can die mid-sequence; either way nothing
+            # confirms the commands above actually landed, so the tracked index
+            # only moves once both are still true.
+            if self._launch_seq != seq or not self.alive():
+                log.warning("disc swap: session ended mid-swap, index %d not committed", index)
+                return False
+            self._disc_index = index
+            log.info("disc swap: now on index %d (%s)", index, path.name)
+            return True
+        finally:
+            self._disc_lock.release()
 
     def _home_state_slot(self) -> None:
         """Park RetroArch's current state slot on STATE_SLOT.
@@ -780,12 +899,12 @@ class Retroarch(Emulator):
             return existing
         return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
         if self.alive():
             info = _platform_info(self.platform)
-            if info is None or info.get("savestate", True):
+            if slot is not None and (info is None or info.get("savestate", True)):
                 saved = self.save_state(slot)
                 if saved:
                     p = self.state_path()
@@ -795,7 +914,11 @@ class Retroarch(Emulator):
             # Flush SRAM so the save dump ships current save data.
             self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
         self._quit()
-        return {"state_saved": saved, "state_slot": STATE_SLOT, "state_file": state_file}
+        return {
+            "state_saved": saved,
+            "state_slot": STATE_SLOT if slot is not None else None,
+            "state_file": state_file,
+        }
 
     def _quit(self) -> None:
         proc = self._proc
@@ -808,7 +931,7 @@ class Retroarch(Emulator):
                 pass
             try:
                 proc.wait(timeout=QUIT_CONFIRM_GAP)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except subprocess.TimeoutExpired:
@@ -825,7 +948,7 @@ class Retroarch(Emulator):
                     pass
             try:
                 proc.wait(timeout=QUIT_WAIT)
-                self._proc = None
+                self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
             except (BrokenPipeError, OSError):

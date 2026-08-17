@@ -214,8 +214,8 @@ class Duckstation(Emulator):
         _patch_ini()
 
         cmd = [os.environ.get("DUCKSTATION_BIN", "/opt/duckstation/AppRun"), "-batch", "-fullscreen"]
-        state = _newest_resume_state() if resume_slot else None
-        if resume_slot and state is None:
+        state = _newest_resume_state() if resume_slot is not None else None
+        if resume_slot is not None and state is None:
             log.warning("resume requested but no resume state in %s", SSTATE_DIR)
         if state is not None:
             cmd += ["-statefile", str(state)]
@@ -224,13 +224,16 @@ class Duckstation(Emulator):
         log.info("launching duckstation (rom=%s, statefile=%s)", rom_path, state)
         self._spawn(cmd, base_launch_env())
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict:
         saved = False
         state_file = None
         was_alive = self.alive()
         before = _resume_snapshot()
         self.stop()
-        if was_alive:
+        # DuckStation writes its resume state on the way out whatever we ask
+        # for, so an exit with no state requested just leaves it unreported and
+        # the emulator resumes from it locally as usual.
+        if was_alive and slot is not None:
             p = _changed_resume_state(before)
             saved = p is not None
             if p is not None:
