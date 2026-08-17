@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/romm-streaming/romm-broker/compare/v0.2.0...v0.3.0) (2026-08-17)
+
+
+### Features
+
+* add PPSSPP emulator module with working save/load-state ([abae001](https://github.com/romm-streaming/romm-broker/commit/abae001fe7375ff3013605a190f6b540f4728ffc))
+
+
+### Bug Fixes
+
+* add PPSSPP emulator module with working save/load-state ([0e8c013](https://github.com/romm-streaming/romm-broker/commit/0e8c0131cbccc42b01121c5e763e91b970379fe3))
+* Merge pull request [#13](https://github.com/romm-streaming/romm-broker/issues/13) from romm-streaming/dev ([0e8c013](https://github.com/romm-streaming/romm-broker/commit/0e8c0131cbccc42b01121c5e763e91b970379fe3))
+
 ## [0.2.0](https://github.com/romm-streaming/romm-broker/compare/v0.1.0...v0.2.0) (2026-08-17)
 
 
