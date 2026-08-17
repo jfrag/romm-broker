@@ -6,6 +6,7 @@ from .dolphin import Dolphin
 from .duckstation import Duckstation
 from .eden import Eden
 from .pcsx2 import Pcsx2
+from .ppsspp import Ppsspp
 from .retroarch import Retroarch
 from .rpcs3 import Rpcs3
 from .shadps4 import Shadps4
@@ -22,6 +23,7 @@ REGISTRY: dict[str, type[Emulator]] = {
     "retroarch": Retroarch,
     "rpcs3": Rpcs3,
     "xemu": Xemu,
+    "ppsspp": Ppsspp,
     "desktop": Desktop,
 }
 
