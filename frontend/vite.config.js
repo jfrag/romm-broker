@@ -4,8 +4,11 @@ import { defineConfig } from 'vite';
 const base = (process.env.SUBFOLDER || '/streaming/').replace(/\/*$/, '/');
 const prefix = base.replace(/\/$/, '');
 
-export default defineConfig({
-  base,
+export default defineConfig(({ command }) => ({
+  // Builds use a relative base so the same dist works under any runtime
+  // SUBFOLDER; the dev server keeps the absolute base because nginx proxies
+  // the full SUBFOLDER path through to vite.
+  base: command === 'build' ? './' : base,
   server: {
     host: '127.0.0.1',
     port: 5173,
@@ -21,4 +24,4 @@ export default defineConfig({
       [`${prefix}/ws`]: { target: 'ws://127.0.0.1:8000', ws: true },
     },
   },
-});
+}));

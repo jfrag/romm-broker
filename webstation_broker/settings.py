@@ -21,8 +21,15 @@ PORT = int(os.environ.get("BROKER_PORT", "8000"))
 # Shared secret for the session lifecycle endpoints; unset disables auth.
 BROKER_SECRET = os.environ.get("BROKER_SECRET", "")
 
-# Selkies control plane for token pushes.
-SELKIES_CONTROL_URL = os.environ.get("SELKIES_CONTROL_URL", "http://127.0.0.1:8083")
+# Check for token control endpoint used by selkies
+_control_url = os.environ.get("SELKIES_CONTROL_URL", "").rstrip("/")
+if _control_url:
+    SELKIES_TOKEN_URLS = [f"{_control_url}/api/tokens", f"{_control_url}/tokens"]
+else:
+    SELKIES_TOKEN_URLS = [
+        "http://127.0.0.1:8082/api/tokens",
+        "http://127.0.0.1:8083/tokens",
+    ]
 SELKIES_MASTER_TOKEN = os.environ.get("SELKIES_MASTER_TOKEN", "")
 
 # ROM library root; activate rejects paths outside it.
