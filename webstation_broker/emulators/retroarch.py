@@ -110,6 +110,8 @@ CORES_BASE_URL = os.environ.get(
     "RETROARCH_CORES_BASE_URL",
     "https://buildbot.libretro.com/nightly/linux/x86_64/latest",
 )
+# Cores the buildbot does not carry name their own release source instead.
+GITHUB_API_BASE = os.environ.get("GITHUB_API_BASE", "https://api.github.com").rstrip("/")
 
 # Broker-managed save data and the append-config we layer onto the user's
 # RetroArch config at launch.
@@ -193,13 +195,53 @@ def _platform_info(platform: str | None) -> dict | None:
     return PLATFORMS.get(platform.lower())
 
 
-def _ensure_core(core: str) -> Path:
-    """Return the core's .so, downloading it from the buildbot if missing."""
+def _github_release_asset(repo: str, asset_pattern: str) -> str:
+    """Download URL of the newest release asset matching `asset_pattern`.
+
+    /releases/latest is the stable channel: GitHub leaves prereleases out of
+    it, which is what keeps a nightly build from installing itself into a
+    player's session."""
+    url = f"{GITHUB_API_BASE}/repos/{repo}/releases/latest"
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=CORE_DOWNLOAD_TIMEOUT)
+    resp.raise_for_status()
+    release = resp.json()
+    tag = release.get("tag_name")
+    pattern = re.compile(asset_pattern)
+    for asset in release.get("assets", []):
+        if pattern.fullmatch(asset.get("name", "")):
+            log.info("retroarch: %s stable release %s -> %s", repo, tag, asset["name"])
+            return asset["browser_download_url"]
+    raise RuntimeError(f"no asset matching {asset_pattern!r} in {repo} release {tag!r}")
+
+
+def _core_url(core: str, source: dict | None) -> str:
+    """Where `core`'s zip comes from. The buildbot unless the platform names a
+    `core_source`; an env override pins a build without editing the table."""
+    override = os.environ.get(f"RETROARCH_CORE_URL_{core.upper()}", "").strip()
+    if override:
+        return override
+    if source:
+        if source.get("url"):
+            return source["url"]
+        if source.get("github_release"):
+            return _github_release_asset(source["github_release"], source["asset"])
+    return f"{CORES_BASE_URL}/{core}_libretro.so.zip"
+
+
+def _ensure_core(core: str, source: dict | None = None) -> Path:
+    """Return the core's .so, downloading it if missing."""
     so = CORES_DIR / f"{core}_libretro.so"
     if so.is_file():
         return so
     CORES_DIR.mkdir(parents=True, exist_ok=True)
-    url = f"{CORES_BASE_URL}/{core}_libretro.so.zip"
+    try:
+        url = _core_url(core, source)
+    except (httpx.HTTPError, KeyError, ValueError) as exc:
+        raise RuntimeError(f"could not resolve a download for core {core}: {exc}") from exc
     log.info("retroarch: downloading core %s from %s", core, url)
     try:
         resp = httpx.get(url, follow_redirects=True, timeout=CORE_DOWNLOAD_TIMEOUT)
@@ -623,7 +665,7 @@ class Retroarch(Emulator):
                 f"no retroarch core mapped for platform {self.platform!r}; "
                 f"mapped: {', '.join(sorted(PLATFORMS))}"
             )
-        core = _ensure_core(info["core"])
+        core = _ensure_core(info["core"], info.get("core_source"))
         _ensure_core_assets(info.get("assets", {}))
         cfg_path = _write_broker_cfg(info.get("thumbnail", True))
 

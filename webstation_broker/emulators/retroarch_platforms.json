@@ -66,8 +66,13 @@
     "extensions": [".nds", ".srl"]
   },
   "3ds": {
-    "core": "citra",
-    "extensions": [".3ds", ".cci", ".cxi", ".cia", ".3dsx", ".app", ".srl"]
+    "core": "azahar",
+    "core_source": {
+      "github_release": "azahar-emu/azahar",
+      "asset": "azahar-libretro-linux-x86_64-.*\\.zip"
+    },
+    "extensions": [".3ds", ".cci", ".zcci", ".cxi", ".zcxi", ".app", ".3dsx", ".z3dsx", ".elf", ".axf"],
+    "save_subtrees": ["states", "saves/Azahar/sdmc/Nintendo 3DS", "saves/Azahar/nand/data"]
   },
   "genesis": {
     "core": "genesis_plus_gx",

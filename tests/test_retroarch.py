@@ -187,7 +187,7 @@ class TestResumeGate:
 
     @pytest.fixture(autouse=True)
     def _stub_launch(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(retroarch, "_ensure_core", lambda name: tmp_path / f"{name}.so")
+        monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
         monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
         monkeypatch.setattr(retroarch.shutil, "which", lambda binary: "/usr/bin/retroarch")
