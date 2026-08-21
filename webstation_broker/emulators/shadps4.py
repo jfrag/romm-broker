@@ -118,7 +118,9 @@ class Shadps4(Emulator):
                 if eboot.resolve().is_relative_to(ROM_ROOT):
                     return eboot
                 else:
-                    return None  # Refuse symlink escapes
+                    return None  # symlink escapes ROM_ROOT; do not fall through to
+                    # `return path` here, that would hand shadps4 an eboot.bin
+                    # outside the ROM library
         except OSError:
             return None
         return path  # shadps4 appends eboot.bin to directory paths itself

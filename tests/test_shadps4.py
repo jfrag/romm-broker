@@ -66,8 +66,8 @@ def versions_dir(monkeypatch, tmp_path):
     return d
 
 
-def _make_release(base: Path, folder_name: str, bin_name: str = "Shadps4-sdl.AppImage") -> Path:
-    folder = base / folder_name
+def _make_release(root: Path, folder_name: str, bin_name: str = "Shadps4-sdl.AppImage") -> Path:
+    folder = root / folder_name
     folder.mkdir(parents=True)
     binary = folder / bin_name
     binary.write_bytes(b"")
@@ -223,7 +223,7 @@ def test_launch_raises_when_no_binary_is_available(monkeypatch, tmp_path, rom_ro
     assert spawned == []
 
 
-def test_stop_sends_ipc_stop_and_waits_for_a_graceful_exit(monkeypatch):
+def test_stop_sends_ipc_stop_and_waits_for_a_graceful_exit(monkeypatch, pid_record):
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = shadps4.Shadps4()
@@ -236,6 +236,8 @@ def test_stop_sends_ipc_stop_and_waits_for_a_graceful_exit(monkeypatch):
     assert proc.stdin.flush_count == 1
     assert proc.wait_calls == [emu.term_timeout]
     assert escalated == []
+    assert emu._proc is None
+    assert not pid_record.exists()
 
 
 def test_stop_falls_back_to_sigterm_escalation_when_the_stdin_write_fails(monkeypatch):
