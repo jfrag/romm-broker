@@ -221,3 +221,54 @@ def test_launch_raises_when_no_binary_is_available(monkeypatch, tmp_path, rom_ro
         emu.launch(rom, resume_slot=None)
 
     assert spawned == []
+
+
+def test_stop_sends_ipc_stop_and_waits_for_a_graceful_exit(monkeypatch):
+    escalated = []
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    emu._proc = proc
+
+    emu.stop()
+
+    assert proc.stdin.written == [b"STOP\n"]
+    assert proc.stdin.flush_count == 1
+    assert proc.wait_calls == [emu.term_timeout]
+    assert escalated == []
+
+
+def test_stop_falls_back_to_sigterm_escalation_when_the_stdin_write_fails(monkeypatch):
+    escalated = []
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.stdin.fail = True
+    emu._proc = proc
+
+    emu.stop()
+
+    assert escalated == [True]
+
+
+def test_stop_falls_back_to_sigterm_escalation_when_the_process_never_exits(monkeypatch):
+    escalated = []
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.wait_exc = subprocess.TimeoutExpired(cmd="shadps4", timeout=emu.term_timeout)
+    emu._proc = proc
+
+    emu.stop()
+
+    assert proc.stdin.written == [b"STOP\n"]
+    assert escalated == [True]
+
+
+def test_stop_is_a_no_op_when_nothing_is_running():
+    emu = shadps4.Shadps4()
+    emu._proc = None
+
+    emu.stop()
+
+    assert emu._proc is None
