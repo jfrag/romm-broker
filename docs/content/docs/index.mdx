@@ -1,0 +1,96 @@
+---
+title: "Overview"
+description: "What the broker is, how a play session flows, and where it sits next to RomM and the webstation container."
+---
+
+webstation-broker is the session broker and collaboration interface for the
+RomM webstation container. The container hosts one play session at a time: a
+game is activated over REST, the broker launches the emulator (restoring save
+data if provided) and returns a token URL that lands on a collab room with the
+selkies stream iframed inside it. Exiting saves state, stops the emulator, and
+archives the session's save delta.
+
+## The pieces
+
+```
+RomM (parent)  ──REST──▶  webstation-broker  ──spawns──▶  emulator
+   ▲                          │      │
+   │ iframe                   │      └──tokens──▶  selkies (stream + input)
+   └───────── browser ◀───────┘  room UI (chat, webcam, input assignment)
+```
+
+- **RomM** is the library and the caller. It decides which game to launch,
+  holds every save state and save archive, and calls the broker's lifecycle
+  endpoints with a shared secret.
+- **webstation-broker** is a FastAPI app inside the container. It owns the
+  single session, launches and stops the emulator, moves save data in and out,
+  and serves the collab room.
+- **selkies** streams the desktop and enforces input routing. The broker pushes
+  it a token map, `{token: {role, slot, mk_control}}`, and selkies decides per
+  streaming connection whether input reaches the mouse and keyboard, a virtual
+  gamepad slot, or nowhere.
+- **The emulator** is whichever launcher the activate request named. Each one is
+  a subclass of the broker's `Emulator` base class; see [Emulators](/docs/emulators).
+
+## A session, end to end
+
+<Steps>
+<Step>
+### Activate
+
+RomM POSTs to `/api/session/activate` with the user, the emulator and the rom
+path, optionally with a save archive to restore and a state slot to resume.
+The broker resolves the bootable file, clears the emulator's working state
+slot, restores the archive, launches the emulator and answers with a token
+URL. See [Launch a game](/docs/api/activate).
+</Step>
+<Step>
+### Play
+
+The token URL opens the room: the stream is iframed inside a page with chat,
+webcam fanout and drag-and-drop gamepad and mouse/keyboard assignment.
+Other users join through `/api/session/join` or an invite link and get their
+own tokens. RomM can save and load state mid-session and pull the state file
+out into its library. See [Save states](/docs/api/state).
+</Step>
+<Step>
+### Exit
+
+The exit button (or RomM) calls `/api/session/exit`. The broker saves a final
+state, stops the emulator, zips everything under the emulator's save subtrees
+that changed since launch, and uploads the archive to the callback origin.
+The room is torn down and every streaming token is revoked. See
+[Exit](/docs/api/exit).
+</Step>
+</Steps>
+
+## Key ideas
+
+- **Everything lives under `SUBFOLDER`** (default `/streaming/`). The same
+  variable drives the container's nginx templating, the FastAPI mount and the
+  vite base, so the whole app follows one reverse-proxy rule. See
+  [Reverse proxy](/docs/deployment/reverse-proxy).
+- **RomM is the datastore.** Each emulator works in exactly one state slot;
+  whatever slot a request names resolves to it. States and save archives are
+  pulled out of the container after every save and exit, and pushed back in
+  before a load or a resume, so a fresh container with nothing on disk can
+  carry on a session.
+- **Save data travels as zip archives** scoped to the emulator's save subtrees
+  (for example `memcards/` and `sstates/` for PCSX2). Activate restores an
+  archive without rolling back newer files; exit zips everything modified since
+  launch. A dead callback never loses save data: outside dev mode the archive
+  lands on disk only when the upload fails, and the
+  [export routes](/docs/api/archives) hand it back.
+- **The callback origin defaults to the parent.** The broker is same-origined
+  under the parent's `SUBFOLDER`, so activate derives the upload target from
+  the request itself (`X-Forwarded-Proto` / `X-Forwarded-Host`, else `Host`).
+  A split-origin deployment overrides it with `callback.base_url`.
+
+## Where to go next
+
+<Cards>
+  <Card title="Run the container" href="/docs/container" description="The image, its volumes and what happens at boot." />
+  <Card title="Configuration" href="/docs/configuration" description="Every environment variable the broker and the launchers read." />
+  <Card title="REST API" href="/docs/api" description="The endpoints RomM and the room UI call." />
+  <Card title="Developer guide" href="/docs/developer" description="Dev mode, tests, adding an emulator and the Python reference." />
+</Cards>

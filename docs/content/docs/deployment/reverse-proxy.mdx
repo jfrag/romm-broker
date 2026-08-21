@@ -1,4 +1,7 @@
-# Serving the container from RomM's origin
+---
+title: "Reverse proxy"
+description: "Serving the container from a subfolder of RomM's origin, with recipes for nginx, Caddy and Traefik and a note on Zoraxy."
+---
 
 The room UI iframes the selkies stream, and RomM in turn iframes the room. When
 that outer iframe is cross origin, the browser stops delivering pointer events
@@ -19,18 +22,22 @@ already built for it.
 
 Three rules, all of them load bearing.
 
-**`SUBFOLDER` must equal the mount path exactly, trailing slash included.** The
-app emits absolute asset paths (`/streaming/assets/...`) and builds its
+<Callout type="info" title="SUBFOLDER must equal the mount path exactly, trailing slash included.">
+The app emits absolute asset paths (`/streaming/assets/...`) and builds its
 websocket URL from `window.location.host` plus that prefix. Set them to the
 same value and the whole thing follows the mount with no rewriting anywhere.
+</Callout>
 
-**The proxy must pass the prefix through, not strip it.** This is the one that
-bites. Most proxies offer a strip-prefix mode and several make it the default.
-Stripping produces a page that loads and then 404s every asset it asks for.
+<Callout type="warn" title="The proxy must pass the prefix through, not strip it.">
+This is the one that bites. Most proxies offer a strip-prefix mode and several
+make it the default. Stripping produces a page that loads and then 404s every
+asset it asks for.
+</Callout>
 
-**The proxy must forward websocket upgrades.** The stream, the collab room, and
-the input channel are all websockets. Without the upgrade headers the room loads
-and then sits there dead.
+<Callout type="warn" title="The proxy must forward websocket upgrades.">
+The stream, the collab room, and the input channel are all websockets. Without
+the upgrade headers the room loads and then sits there dead.
+</Callout>
 
 ## Container side
 
@@ -76,7 +83,8 @@ container behind a proxy does not disturb a session it is already holding.
 
 ## Proxy recipes
 
-### nginx
+<Tabs items={['nginx', 'Caddy', 'Traefik']}>
+<Tab value="nginx">
 
 ```nginx
 location /streaming/ {
@@ -95,19 +103,21 @@ nginx strip `/streaming/` before forwarding, which breaks every asset.
 `proxy_buffering off` matters for the stream, and the long read timeout keeps an
 idle session's websocket from being culled mid game.
 
-### Caddy
+</Tab>
+<Tab value="Caddy">
 
-```caddyfile
+```txt title="Caddyfile"
 handle /streaming/* {
     reverse_proxy 10.0.1.56:3009
 }
 ```
 
 Use `handle`, never `handle_path`. `handle_path` strips the matched prefix,
-which is the same failure as the nginx one above. Caddy forwards websocket
+which is the same failure as the nginx one. Caddy forwards websocket
 upgrades on its own, so there is nothing to add for those.
 
-### Traefik
+</Tab>
+<Tab value="Traefik">
 
 ```yaml
 labels:
@@ -116,6 +126,9 @@ labels:
 ```
 
 Do not attach a `stripPrefix` middleware.
+
+</Tab>
+</Tabs>
 
 ## Zoraxy: use a host rule, never a virtual directory
 

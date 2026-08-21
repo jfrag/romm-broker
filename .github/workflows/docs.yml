@@ -1,0 +1,84 @@
+name: docs
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - "webstation_broker/**"
+      - "pyproject.toml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Deploys through the Pages API rather than a gh-pages branch, so the
+# repository's Pages source has to be set to "GitHub Actions".
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
+      - name: Install the site
+        working-directory: docs
+        run: npm ci
+
+      # fumadocs-python ships the Python extractor inside the npm package;
+      # the broker itself has to be importable with its distribution metadata
+      # for the version to land in the reference.
+      - name: Install the broker and the docstring extractor
+        run: |
+          python -m pip install --upgrade pip
+          pip install . ./docs/node_modules/fumadocs-python
+
+      - name: Generate the Python reference
+        run: |
+          fumapy-generate webstation_broker --dir docs
+          cd docs && npm run generate
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      # A project site lives under /<repo>/, which configure-pages reports as
+      # base_path; the site prefixes every link and asset with it. The GitHub
+      # owner feeds the "edit on GitHub" links so a fork points at itself.
+      - name: Build the static export
+        working-directory: docs
+        env:
+          NEXT_PUBLIC_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          NEXT_PUBLIC_GITHUB_USER: ${{ github.repository_owner }}
+          NEXT_PUBLIC_GITHUB_REPO: ${{ github.event.repository.name }}
+        run: npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

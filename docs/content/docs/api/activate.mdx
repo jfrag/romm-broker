@@ -1,0 +1,141 @@
+---
+title: "Launch a game"
+description: "POST /api/session/activate, with save data to restore, a state to resume, the desktop session, and disc swaps."
+---
+
+## Launch a game
+
+```bash
+curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+  -H 'X-Broker-Secret: <shared secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user": { "id": 1, "username": "ryan", "display_name": "Ryan" },
+    "emulator": "pcsx2",
+    "rom": { "name": "Soul Calibre 2", "platform": "ps2", "path": "/romm/ps2/SC2.iso" }
+  }'
+```
+
+Returns `{"status": "launching", "session_id": ..., "url": "/streaming/?token=<controller token>"}`.
+Open `https://<host>:3001/streaming/?token=...` for the room with the game
+streaming. Returns `409` if a session is already active.
+
+`rom.path` may be a file or a game folder; the broker picks the best bootable
+disc image (disc number first, then format ranking, chd > iso > ...). The path
+must resolve inside `ROM_ROOT` or activate answers `400`.
+
+The payload fields:
+
+| Field | Required | Purpose |
+| --- | --- | --- |
+| `emulator` | yes | A registry key from [Supported emulators](/docs/emulators). |
+| `rom` | unless the emulator is `desktop` | `path` is the container path; `id`, `name` and `platform` are echoed in the exit upload and, for `retroarch`, `platform` picks the core. |
+| `user` | no | `id`, `username`, `display_name` of the controller. Joins and re-joins match on `id`, then `username`. |
+| `session_id` | no | A caller-supplied id, reduced to what is safe in a filename; the broker mints one otherwise. |
+| `save` | no | See below. |
+| `callback` | no | `base_url` and `token` for the exit upload; see [Exit](/docs/api/exit). |
+| `multiplayer` | no | Decided once on RomM's launch screen: whether RomM advertises the session for joining and whether the room shows its comms surface while the host is alone. |
+
+## Launch a game with save data
+
+Add a `save` object: `archive` is a zip restored before launch, `resume_slot`
+loads a state once the VM is up. Both are optional and independent. Like the
+state routes, `resume_slot` resolves to the emulator's working slot rather than
+being honoured literally, so any value loads whatever that slot holds.
+
+PCSX2 empties its working slot at the start of activate, before the archive is
+restored. A `.p2s` is named for the disc it was taken from and the serial only
+comes off the running disc, so a file left over from an earlier session cannot
+be told apart from the current game's; RomM already holds those states, and
+clearing them is what stops the last player's save being served as this one's.
+Both the restore and the later resume push land afterwards, so neither is
+touched. The other emulators name a state after the loaded content and can tell
+a stale one apart on sight, so they need no equivalent.
+
+```bash
+curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+  -H 'X-Broker-Secret: <shared secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "user": { "id": 1, "username": "ryan", "display_name": "Ryan" },
+    "emulator": "pcsx2",
+    "rom": { "name": "Soul Calibre 2", "platform": "ps2", "path": "/romm/ps2/SC2.iso" },
+    "save": { "archive": "/config/broker-imports/4471.zip", "resume_slot": 10 }
+  }'
+```
+
+The archive path is a container path. RomM gets one by uploading the zip
+through the [import route](/docs/api/archives) first and feeding back the
+`path` it returns.
+
+`save.memory_card_synced: true` tells the broker the whole memory card is
+being synced over the [memory card routes](/docs/api/archives#memory-cards).
+The card then travels as its own image, so it is left out of both the restore
+and the exit dump.
+
+A resume state can also arrive after activate has returned: the
+[state-file PUT](/docs/api/state#move-a-state-file-in-or-out) needs a live
+session, so RomM pushes its pick once the game is already booting, and the
+deferred resume load waits for it.
+
+## Launch the desktop
+
+`emulator: "desktop"` streams the full webstation desktop so emulators can be
+configured through the GUI. No `rom` or `save`; same room interface, same exit
+teardown.
+
+```bash
+curl -k -X POST https://localhost:3001/streaming/api/session/activate \
+  -H 'X-Broker-Secret: <shared secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{ "emulator": "desktop", "user": { "id": 1, "username": "ryan", "display_name": "Ryan" } }'
+```
+
+## Swap discs
+
+Emulators that report `supports_disc_swap` (RetroArch) can change the mounted
+disc without restarting:
+
+```bash
+curl -k -X POST https://localhost:3001/streaming/api/session/swap-disc \
+  -H 'X-Broker-Secret: <shared secret>' \
+  -H 'Content-Type: application/json' \
+  -d '{ "path": "/romm/psx/Final Fantasy VII (Disc 2).chd" }'
+```
+
+`path` is validated against `ROM_ROOT` the same way activate validates its rom
+path. Returns `{"status": "swapped", ...}`, `400` when the running emulator has
+no tray, `409` without a session. Swaps are serialised against each other and
+against the deferred resume load, and a swap is only committed once the core
+reports a running game again.
+
+## What activate does
+
+<Steps>
+<Step>
+Checks the secret and that no session is active (`409` otherwise), looks the
+emulator up in the registry (`422` for an unknown one), and resolves the
+bootable file under `ROM_ROOT`.
+</Step>
+<Step>
+Clears any emulator left behind by an earlier broker process (the pid record),
+and clears the emulator's working state slot of leftovers from the previous
+session.
+</Step>
+<Step>
+Restores `save.archive` into the emulator's save subtrees without rolling back
+files that are newer on disk. A member outside the subtrees, or a synced memory
+card inside an older archive, is skipped rather than failing the restore.
+</Step>
+<Step>
+Launches the emulator in its own process group with output captured to its
+log file, records its pid, and mints the controller token. The token map is
+pushed to selkies so the stream accepts the controller.
+</Step>
+<Step>
+If `resume_slot` was given, a watchdog waits for the game to report running,
+lets it settle, and fires the load. Answers immediately with the session id
+and the room URL; the status route reports `boot_failed` if the emulator comes
+up but never reaches a running game.
+</Step>
+</Steps>

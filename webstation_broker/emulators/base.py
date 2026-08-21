@@ -1,4 +1,9 @@
-"""Emulator interface and shared launch plumbing."""
+"""Emulator interface and shared launch plumbing.
+
+Defines the `Emulator` base class every launcher in this package subclasses, the
+environment apps are launched into, and the on-disk pid record that lets a broker
+process kill an emulator it never spawned.
+"""
 
 import json
 import logging
@@ -7,23 +12,36 @@ import signal
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
 
 log = logging.getLogger(__name__)
 
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
+"""The session's runtime directory, from `XDG_RUNTIME_DIR` (default `/config/.XDG`)."""
 
-# Where the running emulator's pid is recorded, so it can still be killed by a
-# broker process that never spawned it. Emulators are started in their own
-# session, so nothing else ties them to the broker: a broker restart (an s6
-# bounce, or uvicorn --reload picking up an edit mid-session) otherwise leaves
-# one playing with no handle on it, and the next launch stacks a second
-# emulator on top of the first.
 PID_FILE = Path(os.environ.get("BROKER_PID_FILE", "/config/broker-emulator.json"))
+"""Where the running emulator's pid is recorded, from `BROKER_PID_FILE`.
+
+Defaults to `/config/broker-emulator.json`. The record exists so the emulator can
+still be killed by a broker process that never spawned it. Emulators are started
+in their own session, so nothing else ties them to the broker: a broker restart
+(an s6 bounce, or uvicorn --reload picking up an edit mid-session) otherwise
+leaves one playing with no handle on it, and the next launch stacks a second
+emulator on top of the first.
+"""
 
 
 def base_launch_env() -> dict[str, str]:
-    """Environment apps are launched into: the broker's own environment,
-    pointed at the running labwc session's displays."""
+    """Build the environment apps are launched into.
+
+    This is the broker's own environment, pointed at the running labwc session's
+    displays (`BROKER_WAYLAND_DISPLAY` and `BROKER_DISPLAY`, defaulting to
+    `wayland-0` and `:0`).
+
+    Returns:
+        A copy of the broker's environment with the display variables set and
+        the emulator binary directories appended to `PATH`.
+    """
     env = dict(os.environ)
     env["WAYLAND_DISPLAY"] = os.environ.get("BROKER_WAYLAND_DISPLAY", "wayland-0")
     env["DISPLAY"] = os.environ.get("BROKER_DISPLAY", ":0")
@@ -37,9 +55,19 @@ def base_launch_env() -> dict[str, str]:
 
 
 def _record_pid(name: str, pid: int, cmd: list[str]) -> None:
-    # Written through a temp file: the record exists for the case where the
-    # broker dies, and a broker that dies mid-write would otherwise leave
-    # half a line of JSON and no way to find the emulator it left behind.
+    """Write the running emulator's pid record to `PID_FILE`.
+
+    Written through a temp file: the record exists for the case where the broker
+    dies, and a broker that dies mid-write would otherwise leave half a line of
+    JSON and no way to find the emulator it left behind. A failure to write is
+    logged, not raised.
+
+    Args:
+        name: The emulator's `name`, so the reaper can say what it killed.
+        pid: The spawned process's pid.
+        cmd: The argv it was spawned with, used later to confirm the pid still
+            runs that command.
+    """
     tmp = PID_FILE.with_suffix(".tmp")
     try:
         tmp.write_text(json.dumps({"name": name, "pid": pid, "cmd": cmd}))
@@ -49,6 +77,7 @@ def _record_pid(name: str, pid: int, cmd: list[str]) -> None:
 
 
 def _clear_pid_record() -> None:
+    """Remove `PID_FILE`, ignoring its absence and logging any other failure."""
     try:
         PID_FILE.unlink()
     except FileNotFoundError:
@@ -58,6 +87,15 @@ def _clear_pid_record() -> None:
 
 
 def _cmdline(pid: int) -> list[str]:
+    """Read a process's argv out of `/proc`.
+
+    Args:
+        pid: The process to look up.
+
+    Returns:
+        The argv as a list of strings, or an empty list when the process is gone
+        or unreadable.
+    """
     try:
         raw = Path(f"/proc/{pid}/cmdline").read_bytes()
     except OSError:
@@ -65,12 +103,18 @@ def _cmdline(pid: int) -> list[str]:
     return [part for part in raw.decode(errors="replace").split("\0") if part]
 
 
-def reap_orphan() -> dict | None:
+def reap_orphan() -> dict[str, Any] | None:
     """Kill an emulator left running by an earlier broker process.
 
     Only ever kills the pid the broker itself recorded, and only while that pid
     is still running the command it was recorded with, so a recycled pid is
-    left alone. Returns what was killed, or None.
+    left alone. The process group gets SIGTERM, then SIGKILL if it is still
+    running the recorded command five seconds later. The record is cleared
+    whatever happens.
+
+    Returns:
+        The record that was acted on, a dict with `{"name", "pid", "cmd"}`, or
+        None when there was no usable record.
     """
     try:
         record = json.loads(PID_FILE.read_text())
@@ -112,56 +156,137 @@ def reap_orphan() -> dict | None:
 
 
 class Emulator:
-    name: str = "base"
-    display_name: str = "Webstation"
-    requires_rom: bool = True
-    # Root of the emulator's writable data and the subtrees under it that
-    # hold save data; save restore and dump are scoped to these.
-    save_root: Path = Path("/config")
-    save_subtrees: tuple[str, ...] = ()
-    rom_extensions: tuple[str, ...] = ()
-    # Whether the emulator can save and load state mid-session. Emulators whose
-    # only persistence is the game's own save data leave this off, so the state
-    # routes refuse instead of silently doing nothing.
-    supports_states: bool = False
-    # Whether the emulator can change the mounted disc without restarting.
-    # Off by default so the swap route refuses instead of silently doing
-    # nothing on an emulator that has no tray.
-    supports_disc_swap: bool = False
-    # The one slot the broker saves into. RomM is the library of states: every
-    # save is pulled out of the container and every stored state is pushed back
-    # into this slot, so nothing here needs to address more than one. Requested
-    # slots resolve to it rather than being honoured, which is why the routes
-    # echo the effective slot back.
-    state_slot: int = 0
-    # Where that slot's file lives, for the state-file routes to read and write.
-    state_dir: Path = Path("/config")
-    log_path: Path = Path("/config/broker-app.log")
-    # Seconds SIGTERM gets before escalating to SIGKILL.
-    term_timeout: float = 5.0
-    # The save subtree holding the whole memory card, for emulators that have
-    # one. With whole-card sync on, that subtree travels on the memory-card
-    # routes instead of inside the save archive, so activate drops it from the
-    # restore and exit drops it from the dump.
-    memory_card_subtree: str | None = None
-    # A file the emulator looks for inside the card directory before it will
-    # treat that directory as a card at all. The broker lays it down empty, the
-    # way the emulator does when it creates a card itself; a card holding
-    # nothing but this is still an empty slot.
-    memory_card_marker: str | None = None
+    """Contract every launcher implements, plus the process plumbing they share.
 
-    def __init__(self):
-        self._proc: subprocess.Popen | None = None
-        # Set by an emulator that can tell its process is alive but never
-        # reached a running game — the boot-error-dialog case. Passive signal
-        # only: the broker surfaces it and takes no action of its own.
+    A subclass describes itself through the class attributes below and must
+    override `launch` and `resolve_rom_file`; both raise `NotImplementedError`
+    here. Everything else is an optional hook with a safe default:
+
+    * `save_state`, `load_state`, `state_path`, `state_screenshot_path`,
+      `state_target`, `clear_working_slot` and `wait_for_state` are the
+      save-state hooks. The broker only calls the first two when
+      `supports_states` is on; the defaults report an empty slot.
+    * `swap_disc` is only called when `supports_disc_swap` is on.
+    * `memory_card_path` pairs with `memory_card_subtree` for emulators whose
+      whole memory card travels on its own routes.
+    * `prepare_restore` runs before a save archive is extracted.
+    * `save_and_exit` is the exit path; the default writes no state.
+
+    The lifecycle as the broker drives it:
+
+    1. Activate: `clear_working_slot` drops the previous session's leftover
+       state, `prepare_restore` runs, and the incoming save archive is
+       extracted into `save_root`, scoped to `save_subtrees`.
+    2. `launch` spawns the process through `_spawn`, which captures output to
+       `log_path`, starts it in its own session and records its pid so a later
+       broker process can reap it (see `reap_orphan`).
+    3. Mid-session: `save_state` and `load_state` work the one slot in
+       `state_slot`. The state-file routes serve `state_path` and write through
+       `state_target`, with `wait_for_state` bridging a resume state that
+       arrives after launch.
+    4. `save_and_exit` saves when asked and stops. `stop` sends SIGTERM to the
+       process group, escalates to SIGKILL after `term_timeout`, and `_forget`
+       drops both the handle and the pid record.
+
+    Attributes:
+        name: Registry key and log label for the emulator.
+        display_name: Human-readable name the UI shows.
+        requires_rom: Whether a launch needs a ROM; the desktop session does not.
+        save_root: Root of the emulator's writable data.
+        save_subtrees: Subtrees under `save_root` that hold save data; save
+            restore and dump are scoped to these.
+        rom_extensions: File extensions the emulator will boot, in preference
+            order.
+        supports_states: Whether the emulator can save and load state
+            mid-session.
+        supports_disc_swap: Whether the emulator can change the mounted disc
+            without restarting.
+        state_slot: The one slot the broker saves into.
+        state_dir: Where that slot's file lives.
+        log_path: Where the emulator's stdout and stderr are appended.
+        term_timeout: Seconds SIGTERM gets before escalating to SIGKILL.
+        memory_card_subtree: The save subtree holding the whole memory card, or
+            None for emulators without one.
+        memory_card_marker: A file the emulator needs inside the card directory
+            before it treats it as a card, or None.
+        boot_failed: Set by an emulator that can tell its process is alive but
+            never reached a running game.
+    """
+
+    name: str = "base"
+    """Registry key and log label for the emulator."""
+    display_name: str = "Webstation"
+    """Human-readable name the UI shows."""
+    requires_rom: bool = True
+    """Whether a launch needs a ROM; the desktop session is the one that does not."""
+    save_root: Path = Path("/config")
+    """Root of the emulator's writable data."""
+    save_subtrees: tuple[str, ...] = ()
+    """The subtrees under `save_root` that hold save data; save restore and dump are scoped to these."""
+    rom_extensions: tuple[str, ...] = ()
+    """File extensions the emulator will boot, in preference order."""
+    supports_states: bool = False
+    """Whether the emulator can save and load state mid-session.
+
+    Emulators whose only persistence is the game's own save data leave this off,
+    so the state routes refuse instead of silently doing nothing.
+    """
+    supports_disc_swap: bool = False
+    """Whether the emulator can change the mounted disc without restarting.
+
+    Off by default so the swap route refuses instead of silently doing nothing on
+    an emulator that has no tray.
+    """
+    state_slot: int = 0
+    """The one slot the broker saves into.
+
+    RomM is the library of states: every save is pulled out of the container and
+    every stored state is pushed back into this slot, so nothing here needs to
+    address more than one. Requested slots resolve to it rather than being
+    honoured, which is why the routes echo the effective slot back.
+    """
+    state_dir: Path = Path("/config")
+    """Where that slot's file lives, for the state-file routes to read and write."""
+    log_path: Path = Path("/config/broker-app.log")
+    """Where the emulator's stdout and stderr are appended."""
+    term_timeout: float = 5.0
+    """Seconds SIGTERM gets before escalating to SIGKILL."""
+    memory_card_subtree: str | None = None
+    """The save subtree holding the whole memory card, for emulators that have one.
+
+    With whole-card sync on, that subtree travels on the memory-card routes
+    instead of inside the save archive, so activate drops it from the restore
+    and exit drops it from the dump.
+    """
+    memory_card_marker: str | None = None
+    """A file the emulator looks for inside the card directory before it treats it as a card.
+
+    The broker lays it down empty, the way the emulator does when it creates a
+    card itself; a card holding nothing but this is still an empty slot.
+    """
+
+    def __init__(self) -> None:
+        """Start with no process handle and no boot failure flagged."""
+        self._proc: subprocess.Popen[bytes] | None = None
         self.boot_failed: bool = False
+        """Whether the process is alive but never reached a running game.
+
+        Set by an emulator that can tell: the boot-error-dialog case. Passive
+        signal only: the broker surfaces it and takes no action of its own.
+        """
 
     def _spawn(self, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False) -> None:
         """Start the app in its own process group with output captured.
 
-        `stdin_pipe` keeps the child's stdin as a pipe so emulators with a
-        stdin control protocol (shadPS4 IPC) can be driven headlessly.
+        A launch banner and then the child's stdout and stderr are appended to
+        `log_path`; if the log cannot be opened the output is discarded. The pid
+        is recorded through `_record_pid` once the process is up.
+
+        Args:
+            cmd: The argv to run.
+            env: The environment to run it in, normally `base_launch_env()`.
+            stdin_pipe: Keep the child's stdin as a pipe so emulators with a
+                stdin control protocol (shadPS4 IPC) can be driven headlessly.
         """
         try:
             log_fh = open(self.log_path, "ab", buffering=0)
@@ -185,6 +310,7 @@ class Emulator:
         _record_pid(self.name, self._proc.pid, cmd)
 
     def alive(self) -> bool:
+        """Whether a spawned process exists and has not exited."""
         return self._proc is not None and self._proc.poll() is None
 
     def _forget(self) -> None:
@@ -192,11 +318,18 @@ class Emulator:
 
         Every path that ends with the process gone has to go through here.
         A graceful exit that only clears `_proc` leaves a record pointing at a
-        pid nobody owns, and the next broker start would hunt it."""
+        pid nobody owns, and the next broker start would hunt it.
+        """
         self._proc = None
         _clear_pid_record()
 
     def stop(self) -> None:
+        """Terminate the running emulator, if any, and forget it.
+
+        The handle and pid record are dropped first, then the process group gets
+        SIGTERM, escalating to SIGKILL once `term_timeout` passes. A process
+        that is already gone is a no-op.
+        """
         proc = self._proc
         self._forget()
         if proc is None or proc.poll() is not None:
@@ -217,20 +350,59 @@ class Emulator:
             pass
 
     def prepare_restore(self) -> None:
-        """Hook run before a save archive is extracted into save_root.
+        """Hook run before a save archive is extracted into `save_root`.
+
         Default: nothing. Override to clear anything that would block the
-        restore: a process holding a save file open, or an existing file
-        the newer-file guard would wrongly keep over the archived one."""
+        restore: a process holding a save file open, or an existing file the
+        newer-file guard would wrongly keep over the archived one.
+        """
 
     def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+        """Start the emulator on `rom_path`, optionally resuming a state.
+
+        Args:
+            rom_path: The file to boot, as returned by `resolve_rom_file`, or
+                None for an emulator that does not require a ROM.
+            resume_slot: The slot to load once the game is up, or None for a
+                fresh start.
+
+        Raises:
+            NotImplementedError: Always; every subclass overrides this.
+        """
         raise NotImplementedError
 
     def save_state(self, slot: int) -> bool:
-        """Save the running game to `slot`. Only called when supports_states."""
+        """Save the running game to `slot`.
+
+        Only called when `supports_states`.
+
+        Args:
+            slot: The slot RomM asked for; implementations may resolve it to
+                `state_slot`.
+
+        Returns:
+            True once the state is confirmed written.
+
+        Raises:
+            NotImplementedError: When the emulator does not support states.
+        """
         raise NotImplementedError
 
     def load_state(self, slot: int) -> bool:
-        """Load `slot` into the running game. Only called when supports_states."""
+        """Load `slot` into the running game.
+
+        Only called when `supports_states`.
+
+        Args:
+            slot: The slot RomM asked for; implementations may resolve it to
+                `state_slot`.
+
+        Returns:
+            True once the load was delivered to the emulator.
+
+        Raises:
+            NotImplementedError: When the emulator does not support states.
+        """
         raise NotImplementedError
 
     def state_path(self) -> Path | None:
@@ -239,7 +411,11 @@ class Emulator:
         This is what the state-file GET serves, so it has to be the file the
         emulator just wrote, not the newest state in the directory: another
         slot or another game's state would otherwise be filed in RomM as this
-        save."""
+        save.
+
+        Returns:
+            The state file's path, or None. The default reports an empty slot.
+        """
         return None
 
     def state_screenshot_path(self) -> Path | None:
@@ -247,7 +423,11 @@ class Emulator:
 
         Only for emulators that write the thumbnail as a separate file. The
         ones that embed it in the state itself return None and let RomM pull it
-        out of the state it already fetched."""
+        out of the state it already fetched.
+
+        Returns:
+            The screenshot's path, or None. The default reports none.
+        """
         return None
 
     def clear_working_slot(self) -> None:
@@ -256,25 +436,38 @@ class Emulator:
         Called at activate, before the incoming save archive is restored, so
         only the container's own leftovers go. Emulators that name a state
         after the loaded content can tell a stale one apart on sight and leave
-        this alone; the override exists for the ones that cannot."""
+        this alone; the override exists for the ones that cannot.
+        """
 
     def memory_card_path(self) -> Path | None:
         """The directory holding the card the memory-card routes sync, or None.
 
         The broker names the card rather than reading the name out of the
         emulator's own config, because RomM lays a card down before the first
-        launch has written that config."""
+        launch has written that config.
+
+        Returns:
+            The card directory, or None for emulators without a memory card.
+        """
         return None
 
     def state_target(self, filename: str) -> Path | None:
-        """Where a pushed state called `filename` belongs, or None if the name
-        is not one this emulator would write for the loaded game.
+        """Where a pushed state called `filename` belongs.
 
         Validating the name against the emulator's own convention is what keeps
         a caller from dropping arbitrary files into the save tree. The slot in
         it is not part of that test: RomM holds the library, so a stored state
         carries whatever slot it was captured in and lands in this broker's own
-        working slot regardless."""
+        working slot regardless.
+
+        Args:
+            filename: The name the pushed state was stored under.
+
+        Returns:
+            The path to write it to, or None if the name is not one this
+            emulator would write for the loaded game. The default accepts
+            nothing.
+        """
         return None
 
     def wait_for_state(self, deadline: float, poll: float = 0.5) -> bool:
@@ -284,28 +477,70 @@ class Emulator:
         answer while a session is up, so RomM pushes its pick once activate has
         returned and the game is already booting. Waiting for it here is what
         keeps a deferred resume load from firing on a slot that is still empty
-        and reporting a fresh start."""
+        and reporting a fresh start.
+
+        Args:
+            deadline: A `time.monotonic()` value to give up at.
+            poll: Seconds between checks of `state_path`.
+
+        Returns:
+            True if the slot holds a state file by the time this returns.
+        """
         while time.monotonic() < deadline:
             if self.state_path() is not None:
                 return True
             time.sleep(poll)
         return self.state_path() is not None
 
-    def save_and_exit(self, slot: int | None) -> dict:
-        """Save state (best effort) and stop. Default: nothing to save.
+    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+        """Save state (best effort) and stop.
 
-        A `slot` of None is an exit that writes no state. The game's own save
-        data is still flushed and shipped: not writing a state is the whole of
-        "exit without saving", and discarding an in-game save the player made
-        at a save point would be losing real progress."""
+        Default: nothing to save. A `slot` of None is an exit that writes no
+        state. The game's own save data is still flushed and shipped: not
+        writing a state is the whole of "exit without saving", and discarding
+        an in-game save the player made at a save point would be losing real
+        progress.
+
+        Args:
+            slot: The slot to save into before stopping, or None to skip the
+                state save.
+
+        Returns:
+            A dict with `{"state_saved", "state_slot", "state_file"}`:
+            whether a state was written, the effective slot, and the written
+            file's `{"path", "size", "mtime"}`. The default reports all three
+            as None.
+        """
         self.stop()
         return {"state_saved": None, "state_slot": None, "state_file": None}
 
     def resolve_rom_file(self, path: Path) -> Path | None:
-        """File the emulator should boot for `path` (folder or file)."""
+        """File the emulator should boot for `path` (folder or file).
+
+        Args:
+            path: The ROM as RomM delivered it, either a single file or a folder
+                holding the game's files.
+
+        Returns:
+            The file to hand to `launch`, or None if nothing bootable is there.
+
+        Raises:
+            NotImplementedError: Always; every subclass overrides this.
+        """
         raise NotImplementedError
 
     def swap_disc(self, path: Path) -> bool:
-        """Mount `path` in place of the running disc. Only called when
-        supports_disc_swap. True once the new disc is in the tray."""
+        """Mount `path` in place of the running disc.
+
+        Only called when `supports_disc_swap`.
+
+        Args:
+            path: The disc image to mount.
+
+        Returns:
+            True once the new disc is in the tray.
+
+        Raises:
+            NotImplementedError: When the emulator has no tray.
+        """
         raise NotImplementedError

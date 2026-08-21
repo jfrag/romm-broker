@@ -1,16 +1,15 @@
-"""Eden (Nintendo Switch) launcher: ROM resolution, qt-config.ini patching,
-and SIGTERM-driven graceful shutdown.
+"""Eden (Nintendo Switch) launcher: ROM resolution, qt-config.ini patching, and SIGTERM shutdown.
 
 Eden has no save states and no external control API. Persistence is the
 game's own save data, which the emulated game commits directly to host files
 under the virtual NAND (`nand/user/save/...`). Save paths are keyed by the
 Switch profile UUID, so the profile store (`nand/system/save/8000000000000010`)
-ships with the saves that way a save archive restored into a fresh
+ships with the saves; that way a save archive restored into a fresh
 container brings its matching profile along and the paths line up.
 
 Shutdown: Eden's Qt frontend routes SIGTERM through the event loop into a
-normal window close (graceful emulation teardown). SIGINT is _exit(1) in
-Eden never use it. The close path pops a confirmation dialog unless the
+normal window close (graceful emulation teardown). SIGINT is `_exit(1)` in
+Eden: never use it. The close path pops a confirmation dialog unless the
 `confirmStop` UI setting is Ask_Never, so that is patched before every
 launch.
 """
@@ -18,6 +17,7 @@ launch.
 import logging
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from .base import Emulator, base_launch_env
@@ -25,31 +25,52 @@ from .base import Emulator, base_launch_env
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Library root a resolved ROM must live under (env `ROM_ROOT`, default `/romm`)."""
 
 CONFIG_DIR = Path(os.environ.get("EDEN_CONFIG_DIR", "/config/.config/eden"))
+"""Eden's config directory (env `EDEN_CONFIG_DIR`, default `/config/.config/eden`)."""
 DATA_DIR = Path(os.environ.get("EDEN_DATA_DIR", "/config/.local/share/eden"))
+"""Eden's data directory holding the virtual NAND (env `EDEN_DATA_DIR`)."""
 INI_PATH = CONFIG_DIR / "qt-config.ini"
+"""The qt-config.ini patched before every launch."""
 EDEN_LOG_PATH = Path(os.environ.get("EDEN_LOG_PATH", "/config/eden.log"))
+"""The emulator log file (env `EDEN_LOG_PATH`, default `/config/eden.log`)."""
 
-# Formats Eden's loader boots directly, best first; a folder holding several
-# candidates picks by this order.
 ROM_EXTENSIONS = (".xci", ".nsp", ".nca", ".nro")
+"""Formats Eden's loader boots directly, best first; a folder holding several picks by this order."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-# Updates/DLC sit beside base games in library folders; boot the base game.
+"""Glob patterns a ROM folder is searched with, one level of wrapper folder deep."""
 _ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE)
+"""Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
 
-# Eden serializes enum settings as their underlying integer;
-# ConfirmStop::Ask_Never is 2. The `\default` flag must be false or the
-# stored value is ignored in favor of the built-in default (Ask_Always),
-# which pops a confirmation dialog on close and would hang a headless
-# SIGTERM shutdown.
 _INI_PATCHES: dict[tuple[str, str], str] = {
     ("UI", "confirmStop\\default"): "confirmStop\\default = false",
     ("UI", "confirmStop"): "confirmStop = 2",
 }
+"""qt-config.ini lines forced before every launch, keyed `(section, key)`.
+
+Eden serializes enum settings as their underlying integer;
+ConfirmStop::Ask_Never is 2. The `\\default` flag must be false or the
+stored value is ignored in favor of the built-in default (Ask_Always),
+which pops a confirmation dialog on close and would hang a headless
+SIGTERM shutdown.
+"""
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Pick the best bootable file among `candidates`.
+
+    Hidden files, non-files and anything resolving outside `ROM_ROOT` are
+    skipped. Ranking prefers base games over updates and DLC, then the
+    `ROM_EXTENSIONS` order, then the shallowest path, then the lowercased name.
+
+    Args:
+        candidates: Paths found under `base` by the search globs.
+        base: The directory the candidates were searched from.
+
+    Returns:
+        The resolved path of the best candidate, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -76,7 +97,12 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
 
 
 def _patch_ini() -> None:
-    """Force broker-required qt-config.ini settings before every launch."""
+    """Force broker-required qt-config.ini settings before every launch.
+
+    A missing file is seeded with just the patched section and Eden fills in
+    the rest. Otherwise the file is patched line-wise so every other setting
+    survives untouched. Failures are logged, not raised.
+    """
     try:
         if not INI_PATH.exists():
             # First run: write a minimal config, Eden fills in the rest.
@@ -134,19 +160,56 @@ def _patch_ini() -> None:
 
 
 class Eden(Emulator):
+    """Nintendo Switch via Eden, driven by command line flags and a graceful SIGTERM.
+
+    Eden has no external control API, so the broker patches qt-config.ini
+    before every launch (close confirmation off) and boots fullscreen with
+    `-f -g`. SIGTERM goes through Eden's Qt event loop into a normal window
+    close, so the stop is a graceful emulation teardown; SIGINT is never
+    used because Eden maps it to `_exit(1)`.
+
+    There are no save states: persistence is the game's own save data under
+    the virtual NAND, and the archive carries it together with the profile
+    store, since Switch save paths embed the profile UUID. A resume slot is
+    logged and ignored.
+
+    Attributes:
+        name: Provider key, `eden`.
+        display_name: Human-readable name.
+        save_root: The data directory the save subtrees hang off.
+        save_subtrees: Game saves plus the profile store.
+        rom_extensions: Bootable formats, best first.
+        log_path: The emulator log file.
+        term_timeout: SIGTERM grace before SIGKILL (env `EDEN_STOP_WAIT`, default 15).
+    """
+
     name = "eden"
     display_name = "Eden"
     save_root = DATA_DIR
-    # Game saves plus the profile store: Switch save paths embed the profile
-    # UUID, so the two must travel together for restored saves to resolve.
     save_subtrees = ("nand/user/save", "nand/system/save/8000000000000010")
+    """Game saves plus the profile store.
+
+    Switch save paths embed the profile UUID, so the two must travel
+    together for restored saves to resolve.
+    """
     rom_extensions = ROM_EXTENSIONS
     log_path = EDEN_LOG_PATH
-    # A running game takes longer than the base 5 s to tear down gracefully;
-    # give SIGTERM room before escalating to SIGKILL.
     term_timeout = float(os.environ.get("EDEN_STOP_WAIT", "15"))
+    """SIGTERM grace before SIGKILL (env `EDEN_STOP_WAIT`, default 15).
+
+    A running game takes longer than the base 5 s to tear down gracefully;
+    give SIGTERM room before escalating to SIGKILL.
+    """
 
     def resolve_rom_file(self, path: Path) -> Path | None:
+        """The file Eden should boot for `path`.
+
+        Args:
+            path: A ROM file, or a folder searched up to two levels deep.
+
+        Returns:
+            The file itself, the best-ranked bootable file in the folder, or None.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -160,6 +223,12 @@ class Eden(Emulator):
         return _pick_rom_file(candidates, path)
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+        """Patch qt-config.ini and boot the game fullscreen.
+
+        Args:
+            rom_path: The file to boot.
+            resume_slot: Ignored with a log line; Eden has no save states.
+        """
         self.stop()
         _patch_ini()
         if resume_slot is not None:

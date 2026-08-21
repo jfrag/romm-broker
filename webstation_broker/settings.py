@@ -1,12 +1,24 @@
-"""Environment-driven configuration."""
+"""Environment-driven configuration.
+
+Every setting is read once, at import time, from the process environment. Each
+attribute below names the variable it reads and the default that applies when
+the variable is unset.
+"""
 
 import os
 from pathlib import Path
 
 
 def _prefix() -> str:
-    """Normalized URL prefix the broker is served under, e.g. '/streaming'.
-    SUBFOLDER also drives the nginx templating and the vite base."""
+    """Return the normalized URL prefix the broker is served under, e.g. `/streaming`.
+
+    Read from `SUBFOLDER`, which also drives the nginx templating and the vite
+    base. A missing leading slash is added and any trailing slash is dropped.
+
+    Returns:
+        The prefix with a leading slash and no trailing slash, or an empty string
+        when `SUBFOLDER` is just `/`.
+    """
     raw = os.environ.get("SUBFOLDER", "/streaming/").strip()
     if not raw.startswith("/"):
         raw = "/" + raw
@@ -14,54 +26,86 @@ def _prefix() -> str:
 
 
 PREFIX = _prefix()
+"""URL prefix the broker is mounted under, from `SUBFOLDER` (default `/streaming/`), normalized."""
 
 HOST = os.environ.get("BROKER_HOST", "127.0.0.1")
+"""Address uvicorn binds to, from `BROKER_HOST` (default `127.0.0.1`)."""
 PORT = int(os.environ.get("BROKER_PORT", "8000"))
+"""Port uvicorn listens on, from `BROKER_PORT` (default `8000`)."""
 
-# Shared secret for the session lifecycle endpoints; unset disables auth.
 BROKER_SECRET = os.environ.get("BROKER_SECRET", "")
+"""Shared secret for the session lifecycle endpoints, from `BROKER_SECRET`; unset disables auth."""
 
-# Check for token control endpoint used by selkies
 _control_url = os.environ.get("SELKIES_CONTROL_URL", "").rstrip("/")
+"""Base of the token control endpoint used by selkies, from `SELKIES_CONTROL_URL` (default empty)."""
 if _control_url:
     SELKIES_TOKEN_URLS = [f"{_control_url}/api/tokens", f"{_control_url}/tokens"]
+    """Candidate selkies token endpoints, both paths under `SELKIES_CONTROL_URL`."""
 else:
     SELKIES_TOKEN_URLS = [
         "http://127.0.0.1:8082/api/tokens",
         "http://127.0.0.1:8083/tokens",
     ]
+    """Candidate selkies token endpoints when `SELKIES_CONTROL_URL` is unset.
+
+    One entry per known selkies image, each on the port and path that image
+    answers on.
+    """
 SELKIES_MASTER_TOKEN = os.environ.get("SELKIES_MASTER_TOKEN", "")
+"""Bearer token for the selkies token endpoint, from `SELKIES_MASTER_TOKEN` (default empty)."""
 
-# ROM library root; activate rejects paths outside it.
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""ROM library root, from `ROM_ROOT` (default `/romm`); activate rejects paths outside it."""
 
-# Where exit writes its save archives (always in dev mode, otherwise only
-# when the upload to the callback origin fails).
 EXPORT_DIR = Path(os.environ.get("BROKER_EXPORT_DIR", "/config/broker-exports"))
+"""Where exit writes its save archives, from `BROKER_EXPORT_DIR` (default `/config/broker-exports`).
 
-# Where the parent uploads save archives it wants restored; activate's
-# save.archive path points into here.
+Written always in dev mode, otherwise only when the upload to the callback
+origin fails.
+"""
+
 IMPORT_DIR = Path(os.environ.get("BROKER_IMPORT_DIR", "/config/broker-imports"))
+"""Where the parent uploads archives to restore, from `BROKER_IMPORT_DIR`.
 
-# Exit upload target: this path is appended to the callback base URL (the
-# parent origin derived at activate unless the payload supplies one).
+Defaults to `/config/broker-imports`; activate's `save.archive` path points
+into here.
+"""
+
 SAVE_UPLOAD_PATH = os.environ.get("BROKER_SAVE_UPLOAD_PATH", "/api/webstation/saves")
-SAVE_UPLOAD_TIMEOUT = float(os.environ.get("BROKER_SAVE_UPLOAD_TIMEOUT", "30"))
+"""Exit upload target path, from `BROKER_SAVE_UPLOAD_PATH` (default `/api/webstation/saves`).
 
-# Built frontend served in non-dev mode; ignored when vite serves the page.
+Appended to the callback base URL, which is the parent origin derived at
+activate unless the payload supplies one.
+"""
+SAVE_UPLOAD_TIMEOUT = float(os.environ.get("BROKER_SAVE_UPLOAD_TIMEOUT", "30"))
+"""Seconds allowed for the exit upload, from `BROKER_SAVE_UPLOAD_TIMEOUT` (default `30`)."""
+
 FRONTEND_DIST = Path(
     os.environ.get("BROKER_FRONTEND_DIST", "/usr/share/webstation-broker/www")
 )
+"""Built frontend served in non-dev mode, from `BROKER_FRONTEND_DIST`.
 
-# Ceiling on a single state file moving either way over the state-file routes.
-# RomM caps its side of the same transfer, so raising one without the other
-# just moves which end refuses.
+Defaults to `/usr/share/webstation-broker/www`; ignored when vite serves the
+page.
+"""
+
 STATE_FILE_MAX_BYTES = int(os.environ.get("BROKER_STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
+"""Ceiling on a single state file moving either way over the state-file routes.
 
-# Same two-sided cap for the frame served alongside a state. Matches RomM's
-# own ceiling on the transfer.
+From `BROKER_STATE_FILE_MAX_BYTES` (default 256 MiB). RomM caps its side of
+the same transfer, so raising one without the other just moves which end
+refuses.
+"""
+
 STATE_SCREENSHOT_MAX_BYTES = int(os.environ.get("BROKER_STATE_SCREENSHOT_MAX_BYTES", str(16 * 1024 * 1024)))
+"""Same two-sided cap for the frame served alongside a state.
+
+From `BROKER_STATE_SCREENSHOT_MAX_BYTES` (default 16 MiB). Matches RomM's own
+ceiling on the transfer.
+"""
 
 DEV_MODE = os.environ.get("BROKER_DEV_MODE", "").lower() == "true"
+"""Whether dev mode is on, from `BROKER_DEV_MODE` (default off; only the string `true` enables it)."""
 
 GAMEPAD_SLOTS = int(os.environ.get("BROKER_GAMEPAD_SLOTS", "4"))
+"""Number of virtual gamepad slots, from `BROKER_GAMEPAD_SLOTS` (default `4`)."""

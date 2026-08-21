@@ -9,6 +9,7 @@ import os
 import struct
 import tomllib
 from pathlib import Path
+from typing import Any, NoReturn
 
 import pytest
 from pyfatx import Fatx
@@ -23,8 +24,21 @@ SECTOR = 2048
 
 def _xiso(path: Path, title_id: int = 0x4D530064, *, base: int = 0,
           xbe_name: bytes = b"default.xbe") -> Path:
-    """A minimal XISO: volume descriptor, a one-entry root directory table,
-    and an XBE whose certificate carries `title_id`."""
+    """Write a minimal XISO image and return its path.
+
+    The image holds a volume descriptor, a one-entry root directory table, and
+    an XBE whose certificate carries `title_id`.
+
+    Args:
+        path: Where the image is written.
+        title_id: Title id stamped into the XBE certificate.
+        base: Byte offset of the game partition, mimicking a disc that carries a
+            video partition up front.
+        xbe_name: Name of the single root directory entry.
+
+    Returns:
+        The path the image was written to.
+    """
     root_sector, xbe_sector, xbe_size = 33, 34, 0x200
     image = bytearray((base + (xbe_sector + 1) * SECTOR))
 
@@ -55,33 +69,41 @@ def _xiso(path: Path, title_id: int = 0x4D530064, *, base: int = 0,
     return path
 
 
-def test_title_id_is_read_from_the_xbe_certificate(tmp_path):
+def test_title_id_is_read_from_the_xbe_certificate(tmp_path: Path) -> None:
+    """The title id is read out of the XBE certificate on the disc."""
     assert xemu._disc_title_id(_xiso(tmp_path / "g.iso")) == "4D530064"
 
 
-def test_title_id_is_uppercase_like_the_dashboard_writes_it(tmp_path):
-    """The dashboard creates E:/UDATA/<id> in uppercase, and a directory this
-    code creates has to be named the same way."""
+def test_title_id_is_uppercase_like_the_dashboard_writes_it(tmp_path: Path) -> None:
+    """The title id is formatted in uppercase, the way the dashboard names save directories.
+
+    The dashboard creates E:/UDATA/<id> in uppercase, and a directory this
+    code creates has to be named the same way.
+    """
     assert xemu._disc_title_id(_xiso(tmp_path / "g.iso", 0x0000ABCD)) == "0000ABCD"
 
 
-def test_title_id_reads_a_disc_with_a_video_partition_up_front(tmp_path):
+def test_title_id_reads_a_disc_with_a_video_partition_up_front(tmp_path: Path) -> None:
+    """A disc whose game partition sits behind a video partition still yields its title id."""
     disc = _xiso(tmp_path / "g.iso", base=0x18300000)
     assert xemu._disc_title_id(disc) == "4D530064"
 
 
-def test_title_id_is_none_when_the_disc_has_no_volume_descriptor(tmp_path):
+def test_title_id_is_none_when_the_disc_has_no_volume_descriptor(tmp_path: Path) -> None:
+    """A file with no XISO volume descriptor yields no title id."""
     junk = tmp_path / "junk.iso"
     junk.write_bytes(b"\x00" * (40 * SECTOR))
     assert xemu._disc_title_id(junk) is None
 
 
-def test_title_id_is_none_when_the_root_holds_no_default_xbe(tmp_path):
+def test_title_id_is_none_when_the_root_holds_no_default_xbe(tmp_path: Path) -> None:
+    """A disc whose root directory lacks default.xbe yields no title id."""
     disc = _xiso(tmp_path / "g.iso", xbe_name=b"nothere.xbe")
     assert xemu._disc_title_id(disc) is None
 
 
-def test_title_id_is_none_for_a_missing_file(tmp_path):
+def test_title_id_is_none_for_a_missing_file(tmp_path: Path) -> None:
+    """A missing disc file yields no title id."""
     assert xemu._disc_title_id(tmp_path / "gone.iso") is None
 
 
@@ -89,7 +111,16 @@ def test_title_id_is_none_for_a_missing_file(tmp_path):
 
 
 @pytest.fixture
-def rom_root(monkeypatch, tmp_path):
+def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the xemu ROM root at a fresh directory under tmp_path.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        The ROM root directory.
+    """
     root = tmp_path / "romm"
     root.mkdir()
     monkeypatch.setattr(xemu, "ROM_ROOT", root)
@@ -105,11 +136,13 @@ def rom_root(monkeypatch, tmp_path):
         ("Game_cd-4.iso", 4),
     ],
 )
-def test_disc_number_is_read_from_the_name(name, expected):
+def test_disc_number_is_read_from_the_name(name: str, expected: int) -> None:
+    """The disc number is parsed from the usual markers in a file name."""
     assert xemu._disc_number(Path(name)) == expected
 
 
-def test_a_disc_set_boots_disc_one(rom_root):
+def test_a_disc_set_boots_disc_one(rom_root: Path) -> None:
+    """A folder holding several discs resolves to disc one."""
     folder = rom_root / "Game"
     folder.mkdir()
     for name in ("Game (Disc 2).iso", "Game (Disc 1).iso"):
@@ -117,20 +150,23 @@ def test_a_disc_set_boots_disc_one(rom_root):
     assert xemu.Xemu.resolve_rom_file(None, folder).name == "Game (Disc 1).iso"
 
 
-def test_a_file_path_resolves_to_itself(rom_root):
+def test_a_file_path_resolves_to_itself(rom_root: Path) -> None:
+    """A path that is already a file resolves to itself."""
     disc = rom_root / "Game.iso"
     disc.write_bytes(b"x")
     assert xemu.Xemu.resolve_rom_file(None, disc) == disc
 
 
-def test_non_iso_files_are_not_bootable(rom_root):
+def test_non_iso_files_are_not_bootable(rom_root: Path) -> None:
+    """A folder holding no .iso resolves to nothing."""
     folder = rom_root / "Game"
     folder.mkdir()
     (folder / "readme.txt").write_bytes(b"x")
     assert xemu.Xemu.resolve_rom_file(None, folder) is None
 
 
-def test_a_symlink_out_of_the_rom_root_is_rejected(rom_root, tmp_path):
+def test_a_symlink_out_of_the_rom_root_is_rejected(rom_root: Path, tmp_path: Path) -> None:
+    """A disc symlinked from outside the ROM root is not bootable."""
     outside = tmp_path / "elsewhere.iso"
     outside.write_bytes(b"x")
     folder = rom_root / "Game"
@@ -143,28 +179,43 @@ def test_a_symlink_out_of_the_rom_root_is_rejected(rom_root, tmp_path):
 
 
 def _toml(tmp_path: Path, hdd_path: str) -> Path:
+    """Write a minimal xemu.toml that names `hdd_path` as the HDD image.
+
+    Args:
+        tmp_path: Directory the config is written into.
+        hdd_path: Value written to the hdd_path key.
+
+    Returns:
+        The path of the written config.
+    """
     cfg = tmp_path / "xemu.toml"
     cfg.write_text(f'[sys.files]\nhdd_path = "{hdd_path}"\n')
     return cfg
 
 
-def test_the_hdd_path_comes_from_the_user_config(monkeypatch, tmp_path):
+def test_the_hdd_path_comes_from_the_user_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The HDD image path is read from the user's xemu.toml."""
     monkeypatch.setattr(xemu, "XEMU_TOML", _toml(tmp_path, "/config/xemu/mine.qcow2"))
     assert xemu._hdd_image_path() == Path("/config/xemu/mine.qcow2")
 
 
 @pytest.mark.parametrize("hdd_path", ["", "relative.qcow2", "/atroot.qcow2"])
-def test_an_unusable_hdd_path_falls_back(monkeypatch, tmp_path, hdd_path):
+def test_an_unusable_hdd_path_falls_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, hdd_path: str
+) -> None:
+    """An empty, relative, or root-level hdd_path falls back to the default image."""
     monkeypatch.setattr(xemu, "XEMU_TOML", _toml(tmp_path, hdd_path))
     assert xemu._hdd_image_path() == xemu.FALLBACK_HDD_IMAGE
 
 
-def test_a_missing_config_falls_back(monkeypatch, tmp_path):
+def test_a_missing_config_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A missing xemu.toml falls back to the default image."""
     monkeypatch.setattr(xemu, "XEMU_TOML", tmp_path / "nope.toml")
     assert xemu._hdd_image_path() == xemu.FALLBACK_HDD_IMAGE
 
 
-def test_an_unparseable_config_falls_back(monkeypatch, tmp_path):
+def test_an_unparseable_config_falls_back(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A xemu.toml that does not parse falls back to the default image."""
     cfg = tmp_path / "xemu.toml"
     cfg.write_text("[sys.files\nhdd_path =")
     monkeypatch.setattr(xemu, "XEMU_TOML", cfg)
@@ -174,7 +225,8 @@ def test_an_unparseable_config_falls_back(monkeypatch, tmp_path):
 # ── One-time raw conversion ──────────────────────────────────────────────────
 
 
-def test_a_raw_image_is_left_alone(tmp_path):
+def test_a_raw_image_is_left_alone(tmp_path: Path) -> None:
+    """An image that is already raw is neither converted nor backed up."""
     image = tmp_path / "hdd.qcow2"
     image.write_bytes(b"not a qcow2 header")
     assert xemu._ensure_raw_image(image) is True
@@ -182,15 +234,17 @@ def test_a_raw_image_is_left_alone(tmp_path):
     assert not image.with_name("hdd.qcow2.backup").exists()
 
 
-def test_a_missing_image_is_not_convertible(tmp_path):
+def test_a_missing_image_is_not_convertible(tmp_path: Path) -> None:
+    """A missing image cannot be made raw."""
     assert xemu._ensure_raw_image(tmp_path / "gone.qcow2") is False
 
 
-def test_a_qcow2_is_converted_in_place_and_backed_up(tmp_path, monkeypatch):
+def test_a_qcow2_is_converted_in_place_and_backed_up(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A qcow2 image is converted to raw in place, with the original kept as a backup."""
     image = tmp_path / "hdd.qcow2"
     image.write_bytes(xemu.QCOW2_MAGIC + b"rest of the qcow2")
 
-    def fake_run(cmd, **kwargs):
+    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
         Path(cmd[-1]).write_bytes(b"raw content")
         return type("R", (), {"returncode": 0, "stderr": ""})()
 
@@ -200,13 +254,18 @@ def test_a_qcow2_is_converted_in_place_and_backed_up(tmp_path, monkeypatch):
     assert image.with_name("hdd.qcow2.backup").read_bytes().startswith(xemu.QCOW2_MAGIC)
 
 
-def test_a_failed_conversion_leaves_the_qcow2_playable(tmp_path, monkeypatch):
-    """Losing save sync is survivable; losing the disk is not."""
+def test_a_failed_conversion_leaves_the_qcow2_playable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed conversion leaves the original qcow2 untouched.
+
+    Losing save sync is survivable; losing the disk is not.
+    """
     image = tmp_path / "hdd.qcow2"
     original = xemu.QCOW2_MAGIC + b"rest of the qcow2"
     image.write_bytes(original)
 
-    def fake_run(cmd, **kwargs):
+    def fake_run(cmd: list[str], **kwargs: Any) -> NoReturn:
         raise xemu.subprocess.CalledProcessError(1, cmd, stderr="boom")
 
     monkeypatch.setattr(xemu.subprocess, "run", fake_run)
@@ -237,8 +296,16 @@ hdd_path = '/config/xemu/xbox_hdd.qcow2'
 
 
 @pytest.fixture
-def pinned(monkeypatch, tmp_path):
-    """Point the pin at a throwaway config and default it to OpenGL."""
+def pinned(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the pin at a throwaway config and default it to OpenGL.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        The path of the config the pin will edit; the file does not exist yet.
+    """
     cfg = tmp_path / "xemu.toml"
     monkeypatch.setattr(xemu, "XEMU_TOML", cfg)
     monkeypatch.setattr(xemu, "XEMU_RENDERER", "OPENGL")
@@ -246,28 +313,49 @@ def pinned(monkeypatch, tmp_path):
 
 
 def _renderer_of(cfg: Path) -> str:
+    """Read the display renderer out of a config file.
+
+    Args:
+        cfg: The xemu.toml to parse.
+
+    Returns:
+        The value of [display] renderer.
+    """
     return tomllib.loads(cfg.read_text())["display"]["renderer"]
 
 
 def _fullscreen_of(cfg: Path) -> bool:
+    """Read the fullscreen-on-startup flag out of a config file.
+
+    Args:
+        cfg: The xemu.toml to parse.
+
+    Returns:
+        The value of [display.window] fullscreen_on_startup.
+    """
     return tomllib.loads(cfg.read_text())["display"]["window"]["fullscreen_on_startup"]
 
 
-def test_a_vulkan_config_is_pinned_back_to_opengl(pinned):
+def test_a_vulkan_config_is_pinned_back_to_opengl(pinned: Path) -> None:
+    """A config set to Vulkan is pinned back to the configured OpenGL renderer."""
     pinned.write_text(FULL_TOML)
     xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
 
 
-def test_a_windowed_config_is_pinned_to_fullscreen(pinned):
+def test_a_windowed_config_is_pinned_to_fullscreen(pinned: Path) -> None:
+    """A config that starts windowed is pinned to fullscreen on startup."""
     pinned.write_text(FULL_TOML.replace(
         "[display.quality]", "[display.window]\nfullscreen_on_startup = false\n\n[display.quality]"))
     xemu._pin_display_settings()
     assert _fullscreen_of(pinned) is True
 
 
-def test_pinning_leaves_the_rest_of_the_config_alone(pinned):
-    """The file belongs to xemu; the pin owns exactly two keys in it."""
+def test_pinning_leaves_the_rest_of_the_config_alone(pinned: Path) -> None:
+    """Pinning rewrites only the renderer and fullscreen keys.
+
+    The file belongs to xemu; the pin owns exactly two keys in it.
+    """
     pinned.write_text(FULL_TOML)
     xemu._pin_display_settings()
     after = pinned.read_text()
@@ -279,22 +367,24 @@ def test_pinning_leaves_the_rest_of_the_config_alone(pinned):
     assert tomllib.loads(after)["display"]["quality"]["surface_scale"] == 1
 
 
-def test_a_display_section_without_a_renderer_gains_one(pinned):
+def test_a_display_section_without_a_renderer_gains_one(pinned: Path) -> None:
+    """A [display] section with no renderer key gains one, leaving other tables alone."""
     pinned.write_text("[display]\nui_scale = 2\n\n[sys]\nmem = 64\n")
     xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
     assert tomllib.loads(pinned.read_text())["sys"]["mem"] == 64
 
 
-def test_a_config_with_no_display_section_gains_one(pinned):
+def test_a_config_with_no_display_section_gains_one(pinned: Path) -> None:
+    """A config with no [display] section gains one carrying both pinned keys."""
     pinned.write_text("[general]\nshow_welcome = false\n")
     xemu._pin_display_settings()
     assert _renderer_of(pinned) == "OPENGL"
     assert _fullscreen_of(pinned) is True
 
 
-def test_the_display_and_display_window_sections_stay_distinct(pinned):
-    """[display.window] is its own table, not a key inside [display]."""
+def test_the_display_and_display_window_sections_stay_distinct(pinned: Path) -> None:
+    """The pin writes [display.window] as its own table rather than a key inside [display]."""
     pinned.write_text("[general]\nshow_welcome = false\n")
     xemu._pin_display_settings()
     display = tomllib.loads(pinned.read_text())["display"]
@@ -302,7 +392,10 @@ def test_the_display_and_display_window_sections_stay_distinct(pinned):
     assert display["window"] == {"fullscreen_on_startup": True}
 
 
-def test_the_renderer_is_configurable_for_hardware_where_vulkan_works(pinned, monkeypatch):
+def test_the_renderer_is_configurable_for_hardware_where_vulkan_works(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned renderer follows XEMU_RENDERER, so Vulkan can be chosen where it works."""
     monkeypatch.setattr(xemu, "XEMU_RENDERER", "VULKAN")
     pinned.write_text("[display]\nrenderer = 'OPENGL'\n")
     xemu._pin_display_settings()
@@ -310,7 +403,9 @@ def test_the_renderer_is_configurable_for_hardware_where_vulkan_works(pinned, mo
 
 
 @pytest.mark.parametrize("setting", ["KEEP", ""])
-def test_the_renderer_pin_can_be_turned_off(pinned, monkeypatch, setting):
+def test_the_renderer_pin_can_be_turned_off(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
     """Turning the renderer pin off leaves the renderer alone, not fullscreen."""
     monkeypatch.setattr(xemu, "XEMU_RENDERER", setting)
     pinned.write_text(FULL_TOML)
@@ -319,16 +414,20 @@ def test_the_renderer_pin_can_be_turned_off(pinned, monkeypatch, setting):
     assert _fullscreen_of(pinned) is True
 
 
-def test_a_missing_config_is_not_created(pinned):
-    """xemu writes the file itself, and its own default is already OpenGL."""
+def test_a_missing_config_is_not_created(pinned: Path) -> None:
+    """A missing config is left for xemu to create.
+
+    xemu writes the file itself, and its own default is already OpenGL.
+    """
     xemu._pin_display_settings()
     assert not pinned.exists()
 
 
-def test_an_unwritable_config_does_not_stop_the_launch(pinned, monkeypatch):
+def test_an_unwritable_config_does_not_stop_the_launch(pinned: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A config that cannot be written is left as it was and the pin does not raise."""
     pinned.write_text(FULL_TOML)
 
-    def fail(*args, **kwargs):
+    def fail(*args: Any, **kwargs: Any) -> NoReturn:
         raise OSError("read-only file system")
 
     monkeypatch.setattr(Path, "write_text", fail)
@@ -336,9 +435,17 @@ def test_an_unwritable_config_does_not_stop_the_launch(pinned, monkeypatch):
     assert _renderer_of(pinned) == "VULKAN"
 
 
-def _spawned_env(emulator, monkeypatch, tmp_path) -> dict:
-    """Launch with the process spawn stubbed out, and hand back the env xemu
-    would have been given."""
+def _spawned_env(emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
+    """Launch with the process spawn stubbed out and hand back the env xemu would have been given.
+
+    Args:
+        emulator: The Xemu instance to launch.
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: Directory the throwaway disc image is written into.
+
+    Returns:
+        The environment mapping passed to the stubbed spawn.
+    """
     monkeypatch.setattr(xemu, "_reap_strays", lambda: None)
     monkeypatch.setattr(xemu.Xemu, "stop", lambda self: None)
     captured: list[dict] = []
@@ -349,14 +456,24 @@ def _spawned_env(emulator, monkeypatch, tmp_path) -> dict:
     return captured[0]
 
 
-def test_software_gl_is_off_by_default(emulator, monkeypatch, tmp_path):
-    """CPU rendering is a workaround for broken drivers, not a default."""
+def test_software_gl_is_off_by_default(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LIBGL_ALWAYS_SOFTWARE is absent from the launch env unless asked for.
+
+    CPU rendering is a workaround for broken drivers, not a default.
+    """
     monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", False)
     assert "LIBGL_ALWAYS_SOFTWARE" not in _spawned_env(emulator, monkeypatch, tmp_path)
 
 
-def test_software_gl_reaches_xemu_and_nothing_else(emulator, monkeypatch, tmp_path):
-    """Set on xemu's own launch env, so the rest of the container keeps the GPU."""
+def test_software_gl_reaches_xemu_and_nothing_else(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The software GL switch lands in xemu's own launch env and not the broker's.
+
+    Set on xemu's own launch env, so the rest of the container keeps the GPU.
+    """
     monkeypatch.setattr(xemu, "XEMU_SOFTWARE_GL", True)
     env = _spawned_env(emulator, monkeypatch, tmp_path)
     assert env["LIBGL_ALWAYS_SOFTWARE"] == "1"
@@ -367,12 +484,18 @@ def test_software_gl_reaches_xemu_and_nothing_else(emulator, monkeypatch, tmp_pa
     ("1", True), ("true", True), ("YES", True), (" on ", True),
     ("0", False), ("false", False), ("", False),
 ])
-def test_the_software_gl_switch_reads_the_usual_spellings(setting, expected):
+def test_the_software_gl_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
+    """The truthy parser accepts the common spellings of on and off."""
     assert xemu._truthy(setting) is expected
 
 
-def test_launch_pins_the_display_settings_before_spawning(emulator, monkeypatch, tmp_path):
-    """The pin is worthless if a launch can get past it."""
+def test_launch_pins_the_display_settings_before_spawning(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch pins the display settings before the process is spawned.
+
+    The pin is worthless if a launch can get past it.
+    """
     cfg = xemu.XEMU_TOML
     cfg.write_text(cfg.read_text() + "\n[display]\nrenderer = 'VULKAN'\n")
     monkeypatch.setattr(xemu, "XEMU_RENDERER", "OPENGL")
@@ -393,8 +516,16 @@ def test_launch_pins_the_display_settings_before_spawning(emulator, monkeypatch,
 
 
 @pytest.fixture
-def emulator(monkeypatch, tmp_path):
-    """An Xemu whose HDD image is a real, freshly formatted FATX disk."""
+def emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> xemu.Xemu:
+    """Build an Xemu whose HDD image is a real, freshly formatted FATX disk.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: Directory holding the image and the config that points at it.
+
+    Returns:
+        An Xemu with its staging directory already created.
+    """
     image = tmp_path / "xbox_hdd.qcow2"
     Fatx.create(str(image))
     monkeypatch.setattr(xemu, "XEMU_TOML", _toml(tmp_path, str(image)))
@@ -404,10 +535,25 @@ def emulator(monkeypatch, tmp_path):
 
 
 def _fatx(image: Path) -> Fatx:
+    """Open the E: partition of a FATX image.
+
+    Args:
+        image: The raw HDD image.
+
+    Returns:
+        A Fatx handle on the E: drive.
+    """
     return Fatx(str(image), drive="e")
 
 
 def _seed(image: Path, path: str, data: bytes) -> None:
+    """Write a file into the image, creating any missing parent directories.
+
+    Args:
+        image: The raw HDD image.
+        path: Absolute path of the file inside the E: partition.
+        data: The file contents.
+    """
     fs = _fatx(image)
     parts = path.strip("/").split("/")
     for i in range(1, len(parts)):
@@ -418,13 +564,21 @@ def _seed(image: Path, path: str, data: bytes) -> None:
     del fs
 
 
-def _stage(em, rel: str, data: bytes) -> None:
+def _stage(em: xemu.Xemu, rel: str, data: bytes) -> None:
+    """Write a file under the emulator's staging directory.
+
+    Args:
+        em: The Xemu whose staging directory receives the file.
+        rel: Path of the file relative to the staging directory.
+        data: The file contents.
+    """
     p = em.staging_dir / rel
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(data)
 
 
-def test_extract_pulls_only_the_launched_title(emulator):
+def test_extract_pulls_only_the_launched_title(emulator: xemu.Xemu) -> None:
+    """Extraction copies the launched title's saves and leaves other titles on the disk."""
     _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"mine")
     _seed(emulator.hdd_image, "/UDATA/DEADBEEF/saved.dat", b"someone else")
     emulator._title_id = "4D530064"
@@ -434,10 +588,13 @@ def test_extract_pulls_only_the_launched_title(emulator):
     assert not (emulator.staging_dir / "UDATA/DEADBEEF").exists()
 
 
-def test_extract_matches_a_save_directory_whatever_its_case(emulator):
-    """Regression: the title id used to be formatted lowercase and looked up
+def test_extract_matches_a_save_directory_whatever_its_case(emulator: xemu.Xemu) -> None:
+    """Extraction finds the title's save directory even when the id differs in case.
+
+    Regression: the title id used to be formatted lowercase and looked up
     literally, so nothing resolved and every session's saves were lost with
-    no error."""
+    no error.
+    """
     _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"mine")
     emulator._title_id = "4d530064"
 
@@ -445,7 +602,8 @@ def test_extract_matches_a_save_directory_whatever_its_case(emulator):
     assert (emulator.staging_dir / "UDATA/4D530064/saved.dat").read_bytes() == b"mine"
 
 
-def test_extract_covers_both_udata_and_tdata(emulator):
+def test_extract_covers_both_udata_and_tdata(emulator: xemu.Xemu) -> None:
+    """Extraction takes the title's files from both UDATA and TDATA."""
     _seed(emulator.hdd_image, "/UDATA/4D530064/a.dat", b"u")
     _seed(emulator.hdd_image, "/TDATA/4D530064/b.dat", b"t")
     emulator._title_id = "4D530064"
@@ -453,7 +611,8 @@ def test_extract_covers_both_udata_and_tdata(emulator):
     assert emulator._extract_saves() == 2
 
 
-def test_extract_without_a_title_id_takes_every_title(emulator):
+def test_extract_without_a_title_id_takes_every_title(emulator: xemu.Xemu) -> None:
+    """Extraction with no title id known copies every title's saves."""
     _seed(emulator.hdd_image, "/UDATA/4D530064/a.dat", b"one")
     _seed(emulator.hdd_image, "/UDATA/DEADBEEF/b.dat", b"two")
     emulator._title_id = None
@@ -461,14 +620,16 @@ def test_extract_without_a_title_id_takes_every_title(emulator):
     assert emulator._extract_saves() == 2
 
 
-def test_extract_is_empty_when_the_title_never_saved(emulator):
+def test_extract_is_empty_when_the_title_never_saved(emulator: xemu.Xemu) -> None:
+    """Extraction copies nothing when the launched title has no saves on the disk."""
     _seed(emulator.hdd_image, "/UDATA/DEADBEEF/a.dat", b"two")
     emulator._title_id = "4D530064"
 
     assert emulator._extract_saves() == 0
 
 
-def test_inject_writes_staged_files_into_the_image(emulator):
+def test_inject_writes_staged_files_into_the_image(emulator: xemu.Xemu) -> None:
+    """Injection writes each staged file into the image at the same path."""
     _stage(emulator, "UDATA/4D530064/saved.dat", b"restored")
 
     assert emulator._inject_saves() == 1
@@ -476,10 +637,13 @@ def test_inject_writes_staged_files_into_the_image(emulator):
     assert bytes(fs.read("/UDATA/4D530064/saved.dat")) == b"restored"
 
 
-def test_inject_lands_in_the_existing_directory_whatever_its_case(emulator):
-    """An archive captured elsewhere can carry a different case than the disk
+def test_inject_lands_in_the_existing_directory_whatever_its_case(emulator: xemu.Xemu) -> None:
+    """Injection reuses a directory already on the disk even when the staged case differs.
+
+    An archive captured elsewhere can carry a different case than the disk
     holds; creating a twin directory beside the real one would hide the save
-    from the game."""
+    from the game.
+    """
     _seed(emulator.hdd_image, "/UDATA/4D530064/old.dat", b"old")
     _stage(emulator, "udata/4d530064/saved.dat", b"restored")
 
@@ -489,9 +653,12 @@ def test_inject_lands_in_the_existing_directory_whatever_its_case(emulator):
     assert [a.filename for a in fs.listdir("/")] == ["UDATA"]
 
 
-def test_inject_truncates_a_file_that_shrank(emulator):
-    """pyfatx write() never shortens an existing file, so a smaller save has
-    to be truncated or it lands with the old tail still attached."""
+def test_inject_truncates_a_file_that_shrank(emulator: xemu.Xemu) -> None:
+    """Injecting a smaller save over a larger one leaves no stale tail behind.
+
+    pyfatx write() never shortens an existing file, so a smaller save has
+    to be truncated or it lands with the old tail still attached.
+    """
     _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"a much longer save")
     _stage(emulator, "UDATA/4D530064/saved.dat", b"short")
 
@@ -500,17 +667,22 @@ def test_inject_truncates_a_file_that_shrank(emulator):
     assert bytes(fs.read("/UDATA/4D530064/saved.dat")) == b"short"
 
 
-def test_inject_skips_dotfiles(emulator):
+def test_inject_skips_dotfiles(emulator: xemu.Xemu) -> None:
+    """Injection ignores dotfiles in the staging directory."""
     _stage(emulator, "UDATA/4D530064/.DS_Store", b"junk")
     assert emulator._inject_saves() == 0
 
 
-def test_inject_is_a_no_op_with_nothing_staged(emulator):
+def test_inject_is_a_no_op_with_nothing_staged(emulator: xemu.Xemu) -> None:
+    """Injection with an empty staging directory writes nothing."""
     assert emulator._inject_saves() == 0
 
 
-def test_a_save_round_trips_through_the_image(emulator):
-    """The whole point: what exit extracts is what the next activate injects."""
+def test_a_save_round_trips_through_the_image(emulator: xemu.Xemu) -> None:
+    """A save extracted at exit is restored intact by the next injection.
+
+    The whole point: what exit extracts is what the next activate injects.
+    """
     _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"progress")
     emulator._title_id = "4D530064"
     assert emulator._extract_saves() == 1
@@ -527,13 +699,19 @@ def test_a_save_round_trips_through_the_image(emulator):
 # ── Session contract ─────────────────────────────────────────────────────────
 
 
-def test_xemu_reports_no_save_state_support():
-    """A raw image cannot hold QEMU internal snapshots, so the parent has to
-    read the absence off the status response rather than assume it."""
+def test_xemu_reports_no_save_state_support() -> None:
+    """Xemu advertises no save state support.
+
+    A raw image cannot hold QEMU internal snapshots, so the parent has to
+    read the absence off the status response rather than assume it.
+    """
     assert xemu.Xemu.supports_states is False
 
 
-def test_save_and_exit_reports_saves_rather_than_a_state(emulator, monkeypatch):
+def test_save_and_exit_reports_saves_rather_than_a_state(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit reports the title id and the count of extracted saves instead of a state."""
     _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"progress")
     emulator._title_id = "4D530064"
     monkeypatch.setattr(xemu, "_reap_strays", lambda: None)

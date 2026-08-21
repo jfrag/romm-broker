@@ -1,5 +1,4 @@
-"""RPCS3 (PlayStation 3) launcher: config.yml patching, PKG install hook,
-and SIGTERM shutdown.
+"""RPCS3 (PlayStation 3) launcher: config.yml patching, PKG install hook, and SIGTERM shutdown.
 
 RPCS3 has no runtime control channel and installs no signal handler; the
 whole lifecycle is CLI + config file. Save states exist only as GUI actions,
@@ -25,18 +24,27 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Library root a resolved ROM must live under (env `ROM_ROOT`, default `/romm`)."""
 
 
 def _default_data_dir() -> str:
-    """RPCS3's Linux data root: $XDG_CONFIG_HOME/rpcs3 when set, otherwise
-    ~/.config/rpcs3. Config, dev_flash and dev_hdd0 all live under it."""
+    """RPCS3's Linux data root when `RPCS3_DATA_DIR` is not set.
+
+    `$XDG_CONFIG_HOME/rpcs3` when set, otherwise `~/.config/rpcs3`. Config,
+    dev_flash and dev_hdd0 all live under it.
+
+    Returns:
+        The data root path.
+    """
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "rpcs3")
@@ -44,26 +52,39 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = Path(os.environ.get("RPCS3_DATA_DIR", _default_data_dir()))
+"""RPCS3's data root (env `RPCS3_DATA_DIR`, default from `_default_data_dir`)."""
 CONFIG_PATH = DATA_DIR / "config.yml"
+"""The config.yml patched before every launch."""
 DEV_HDD0 = DATA_DIR / "dev_hdd0"
+"""The emulated internal HDD, the save root."""
 USER_HOME = DEV_HDD0 / "home" / "00000001"
+"""The default user's home on the emulated HDD."""
 EXDATA_DIR = USER_HOME / "exdata"
+"""Where .rap and .edat licenses are copied."""
 GAME_DIR = DEV_HDD0 / "game"
+"""Installed PKG titles and cellGameData saves."""
 RPCS3_LOG_PATH = Path(os.environ.get("RPCS3_LOG_PATH", "/config/rpcs3.log"))
-# PKG decryption/extraction can run minutes for multi-GB packages.
+"""The emulator log file, also fed by headless installs (env `RPCS3_LOG_PATH`)."""
 INSTALL_TIMEOUT = float(os.environ.get("RPCS3_INSTALL_TIMEOUT", "1800"))
+"""Seconds a headless PKG install may run (env `RPCS3_INSTALL_TIMEOUT`, default 1800).
 
-# Boot formats, best first: decrypted ISO and PKG installer beat a bare
-# EBOOT so a folder holding both the rip and its installer picks the image.
+PKG decryption/extraction can run minutes for multi-GB packages.
+"""
+
 ROM_EXTENSIONS = (".iso", ".pkg", ".bin", ".self", ".elf")
-# EBOOT.BIN sits three levels down in a disc rip (PS3_GAME/USRDIR/EBOOT.BIN).
-_ROM_SEARCH_GLOBS = ("*", "*/*", "*/*/*")
-# Only executables named EBOOT.* are bootable; other .bin/.self files in a
-# rip (licenses, sdata) are not.
-_EBOOT_EXTS = (".bin", ".self", ".elf")
+"""Boot formats, best first.
 
-# config.yml values forced before every launch. RPCS3 fills missing keys
-# with defaults, so a partial file is a valid config.
+Decrypted ISO and PKG installer beat a bare EBOOT so a folder holding both
+the rip and its installer picks the image.
+"""
+_ROM_SEARCH_GLOBS = ("*", "*/*", "*/*/*")
+"""Glob patterns a ROM folder is searched with; EBOOT.BIN sits three levels down in a disc rip."""
+_EBOOT_EXTS = (".bin", ".self", ".elf")
+"""Executable extensions that are bootable only when named `EBOOT.*`.
+
+Other .bin/.self files in a rip (licenses, sdata) are not.
+"""
+
 _CONFIG_PATCHES: dict[tuple[str, str], str] = {
     ("Miscellaneous", "Automatically start games after boot"): "true",
     # Game quit (or XMB exit) ends the process, so alive() tracks the game.
@@ -72,13 +93,23 @@ _CONFIG_PATCHES: dict[tuple[str, str], str] = {
     # freeze the game invisibly.
     ("Miscellaneous", "Pause emulation on RPCS3 focus loss"): "false",
 }
+"""config.yml values forced before every launch, keyed `(section, key)`.
+
+RPCS3 fills missing keys with defaults, so a partial file is a valid config.
+"""
 
 
 def _rpcs3_bin() -> str:
+    """The RPCS3 executable (env `RPCS3_BIN`, default `/opt/rpcs3/AppRun`)."""
     return os.environ.get("RPCS3_BIN", "/opt/rpcs3/AppRun")
 
 
 def _launch_env() -> dict[str, str]:
+    """The environment RPCS3 is spawned with.
+
+    Returns:
+        The base launch environment with `QT_QPA_PLATFORM` pinned to xcb.
+    """
     env = base_launch_env()
     # The AppImage's desktop entry pins xcb; the Qt wayland platform is not
     # bundled.
@@ -86,7 +117,20 @@ def _launch_env() -> dict[str, str]:
     return env
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Pick the best bootable file among `candidates`.
+
+    Hidden files, non-files, executables not named `EBOOT.*` and anything
+    resolving outside `ROM_ROOT` are skipped. Ranking follows the
+    `ROM_EXTENSIONS` order, then the shallowest path, then the lowercased name.
+
+    Args:
+        candidates: Paths found under `base` by the search globs.
+        base: The directory the candidates were searched from.
+
+    Returns:
+        The resolved path of the best candidate, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -116,7 +160,9 @@ def _patch_config() -> None:
 
     config.yml is two-level YAML: unindented `Section:` headers over
     2-space-indented `Key: value` lines. Patched line-wise so every other
-    setting the user tuned through the GUI survives untouched."""
+    setting the user tuned through the GUI survives untouched. A missing
+    file is seeded empty first. Failures are logged, not raised.
+    """
     try:
         if not CONFIG_PATH.exists():
             log.info("config.yml not found at %s, seeding one", CONFIG_PATH)
@@ -169,9 +215,19 @@ def _patch_config() -> None:
 
 
 def _run_headless(args: list[str], what: str) -> None:
-    """Run a one-shot `rpcs3 --headless` operation (installer CLI); the
-    process exits when the operation completes. Exit code is always 0, so
-    callers verify success by checking the expected files afterwards."""
+    """Run a one-shot `rpcs3 --headless` operation (installer CLI).
+
+    The process exits when the operation completes. Exit code is always 0,
+    so callers verify success by checking the expected files afterwards.
+    Output is appended to `RPCS3_LOG_PATH` under a timestamped banner.
+
+    Args:
+        args: The arguments after `--headless`, such as `--installpkg` and a path.
+        what: A short label for the log lines.
+
+    Raises:
+        RuntimeError: When the operation outlives `INSTALL_TIMEOUT`.
+    """
     cmd = [_rpcs3_bin(), "--headless", *args]
     log.info("rpcs3 %s: %s", what, " ".join(cmd))
     try:
@@ -198,8 +254,14 @@ def _run_headless(args: list[str], what: str) -> None:
 
 
 def _gamedata_dirs() -> list[Path]:
-    """cellGameData save dirs under game/: everything except installed
-    titles (which have a bootable EBOOT.BIN) and RPCS3's ＄locks dir."""
+    """Save dirs of the cellGameData kind under game/.
+
+    Everything except installed titles (which have a bootable EBOOT.BIN) and
+    RPCS3's ＄locks dir.
+
+    Returns:
+        The save directories, sorted by name.
+    """
     dirs = []
     if GAME_DIR.is_dir():
         for d in sorted(GAME_DIR.iterdir()):
@@ -212,8 +274,16 @@ def _gamedata_dirs() -> list[Path]:
 
 
 def _sfo_title_id(sfo: Path) -> str | None:
-    """TITLE_ID string from a PARAM.SFO (key/data table pairs indexed from
-    a fixed-size header)."""
+    """TITLE_ID string from a PARAM.SFO.
+
+    The file is key/data table pairs indexed from a fixed-size header.
+
+    Args:
+        sfo: The PARAM.SFO path.
+
+    Returns:
+        The title id, or None when the file is unreadable, malformed or has no TITLE_ID.
+    """
     try:
         data = sfo.read_bytes()
     except OSError:
@@ -239,8 +309,17 @@ def _sfo_title_id(sfo: Path) -> str | None:
 
 
 def _pkg_title_id(pkg: Path) -> str | None:
-    """Title ID from the PKG header: the content id at offset 0x30 embeds it
-    as chars 7-15 (`UP0001-BLUS30443_00-...` -> BLUS30443)."""
+    """Title ID from the PKG header.
+
+    The content id at offset 0x30 embeds it as chars 7-15
+    (`UP0001-BLUS30443_00-...` gives BLUS30443).
+
+    Args:
+        pkg: The .pkg path.
+
+    Returns:
+        The title id, or None when the header is unreadable or not a PKG.
+    """
     try:
         with open(pkg, "rb") as f:
             header = f.read(0x60)
@@ -255,10 +334,22 @@ def _pkg_title_id(pkg: Path) -> str | None:
 
 
 def _install_pkgs(rom: Path) -> Path:
-    """Install-if-needed hook for .pkg roms; returns the installed EBOOT to
-    boot. When the rom has its own folder, every .pkg in it is installed
-    (base + update + DLC) and every .rap/.edat license is copied into
-    exdata. Already-installed titles skip straight to the boot path."""
+    """Install-if-needed hook for .pkg roms.
+
+    When the rom has its own folder, every .pkg in it is installed (base +
+    update + DLC) and every .rap/.edat license is copied into exdata.
+    Already-installed titles skip straight to the boot path.
+
+    Args:
+        rom: The .pkg the session was activated with.
+
+    Returns:
+        The installed EBOOT.BIN to boot.
+
+    Raises:
+        RuntimeError: When the title id cannot be determined, the install
+            produces no EBOOT.BIN, or a headless install times out.
+    """
     folder = rom.parent if rom.parent.resolve() != ROM_ROOT.resolve() else None
     siblings = sorted(folder.iterdir()) if folder else [rom]
     pkgs = [p for p in siblings if p.is_file() and p.suffix.lower() == ".pkg"] or [rom]
@@ -303,6 +394,34 @@ def _install_pkgs(rom: Path) -> Path:
 
 
 class Rpcs3(Emulator):
+    """PlayStation 3 via RPCS3, driven by command line flags and config.yml patching.
+
+    RPCS3 has no runtime control channel, so the broker pins config.yml
+    before every launch (auto-start, exit when the game ends, no pause on
+    focus loss) and boots with `--no-gui --fullscreen`. A .pkg is installed
+    first through the headless installer CLI. RPCS3 installs no signal
+    handler, so the stop is a hard SIGTERM kill; that is safe because save
+    data is written to host files the moment the game saves.
+
+    Save states exist only as GUI actions, so there are none here and a
+    resume slot is logged and ignored. The archive carries cellSaveData
+    saves and the cellGameData dirs under game/, and the save subtrees are
+    computed per call because game/ also holds installed titles. At exit
+    every file in this title's save dirs (by serial prefix, or written during
+    the session) gets its mtime refreshed so the delta dump ships them whole.
+
+    Attributes:
+        name: Provider key, `rpcs3`.
+        display_name: Human-readable name.
+        save_root: The emulated HDD the save subtrees hang off.
+        rom_extensions: Bootable formats, best first.
+        log_path: The emulator log file.
+        term_timeout: SIGTERM grace before SIGKILL (env `RPCS3_STOP_WAIT`, default 2).
+        _restoring: Whether a restore is in flight, widening `save_subtrees`.
+        _session_serial: The launched title's serial, or None for an .iso.
+        _session_start: Launch time, the baseline for modified save dirs.
+    """
+
     name = "rpcs3"
     display_name = "RPCS3"
     save_root = DEV_HDD0
@@ -311,20 +430,27 @@ class Rpcs3(Emulator):
     _session_serial: str | None = None
     _session_start = 0.0
     log_path = RPCS3_LOG_PATH
-    # No SIGTERM handler: the default action ends the process at once, saves
-    # are already on disk. The grace window only covers process-group
-    # teardown of the AppImage wrapper.
     term_timeout = float(os.environ.get("RPCS3_STOP_WAIT", "2"))
+    """SIGTERM grace before SIGKILL (env `RPCS3_STOP_WAIT`, default 2).
+
+    No SIGTERM handler: the default action ends the process at once, saves
+    are already on disk. The grace window only covers process-group
+    teardown of the AppImage wrapper.
+    """
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
-        """cellSaveData saves plus the cellGameData save dirs under game/.
+        """Subtrees holding cellSaveData saves plus the cellGameData save dirs under game/.
 
         game/ mixes save data with installed PKG titles and RPCS3's ＄locks
         dir, so the dump enumerates only the dirs without a bootable
         EBOOT.BIN. A restore inverts the problem: the archive holds nothing
         but previously dumped save dirs, and those dirs don't exist on disk
-        yet, so the whole game/ prefix is declared to let them through."""
+        yet, so the whole game/ prefix is declared to let them through.
+
+        Returns:
+            Subtree paths relative to `save_root`.
+        """
         if self._restoring:
             return ("home/00000001/savedata", "game")
         subtrees = ["home/00000001/savedata"]
@@ -332,10 +458,19 @@ class Rpcs3(Emulator):
         return tuple(subtrees)
 
     def prepare_restore(self) -> None:
+        """Stop RPCS3 and widen the save subtrees so the archive's game/ dirs land."""
         self.stop()
         self._restoring = True
 
     def resolve_rom_file(self, path: Path) -> Path | None:
+        """The file RPCS3 should boot for `path`.
+
+        Args:
+            path: A ROM file, or a folder searched up to three levels deep.
+
+        Returns:
+            The file itself, the best-ranked bootable file in the folder, or None.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -349,6 +484,15 @@ class Rpcs3(Emulator):
         return _pick_rom_file(candidates, path)
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+        """Patch config, install a .pkg if needed, and boot the game.
+
+        Args:
+            rom_path: The file to boot, or the .pkg to install and boot.
+            resume_slot: Ignored with a log line; RPCS3 has no usable save states.
+
+        Raises:
+            RuntimeError: When a .pkg cannot be installed.
+        """
         self.stop()
         self._restoring = False
         if resume_slot is not None:
@@ -380,7 +524,15 @@ class Rpcs3(Emulator):
         )
         self._spawn([_rpcs3_bin(), "--no-gui", "--fullscreen", str(boot)], _launch_env())
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+        """Stop RPCS3 and mark this title's save dirs for the dump.
+
+        Args:
+            slot: Ignored; there are no save states.
+
+        Returns:
+            `state_saved`, `state_slot` and `state_file`, all None.
+        """
         self.stop()
         # The dump ships files newer than the session baseline. A save is a
         # directory tree the game rewrites only partially, and sibling dirs
@@ -397,8 +549,14 @@ class Rpcs3(Emulator):
         return {"state_saved": None, "state_slot": None, "state_file": None}
 
     def _session_save_dirs(self) -> list[Path]:
-        """This title's save dirs: name prefixed with the session serial, or
-        containing a file written while the session ran."""
+        """This title's save dirs.
+
+        Those whose name is prefixed with the session serial, or which
+        contain a file written while the session ran.
+
+        Returns:
+            Directories under savedata/ and game/ that belong to this session.
+        """
         savedata = USER_HOME / "savedata"
         candidates = sorted(d for d in savedata.iterdir() if d.is_dir()) if savedata.is_dir() else []
         candidates += _gamedata_dirs()

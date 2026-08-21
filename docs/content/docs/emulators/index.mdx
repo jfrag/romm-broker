@@ -1,0 +1,173 @@
+---
+title: "Supported emulators"
+description: "Every launcher the broker registers, what it can do, and the details of how each one is driven."
+---
+
+An activate request names its launcher with the `emulator` field. Each launcher
+is a subclass of the broker's `Emulator` base class that knows how to boot a
+game, where the emulator keeps its save data, and whether it can save and load
+state on demand.
+
+| `emulator` | System | Save states | Disc swap | Save subtrees shipped in the archive |
+| --- | --- | --- | --- | --- |
+| `retroarch` | anything with a libretro core | yes | yes | `states/`, `saves/` under `RETROARCH_DATA_DIR` |
+| `pcsx2` | PlayStation 2 | yes | no | `memcards/`, `sstates/` |
+| `duckstation` | PlayStation | no (a resume state is written at exit) | no | `memcards/`, `savestates/` |
+| `dolphin` | GameCube, Wii | yes | no | `StateSaves/`, `GC/`, `Wii/` |
+| `ppsspp` | PSP | yes | no | `SAVEDATA/`, `PPSSPP_STATE/` under `PSP/` |
+| `cemu` | Wii U | no | no | `usr/save/` under the mlc01 tree |
+| `azahar` | 3DS | no | no | the SD `title/` and `extdata/` trees and the NAND `extdata/` and `sysdata/` trees |
+| `eden` | Switch | no | no | `nand/user/save/` plus the profile store under `nand/system/save/` |
+| `shadps4` | PlayStation 4 | no | no | `home/1000/savedata/` |
+| `rpcs3` | PlayStation 3 | no | no | the save directories under `dev_hdd0/` |
+| `xemu` | Xbox | no | no | extracted from the HDD image into a staging directory |
+| `xenia` | Xbox 360 | no | no | `content/` under `XENIA_DATA_DIR` |
+| `desktop` | the webstation desktop itself | no | no | none |
+
+"Save states" is what the status response reports as `supports_states`. When
+it is off, the state routes answer `400` and `resume_slot` is ignored; the
+game's own save data is the only persistence. The exact paths are the
+`save_subtrees` attribute of each class in the
+[Python reference](/docs/developer/reference/emulators).
+
+## RetroArch
+
+`emulator: "retroarch"` is the general purpose launcher: one class covering
+every libretro core, with `rom.platform` picking the core (ngc and wii both
+map to `dolphin`, plus snes, n64, dc, saturn, psp, nds, 3ds, arcade and
+genesis). Missing cores are downloaded from the libretro buildbot into the
+user's own `libretro_directory`, which is where RetroArch also keeps the
+matching `.info` files: a core loaded from anywhere else has no core info and
+`GET_STATUS` then segfaults RetroArch mid-session. The user's config is never
+edited, only layered with `--appendconfig`.
+
+Save states are real, but RetroArch has no "save to slot n" command, so the
+broker parks the slot instead: it walks down to the -1 floor and back up to
+`RETROARCH_STATE_SLOT` (default 0). That runs once per launch and again only
+when a save lands elsewhere, which means the player moved the slot with their
+own hotkeys. The first save of a session costs about 3 s, the rest under 1 s.
+Loads use `LOAD_STATE_SLOT`, which is already absolute. Tunables:
+`RETROARCH_SLOT_STEP_DELAY` (0.1 s between presses) and
+`RETROARCH_SLOT_HOME_STEPS` (24 presses to reach the floor).
+
+Multi-disc games: `rom.path` may point at an `.m3u` playlist or a folder
+holding one, and the broker prefers the playlist on disc platforms. A running
+core can change discs through the [swap-disc route](/docs/api/activate#swap-discs).
+
+The platform-to-core table lives in `retroarch_platforms.json` next to the
+launcher; `RETROARCH_CORE_URL_<CORE>` pins a single core's download without
+editing it.
+
+## PCSX2
+
+Driven over its PINE socket (`$XDG_RUNTIME_DIR/pcsx2.sock`) for save, load,
+status and the game serial. PCSX2 works in slot 10, its own autosave slot.
+State files (`.p2s`) are named for the disc they were taken from, and the
+serial only comes off the running disc, so a file left over from an earlier
+session cannot be told apart from the current game's. PCSX2 therefore empties
+its working slot at the start of activate, before the archive is restored;
+RomM already holds those states, and clearing them is what stops the last
+player's save being served as this one's.
+
+The Slot 1 memory card is a folder card the broker owns (`PCSX2_SLOT1_CARD`,
+default `romm-slot1`). With `save.memory_card_synced` set, the whole card
+travels on the [memory card routes](/docs/api/archives#memory-cards) instead of
+inside the save archive.
+
+## DuckStation
+
+No mid-session save states: DuckStation exposes nothing the broker can drive
+while a game runs, so the state routes answer `400`. What it does have is a
+graceful shutdown that serialises a resume state, which exit reports as its
+state file; that is why `DUCKSTATION_STOP_WAIT` is the longest SIGTERM grace
+of the set. Memory cards and that state live under the data root the archive
+carries.
+
+## Dolphin
+
+Save and load go through xdotool hotkeys (Shift+F`n` saves slot `n`, F`n`
+loads it), so the broker waits for the render window before sending them and
+confirms a save by watching `StateSaves/` for the file. The video backend is
+pinned to OpenGL at launch (`DOLPHIN_VIDEO_BACKEND`) and state thumbnails are
+disabled because the GPU-rendered core crashes producing them. GameCube
+Slot A is pinned to the GCI folder card device so the card is a directory the
+archive can carry.
+
+## PPSSPP
+
+Hotkey driven like Dolphin, working in slot 1. Save data and states live under
+`PSP/` in the config root.
+
+## Cemu
+
+No save states; `mlc01/usr/save/` is the persistence. Cemu binds controllers
+by SDL GUID, so the launcher derives the selkies virtual pad's GUIDs from
+`CEMU_PAD_NAME` and writes a controller profile before each launch
+(`CEMU_PAD_UUIDS` overrides the derived list). Cemu has no SIGTERM handler,
+so `CEMU_STOP_WAIT` only covers process-group teardown.
+
+## Azahar
+
+No save states and no control interface, so exit is a kill and only what the
+game already wrote survives. Single game launches start it windowed because
+Azahar stops rendering when the display resizes underneath it in fullscreen.
+For 3DS the RetroArch core is the better option and is what a `3ds` launch
+uses by default.
+
+## Eden
+
+No save states; `nand/user/save/` is the persistence. A running game takes
+longer than the base grace to tear down, hence `EDEN_STOP_WAIT`.
+
+## shadPS4
+
+`emulator: "shadps4"` launches the shadPS4 PlayStation 4 emulator. shadPS4
+has no save states (`resume_slot` is ignored); the game's save data
+under `home/1000/savedata/` is the persistence. The binary is picked from
+`$HOME/.local/share/shadPS4QtLauncher/versions`: the `Pre-release/` build if
+present (it always trumps releases), otherwise the newest semver release
+folder (`vX.Y.Z - ... - <date>/`, each holding `Shadps4-sdl.AppImage`).
+Override the search with `SHADPS4_BIN` (explicit path), `SHADPS4_VERSIONS_DIR`,
+`SHADPS4_BIN_NAME`, or `SHADPS4_DATA_DIR`. The broker drives shadPS4 through
+its stdin IPC (`SHADPS4_ENABLE_IPC=true`): RUN/START boot the game headlessly,
+and exit sends STOP (the SDL quit event) for a graceful teardown before the
+save delta is dumped. shadPS4 has no SIGTERM handler, so SIGTERM is only the
+fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
+
+## RPCS3
+
+No save states; `dev_hdd0/home/` is the persistence. `rom.path` may be a
+PKG, which the launcher installs first (`RPCS3_INSTALL_TIMEOUT` bounds the
+decryption), an extracted game folder, or a disc image.
+
+## xemu
+
+No save states. xemu keeps saves inside the Xbox HDD image, so the launcher
+extracts them from the qcow2 (through the raw image the container prepares on
+first init) after a clean shutdown, and injects them back before launch; the
+save directories are matched on the disk's own case. The renderer is pinned in
+`xemu.toml` before each launch (`XEMU_RENDERER`, `KEEP` to leave it alone) and
+`XEMU_SOFTWARE_GL` forces CPU rendering for hosts where both GPU paths abort.
+
+## Xenia
+
+`emulator: "xenia"` launches the Xenia Edge Xbox 360 emulator. Xenia has no
+save states (`resume_slot` is ignored) and no control interface of any kind
+(no IPC, socket or stdin protocol), so the game's own save data is the
+persistence and exit is a SIGTERM, which Xenia takes as a plain kill. That is
+safe because guest save writes go straight through to host files, so nothing
+is lost in a buffer. The save archive is the whole `content/` tree under
+`XENIA_DATA_DIR`: Xbox 360 save paths embed the profile XUID and the profile
+store lives in that same tree, so the two travel together and line up on a
+restore into a fresh container. `rom.path` may be an XISO (`.iso`), a
+bare `.xex`, an extracted dump (a folder holding `default.xex`), or an XBLA /
+Games on Demand title folder: the broker walks the console's own layout
+(`[Content/<XUID>/]<TITLE_ID>/000D0000` or `00007000/<package>`) and boots the
+STFS package it finds there, checked by magic so DLC, title updates and the
+`.data` payload beside a GoD package are passed over.
+
+## Desktop
+
+`emulator: "desktop"` streams the full webstation desktop so emulators can be
+configured through the GUI. No `rom` or `save`; same room interface, same exit
+teardown. This is how you do the one-time [setup](/docs/emulators/setup).
