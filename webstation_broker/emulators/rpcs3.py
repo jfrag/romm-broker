@@ -129,7 +129,9 @@ _WINDOW_CLASS = "rpcs3"
 # Default binding for gw_savestate_1 (rpcs3qt/shortcut_settings.cpp). RPCS3
 # has four such shortcuts, but every one just writes a new auto-numbered
 # state (rpcs3/Emu/savestate_utils.cpp), so slot 1 is as good as any other.
-_SAVE_STATE_KEY = "ctrl+alt+1"
+# Configurable because it's a GUI-rebindable shortcut, unlike the rest of
+# this module's constants.
+_SAVE_STATE_KEY = os.environ.get("RPCS3_SAVE_STATE_KEY", "ctrl+alt+1")
 
 
 def _rpcs3_bin() -> str:
@@ -169,7 +171,7 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
     return min(ranked)[3]
 
 
-def _patch_yaml_file(path: Path, patches: dict[tuple[str, str], str], seed: str = "") -> None:
+def _patch_yaml_file(path: Path, patches: dict[tuple[str, str], str]) -> None:
     """Force ("section", "key") -> value into a two-level YAML file
     (unindented "Section:" headers over 2-space "key: value" lines) before
     every launch, or a flat "key: value" when section is "". RPCS3 fills
@@ -178,7 +180,7 @@ def _patch_yaml_file(path: Path, patches: dict[tuple[str, str], str], seed: str 
         if not path.exists():
             log.info("%s not found, seeding one", path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(seed)
+            path.write_text("")
         lines = path.read_text().splitlines()
         section = ""
         applied: set[tuple[str, str]] = set()
@@ -424,10 +426,13 @@ def _newest_state(serial: str | None) -> Path | None:
 
 
 def _changed_state(serial: str | None, before: dict) -> Path | None:
+    best: tuple[float, Path] | None = None
     for p, cur in _state_snapshot(serial).items():
         if before.get(p) != cur:
-            return p
-    return None
+            mtime = cur[1]
+            if best is None or mtime > best[0]:
+                best = (mtime, p)
+    return best[1] if best is not None else None
 
 
 def _wait_for_state_write(serial: str | None, before: dict, deadline: float) -> Path | None:
@@ -462,7 +467,9 @@ def _wait_for_state_write(serial: str | None, before: dict, deadline: float) -> 
             log.info("save state write complete: %s (%d bytes)", target.name, last_size)
             return target
         time.sleep(POLL_SECS)
-    return target
+    if target is not None:
+        log.warning("save state write never stabilized within timeout: %s", target)
+    return None
 
 
 def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
@@ -540,8 +547,27 @@ class Rpcs3(Emulator):
         it ever reads save_subtrees to restore an archive, which makes it the
         one place that is safe to create the savestates symlink: it runs on
         every activate, but never during a bare construction (registry
-        sweeps build every emulator against real, unredirected paths)."""
+        sweeps build every emulator against real, unredirected paths).
+
+        It also wipes every title's savestates dir and flips _restoring on
+        early. Wiping first means a leftover local state from a previous
+        session never outranks (by mtime) whatever this session's archive
+        restores, and it caps SSTATE_ROOT at whatever the current session
+        itself produces rather than growing across every activate. Flipping
+        _restoring here, not just in prepare_restore(), matters because
+        api.py reads save_subtrees for the restore extract before it ever
+        calls prepare_restore()."""
         _ensure_sstate_link()
+        self._restoring = True
+        if SSTATE_ROOT.is_dir():
+            for child in SSTATE_ROOT.iterdir():
+                try:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                except OSError as exc:
+                    log.warning("could not clear stale savestate %s: %s", child, exc)
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
@@ -683,6 +709,13 @@ class Rpcs3(Emulator):
             if _pine_status() == 0:
                 if not self._session_serial:
                     title = _pine_title_id()
+                    if self._launch_seq != seq:
+                        log.info(
+                            "boot watchdog: launch superseded during title lookup, "
+                            "discarding %s",
+                            title,
+                        )
+                        return
                     if title:
                         self._session_serial = title
                         log.info("boot watchdog: resolved title id %s via PINE", title)
@@ -714,12 +747,16 @@ class Rpcs3(Emulator):
                     p = _wait_for_state_write(
                         self._session_serial, before, time.monotonic() + STATE_WAIT
                     )
-                    if p is not None:
-                        saved = True
-                        st = p.stat()
-                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
-                    else:
+                    if p is None:
                         log.warning("save-and-exit: no new state file appeared")
+                    else:
+                        try:
+                            st = p.stat()
+                        except OSError as exc:
+                            log.warning("save-and-exit: could not stat saved state %s: %s", p, exc)
+                        else:
+                            saved = True
+                            state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
 
         # The dump ships files newer than the session baseline. A save is a
         # directory tree the game rewrites only partially, and sibling dirs
@@ -731,8 +768,8 @@ class Rpcs3(Emulator):
                 if p.is_file():
                     try:
                         os.utime(p, (now, now))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
 
         self.stop()
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}

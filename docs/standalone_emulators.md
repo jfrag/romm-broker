@@ -131,7 +131,8 @@ Adjust graphics settings as desired and run a game to confirm.
 > and resumes at the next launch by booting straight into that state rather
 > than loading it after the fact. RPCS3's IPC has no save/load-state opcode
 > at all, so it is used only to confirm a launch actually reached a running
-> game.
+> game and, when a game's title id can't be read from the file path alone,
+> to look it up once the game is confirmed running.
 
 ## Cemu
 
