@@ -62,6 +62,35 @@ and audio to your liking and test a game.
 > **Special note:** Xemu must be relaunched after its default files are set up
 > before it will boot anything.
 
+## Xenia
+
+Xenia (Xbox 360) runs through the Xenia Edge.
+Controllers work out of the box through SDL, so the desktop visit is mostly
+about the profile and graphics settings.
+
+Xenia needs a profile before it can save anything, and it asks for one the
+first time it starts with none: a **No Profiles Found** dialog offers to create
+one. Launch Xenia once from the desktop, accept that prompt (or use the profile
+menu's **Create new...**), enter a gamertag, and close Xenia. The new profile is
+signed in automatically and Xenia remembers it in its config, so every later
+launch signs into that profile silently and games see a logged-in Live profile
+to save against.
+
+Single game launches run with `--headless`, which auto-answers the guest
+dialogs (storage device select, sign-in, message boxes) that nobody in the
+stream could click through. The profile prompt is not one of those: it is
+Xenia's own window, it appears even in headless mode, and a game launched
+without a profile would sit behind it with no way to dismiss it.
+
+Set your graphics options and test a real game from the desktop before
+launching through RomM.
+
+> **Special note:** Xenia must be launched once from the desktop to create a
+> default Live profile for signing into games. Without it, single game launches
+> stall on the profile prompt and games cannot save. Single game launches keep
+> all Xenia data, the profile included, under `/config/xenia`; the profile has
+> to be created against that same storage root to be the one games boot with.
+
 ## DuckStation
 
 DuckStation runs a setup wizard on first launch. Upload your BIOS, select it

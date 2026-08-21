@@ -11,6 +11,7 @@ from .retroarch import Retroarch
 from .rpcs3 import Rpcs3
 from .shadps4 import Shadps4
 from .xemu import Xemu
+from .xenia import Xenia
 
 REGISTRY: dict[str, type[Emulator]] = {
     "pcsx2": Pcsx2,
@@ -23,6 +24,7 @@ REGISTRY: dict[str, type[Emulator]] = {
     "retroarch": Retroarch,
     "rpcs3": Rpcs3,
     "xemu": Xemu,
+    "xenia": Xenia,
     "ppsspp": Ppsspp,
     "desktop": Desktop,
 }
