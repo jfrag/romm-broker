@@ -117,10 +117,13 @@ class Shadps4(Emulator):
             if eboot.is_file():
                 if eboot.resolve().is_relative_to(ROM_ROOT):
                     return eboot
-                else:
-                    return None  # symlink escapes ROM_ROOT; do not fall through to
-                    # `return path` here, that would hand shadps4 an eboot.bin
-                    # outside the ROM library
+                return None  # symlink escapes ROM_ROOT
+            if eboot.exists() or eboot.is_symlink():
+                # present but not a regular file: dangling symlink, or a
+                # symlink to a directory/device/fifo. is_file() misses these,
+                # and falling through to `return path` would hand shadps4 an
+                # unvalidated target via its own eboot.bin lookup.
+                return None
         except OSError:
             return None
         return path  # shadps4 appends eboot.bin to directory paths itself

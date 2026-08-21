@@ -1,5 +1,6 @@
 """shadPS4 ROM resolution, binary version selection, launch, and IPC-driven stop."""
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -24,6 +25,39 @@ def test_resolve_refuses_an_eboot_that_symlinks_out_of_the_rom_root(rom_root, tm
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "eboot.bin").symlink_to(secret)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+
+def test_resolve_accepts_an_eboot_that_symlinks_inside_the_rom_root(rom_root):
+    shared = rom_root / "SharedAssets"
+    shared.mkdir()
+    real_eboot = shared / "actual_eboot.bin"
+    real_eboot.write_bytes(b"game data")
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "eboot.bin").symlink_to(real_eboot)
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) == folder / "eboot.bin"
+
+
+def test_resolve_refuses_a_dangling_eboot_symlink(rom_root):
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "eboot.bin").symlink_to(rom_root / "does-not-exist")
+
+    assert shadps4.Shadps4().resolve_rom_file(folder) is None
+
+
+def test_resolve_refuses_an_eboot_that_symlinks_to_a_non_regular_file_outside_the_rom_root(
+    rom_root, tmp_path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.mkfifo(outside / "pipe")
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    (folder / "eboot.bin").symlink_to(outside / "pipe")
 
     assert shadps4.Shadps4().resolve_rom_file(folder) is None
 
@@ -156,7 +190,8 @@ class _FakeProc:
         self.wait_calls.append(timeout)
         if self.wait_exc is not None:
             raise self.wait_exc
-        return 0
+        self.exit_code = 0
+        return self.exit_code
 
 
 def test_launch_stops_first_then_spawns_with_ipc_enabled(monkeypatch, versions_dir, rom_root):
@@ -247,7 +282,7 @@ def test_stop_falls_back_to_sigterm_escalation_when_the_stdin_write_fails(monkey
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = shadps4.Shadps4()
     proc = _FakeProc()
-    proc.stdin.fail = True
+    proc.stdin = _FakeStdin(fail=True)
     emu._proc = proc
 
     emu.stop()
@@ -300,3 +335,21 @@ def test_ipc_send_returns_false_when_the_process_already_exited():
 
     assert emu._ipc_send("RUN") is False
     assert proc.stdin.written == []
+
+
+def test_ipc_send_returns_false_when_the_write_fails():
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.stdin = _FakeStdin(fail=True)
+    emu._proc = proc
+
+    assert emu._ipc_send("RUN") is False
+
+
+def test_ipc_send_returns_false_when_there_is_no_stdin():
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.stdin = None
+    emu._proc = proc
+
+    assert emu._ipc_send("RUN") is False
