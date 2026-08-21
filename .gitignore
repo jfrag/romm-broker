@@ -20,3 +20,5 @@ frontend/dist/
 
 # Subagent-driven-development scratch workspaces
 .superpowers/
+.claude
+docs/superpowers/
