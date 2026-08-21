@@ -446,7 +446,7 @@ class Pcsx2(Emulator):
             self.boot_failed = True
             log.warning(
                 "boot watchdog: VM never reached running state and pcsx2 is "
-                "still alive — treating as a boot failure"
+                "still alive, treating as a boot failure"
             )
         else:
             log.warning("boot watchdog: pcsx2 exited before the VM ever ran")

@@ -316,6 +316,6 @@ class Cemu(Emulator):
                 if p.is_file():
                     try:
                         os.utime(p, (now, now))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
         return {"state_saved": None, "state_slot": None, "state_file": None}

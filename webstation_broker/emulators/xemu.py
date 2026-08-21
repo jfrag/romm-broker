@@ -1,16 +1,16 @@
 """xemu launcher (original Xbox): FATX-level save sync on a raw HDD image.
 
 xemu keeps game saves inside the one hard-disk image its xemu.toml points at,
-and QEMU exposes that image only as an opaque block device — the previous
+and QEMU exposes that image only as an opaque block device: the previous
 design therefore shipped the entire qcow2 as the save artifact. This version
 syncs at the filesystem level instead: the image is kept in raw format so
-pyfatx (userspace libfatx bindings — no FUSE, no NBD, container-safe) can
+pyfatx (userspace libfatx bindings, no FUSE, no NBD, container-safe) can
 read and write the FATX E partition directly, and the save archive carries
 only the launched title's save data.
 
   image:  the first launch after deploy finds the configured qcow2 and
-          converts it in place with qemu-img — same filename, raw content,
-          sparse on disk — keeping the original alongside as <name>.backup.
+          converts it in place with qemu-img (same filename, raw content,
+          sparse on disk), keeping the original alongside as <name>.backup.
           A raw image cannot hold QEMU internal snapshots, so the save-state
           interface is gone; save data is the whole artifact now.
   launch: when the activate restored an archive, its files are written into
@@ -234,7 +234,7 @@ def _ensure_raw_image(image: Path) -> bool:
 
     Detection is the qcow2 magic, so this runs as a cheap no-op on every
     launch and converts exactly once. The raw content replaces the file under
-    its original name — xemu format-probes the content, so the .qcow2 name
+    its original name; xemu format-probes the content, so the .qcow2 name
     keeps working and the user's xemu.toml never needs to change. The
     original qcow2 (including any internal snapshots) is kept alongside as a
     backup. On any failure the qcow2 is left in place so the session can
@@ -408,7 +408,7 @@ def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
 
 def _reap_strays() -> None:
     """SIGKILL any xemu the broker does not own. An orphan busy-loops CPU
-    cores and — worst — keeps writing the HDD image the save hooks are about
+    cores and, worst, keeps writing the HDD image the save hooks are about
     to touch. Matched by full command line so other AppImage emulators
     (duckstation is also comm "AppRun") are left alone."""
     if subprocess.run(["pkill", "-9", "-f", XEMU_BIN], capture_output=True).returncode == 0:
@@ -504,7 +504,7 @@ class Xemu(Emulator):
     def _extract_saves(self) -> int:
         """Post-close hook: copy the title's save data out of the FATX E
         partition into the (already cleared) staging dir. The files carry
-        fresh mtimes, so the dump's launch-baseline filter ships them all —
+        fresh mtimes, so the dump's launch-baseline filter ships them all:
         the archive is the title's complete save set, not a delta."""
         fs = _open_fatx_e(self.hdd_image)
         if fs is None:
@@ -561,7 +561,7 @@ class Xemu(Emulator):
 
     def prepare_restore(self) -> None:
         """Before the archive is extracted: stop anything holding the image,
-        make sure it is raw, and empty the staging dir — leftovers from the
+        make sure it is raw, and empty the staging dir: leftovers from the
         previous session's dump would otherwise mix into the injection, and
         the newer-file guard could skip archive members over them."""
         self.stop()
