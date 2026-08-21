@@ -147,9 +147,10 @@ class _FakeProc:
         self.stdin = _FakeStdin()
         self.wait_calls: list[float | None] = []
         self.wait_exc: Exception | None = None
+        self.exit_code: int | None = None
 
     def poll(self):
-        return None
+        return self.exit_code
 
     def wait(self, timeout=None):
         self.wait_calls.append(timeout)
@@ -160,11 +161,12 @@ class _FakeProc:
 
 def test_launch_stops_first_then_spawns_with_ipc_enabled(monkeypatch, versions_dir, rom_root):
     binary = _make_release(versions_dir, "v0.17.0 - Only Release")
-    stopped = []
-    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: stopped.append(True))
+    order = []
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: order.append("stop"))
     spawned = {}
 
     def fake_spawn(self, cmd, env, stdin_pipe=False):
+        order.append("spawn")
         spawned["cmd"] = cmd
         spawned["env"] = env
         spawned["stdin_pipe"] = stdin_pipe
@@ -177,7 +179,7 @@ def test_launch_stops_first_then_spawns_with_ipc_enabled(monkeypatch, versions_d
 
     emu.launch(rom, resume_slot=None)
 
-    assert stopped == [True]
+    assert order == ["stop", "spawn"]
     assert spawned["cmd"] == [str(binary), "-f", "true", "-g", str(rom)]
     assert spawned["env"]["SHADPS4_ENABLE_IPC"] == "true"
     assert spawned["stdin_pipe"] is True
@@ -199,7 +201,7 @@ def test_launch_logs_and_ignores_a_resume_slot(monkeypatch, versions_dir, rom_ro
     with caplog.at_level("INFO"):
         emu.launch(rom, resume_slot=3)
 
-    assert "resume_slot" in caplog.text
+    assert "resume_slot 3 ignored" in caplog.text
     assert emu._proc.stdin.written == [b"RUN\n", b"START\n"]
 
 
@@ -274,3 +276,27 @@ def test_stop_is_a_no_op_when_nothing_is_running():
     emu.stop()
 
     assert emu._proc is None
+
+
+def test_stop_skips_ipc_and_escalates_when_the_process_already_exited(monkeypatch):
+    escalated = []
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.exit_code = 0
+    emu._proc = proc
+
+    emu.stop()
+
+    assert proc.stdin.written == []
+    assert escalated == [True]
+
+
+def test_ipc_send_returns_false_when_the_process_already_exited():
+    emu = shadps4.Shadps4()
+    proc = _FakeProc()
+    proc.exit_code = 0
+    emu._proc = proc
+
+    assert emu._ipc_send("RUN") is False
+    assert proc.stdin.written == []
