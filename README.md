@@ -54,14 +54,120 @@ frontend/                vite vanilla-JS room interface
 | `ROM_ROOT` | `/romm` | activate rejects rom paths outside this root |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | where exit writes save archives (always in dev mode, otherwise only when the upload fails) |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |
+| `BROKER_DISPLAY` | `:0` | X display emulators are launched onto |
+| `BROKER_WAYLAND_DISPLAY` | `wayland-0` | Wayland display emulators are launched onto |
 | `BROKER_PID_FILE` | `/config/broker-emulator.json` | where the running emulator's pid is recorded so a restarted broker can still kill it |
 | `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | path appended to the callback base URL when exit POSTs the save archive |
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | seconds allowed for the exit save upload |
 | `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | ceiling on one state file over the state-file routes; RomM caps the same transfer |
 | `BROKER_STATE_SCREENSHOT_MAX_BYTES` | `16777216` | ceiling on the frame served with a state; RomM caps the same transfer |
-| `PCSX2_STATE_SLOT` | `10` | the slot PCSX2 works in; 10 is its own autosave slot, which the per-emulator broker also used |
-| `RETROARCH_STATE_SLOT` | `0` | the slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file |
 | `BROKER_DEV_MODE` | unset | run from mounted source with uvicorn/vite hot reload; also disables the exit save upload (report-only) |
+
+### Emulator settings
+
+Each launcher reads its own variables at import time. Paths default to where
+the emulator itself keeps its data inside the container (`HOME` is `/config`,
+and `XDG_CONFIG_HOME` / `XDG_DATA_HOME` are honoured where the emulator
+honours them), so none of these need setting unless the image layout changes.
+Timings are in seconds.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `XDOTOOL_BIN` | `xdotool` | the xdotool used to send save/load hotkeys to Dolphin and PPSSPP |
+| `XDG_RUNTIME_DIR` | `/config/.XDG` | where PCSX2's PINE socket (`pcsx2.sock`) is looked for |
+| `DESKTOP_BIN` | `selkies-desktop` | what the `desktop` type launches |
+| `PCSX2_BIN` | `pcsx2-qt` | PCSX2 binary |
+| `PCSX2_STATE_SLOT` | `10` | the slot PCSX2 works in; 10 is its own autosave slot, which the per-emulator broker also used |
+| `PCSX2_SLOT1_CARD` | `romm-slot1` | name of the Slot 1 folder memory card the broker owns (a directory, no `.ps2` extension) |
+| `PCSX2_LOG_PATH` | `/config/pcsx2-qt.log` | where PCSX2's stdout/stderr is captured |
+| `SSTATE_DIR` | `/config/.config/PCSX2/sstates` | where PCSX2 writes save states |
+| `PINE_WAIT` | `20.0` | how long a save state has to land on disk after the PINE save command |
+| `RESUME_LOAD_WAIT` | `90.0` | how long a resume load waits for PCSX2 to report a running game |
+| `RESUME_LOAD_SETTLE` | `3.0` | how long the game has to be running before the resume load fires |
+| `DUCKSTATION_BIN` | `/opt/duckstation/AppRun` | DuckStation binary |
+| `DUCKSTATION_DATA_DIR` | `/config/.local/share/duckstation` | DuckStation's data root (`settings.ini`, `savestates/`, memory cards); `$XDG_CONFIG_HOME/duckstation` when that is set |
+| `DUCKSTATION_LOG_PATH` | `/config/duckstation.log` | where DuckStation's stdout/stderr is captured |
+| `DUCKSTATION_STOP_WAIT` | `30` | SIGTERM grace before SIGKILL; the graceful shutdown serialises the resume state |
+| `DOLPHIN_BIN` | `dolphin-emu` | Dolphin binary |
+| `DOLPHIN_USER_DIR` | `/config/.local/share/dolphin-emu` | Dolphin's user directory (`Config/`, `StateSaves/`, `GC/`, `Wii/`) |
+| `DOLPHIN_LOG_PATH` | `/config/dolphin.log` | where Dolphin's stdout/stderr is captured |
+| `DOLPHIN_STATE_SLOT` | `1` | the slot Dolphin works in (Shift+F<n> saves it, F<n> loads it) |
+| `DOLPHIN_STATE_WAIT` | `20.0` | how long a save state has to land on disk after the save hotkey |
+| `DOLPHIN_RESUME_LOAD_WAIT` | `90.0` | how long a resume load waits for the render window |
+| `DOLPHIN_RESUME_LOAD_SETTLE` | `5.0` | how long the window has to be up before the load hotkey is sent |
+| `DOLPHIN_VIDEO_BACKEND` | `OGL` | video backend pinned at launch; OGL over Vulkan because RADV on the integrated AMD parts has been the less reliable one |
+| `CEMU_BIN` | `Cemu` | Cemu binary |
+| `CEMU_CONFIG_DIR` | `/config/.config/Cemu` | Cemu's config directory (`settings.xml`, `controllerProfiles/`) |
+| `CEMU_DATA_DIR` | `/config/.local/share/Cemu` | Cemu's data directory |
+| `CEMU_MLC_DIR` | `<CEMU_DATA_DIR>/mlc01` | the mlc01 tree saves are dumped from; only passed to Cemu as `-m` when set explicitly |
+| `CEMU_LOG_PATH` | `/config/cemu.log` | where Cemu's stdout/stderr is captured |
+| `CEMU_PAD_NAME` | `Microsoft X-Box 360 pad` | the selkies virtual pad's name as the kernel xpad driver presents it, used to derive the SDL GUIDs the controller profile binds |
+| `CEMU_PAD_UUIDS` | unset | comma separated `<index>_<guid>` list to bind instead of the derived ones |
+| `CEMU_STOP_WAIT` | `5` | SIGTERM grace before SIGKILL (Cemu has no SIGTERM handler, so this only covers process-group teardown) |
+| `AZAHAR_BIN` | `/opt/azahar/AppRun` | Azahar binary |
+| `AZAHAR_USER_DIR` | `/config/.local/share/azahar-emu` | Azahar's user data directory (`sdmc/`, `nand/`) |
+| `AZAHAR_CONFIG_DIR` | `/config/.config/azahar-emu` | Azahar's config directory (`qt-config.ini`) |
+| `AZAHAR_LOG_PATH` | `/config/azahar.log` | where Azahar's stdout/stderr is captured |
+| `AZAHAR_STOP_WAIT` | `5` | SIGTERM grace before SIGKILL (no SIGTERM handler, process-group teardown only) |
+| `EDEN_BIN` | `eden` | Eden binary |
+| `EDEN_CONFIG_DIR` | `/config/.config/eden` | Eden's config directory (`qt-config.ini`) |
+| `EDEN_DATA_DIR` | `/config/.local/share/eden` | Eden's data directory (`nand/`, `sdmc/`) |
+| `EDEN_LOG_PATH` | `/config/eden.log` | where Eden's stdout/stderr is captured |
+| `EDEN_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL; a running game takes longer than the base 5 s to tear down |
+| `SHADPS4_BIN` | unset | explicit shadPS4 binary; skips the version search |
+| `SHADPS4_VERSIONS_DIR` | `/config/.local/share/shadPS4QtLauncher/versions` | where the Qt launcher downloads builds, one folder per release; `Pre-release/` trumps the newest semver folder |
+| `SHADPS4_BIN_NAME` | `Shadps4-sdl.AppImage` | the binary looked for inside each version folder |
+| `SHADPS4_DATA_DIR` | `/config/.local/share/shadPS4` | shadPS4's data directory (`home/1000/savedata/` is the save subtree) |
+| `SHADPS4_LOG_PATH` | `/config/shadps4.log` | where shadPS4's stdout/stderr is captured |
+| `SHADPS4_STOP_WAIT` | `20` | how long the IPC STOP gets to finish before SIGTERM |
+| `RETROARCH_BIN` | `retroarch` | RetroArch binary |
+| `RETROARCH_CONFIG_DIR` | `/config/.config/retroarch` | where the user's `retroarch.cfg` lives |
+| `RETROARCH_CORES_DIR` | `libretro_directory` from `retroarch.cfg`, else `/config/.local/share/RetroArch/cores` | where cores are loaded from and downloaded into |
+| `RETROARCH_SYSTEM_DIR` | `system_directory` from `retroarch.cfg`, else `/config/.local/share/RetroArch/system` | where cores look for BIOS files and firmware |
+| `RETROARCH_CORES_BASE_URL` | `https://buildbot.libretro.com/nightly/linux/x86_64/latest` | where missing cores are downloaded from |
+| `RETROARCH_CORE_URL_<CORE>` | unset | pins one core's download URL without editing `retroarch_platforms.json` |
+| `GITHUB_API_BASE` | `https://api.github.com` | API base for cores whose platform entry names a GitHub release source |
+| `GITHUB_TOKEN` | unset | bearer token for those GitHub release lookups |
+| `RETROARCH_CORE_DOWNLOAD_TIMEOUT` | `180` | timeout on a core download |
+| `RETROARCH_DATA_DIR` | `/config/.retroarch` | broker-managed `states/`, `saves/` and the `broker.cfg` layered on with `--appendconfig` |
+| `RETROARCH_LOG_PATH` | `/config/retroarch.log` | where RetroArch's stdout/stderr is captured |
+| `RETROARCH_JOYPAD_DRIVER` | `linuxraw` | joypad driver forced at launch; the udev driver sees the selkies pads as one device plugged eight times. Set empty to leave the user's own driver alone |
+| `RETROARCH_STATE_SLOT` | `0` | the slot RetroArch works in; 0 is its default, so the player's own load hotkey reaches the same file |
+| `RETROARCH_SLOT_STEP_DELAY` | `0.1` | pause between slot presses while parking the slot |
+| `RETROARCH_SLOT_HOME_STEPS` | `24` | slot-down presses to reach the -1 floor from anywhere the player could have cycled to |
+| `RETROARCH_STATE_CONFIRM_WAIT` | `10.0` | how long a save state has to land on disk after `SAVE_STATE_SLOT` |
+| `RETROARCH_LOAD_ACK_WAIT` | `10.0` | how long `LOAD_STATE_SLOT` has to be acknowledged |
+| `RETROARCH_RESUME_WAIT` | `90.0` | how long a resume load waits for the core to report a running game |
+| `RETROARCH_RESUME_SETTLE` | `3.0` | how long the game has to be running before the resume load fires |
+| `RETROARCH_SAVE_FILES_WAIT` | `10.0` | how long `SAVE_FILES` (flush SRAM to disk) has to answer at exit |
+| `RETROARCH_QUIT_WAIT` | `10.0` | how long `QUIT` gets to finish before SIGTERM |
+| `RETROARCH_QUIT_CONFIRM_GAP` | `0.1` | gap before the second `QUIT`, for configs that ask for confirmation |
+| `RETROARCH_DISC_TRAY_SETTLE` | `1.5` | pause after opening the tray before changing the disc index; an index change during the open is silently dropped |
+| `RETROARCH_DISC_STEP_DELAY` | `0.1` | pause between disc index presses |
+| `RETROARCH_DISC_SWAP_WAIT` | `90.0` | how long a swap waits for the core to report a running game |
+| `RETROARCH_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL once `QUIT` has been tried |
+| `RPCS3_BIN` | `/opt/rpcs3/AppRun` | RPCS3 binary |
+| `RPCS3_DATA_DIR` | `/config/.config/rpcs3` | RPCS3's data root (`config.yml`, `dev_hdd0/`) |
+| `RPCS3_LOG_PATH` | `/config/rpcs3.log` | where RPCS3's stdout/stderr is captured |
+| `RPCS3_INSTALL_TIMEOUT` | `1800` | how long a PKG install may run; decryption of a multi-GB package takes minutes |
+| `RPCS3_STOP_WAIT` | `2` | SIGTERM grace before SIGKILL (no SIGTERM handler, covers the AppImage wrapper teardown) |
+| `XEMU_BIN` | `/opt/xemu/AppRun` | xemu binary |
+| `XEMU_TOML` | `/config/.local/share/xemu/xemu/xemu.toml` | xemu's config, read for the HDD image path and pinned for the renderer |
+| `XEMU_HDD_IMAGE` | `/config/xemu/xbox_hdd.qcow2` | HDD image used only when `xemu.toml` has no usable `hdd_path` |
+| `XEMU_RENDERER` | `OPENGL` | renderer pinned in `xemu.toml` before each launch; `VULKAN` where the driver is known good, `KEEP` to leave the file alone |
+| `XEMU_SOFTWARE_GL` | unset | truthy renders xemu on the CPU (`LIBGL_ALWAYS_SOFTWARE` for xemu only); slow, for hosts where both GPU paths abort |
+| `XEMU_LOG_PATH` | `/config/xemu.log` | where xemu's stdout/stderr is captured |
+| `XEMU_STOP_WAIT` | `15` | SIGTERM grace before SIGKILL; QEMU's clean shutdown flushes the HDD image the save extraction reads |
+| `PPSSPP_BIN` | `PPSSPPQt` | PPSSPP binary |
+| `PPSSPP_CONFIG_DIR` | `/config/.config/ppsspp` | PPSSPP's config root; `PSP/` under it holds `SYSTEM/ppsspp.ini`, `SAVEDATA/` and `PPSSPP_STATE/` |
+| `PPSSPP_LOG_PATH` | `/config/ppsspp.log` | where PPSSPP's stdout/stderr is captured |
+| `PPSSPP_STATE_SLOT` | `1` | the slot PPSSPP works in |
+| `PPSSPP_STATE_WAIT` | `20.0` | how long a save state has to land on disk after the save hotkey |
+| `PPSSPP_RESUME_LOAD_WAIT` | `90.0` | how long a resume load waits for the game window |
+| `PPSSPP_RESUME_LOAD_SETTLE` | `5.0` | how long the window has to be up before the load hotkey is sent |
+| `XENIA_BIN` | `/opt/xenia/AppRun` | Xenia Edge binary |
+| `XENIA_DATA_DIR` | `/config/xenia` | Xenia's `--storage_root`: config, cache, the signed-in profile and the `content/` tree the save archive ships |
+| `XENIA_LOG_PATH` | `/config/xenia.log` | where Xenia's stdout/stderr is captured |
 
 ## Deployment
 
@@ -162,6 +268,21 @@ its stdin IPC (`SHADPS4_ENABLE_IPC=true`): RUN/START boot the game headlessly,
 and exit sends STOP (the SDL quit event) for a graceful teardown before the
 save delta is dumped. shadPS4 has no SIGTERM handler, so SIGTERM is only the
 fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
+
+`emulator: "xenia"` launches the Xenia Edge Xbox 360 emulator. Xenia has no
+save states (`resume_slot` is ignored) and no control interface of any kind
+(no IPC, socket or stdin protocol), so the game's own save data is the
+persistence and exit is a SIGTERM, which Xenia takes as a plain kill. That is
+safe because guest save writes go straight through to host files, so nothing
+is lost in a buffer. The save archive is the whole `content/` tree under
+`XENIA_DATA_DIR`: Xbox 360 save paths embed the profile XUID and the profile
+store lives in that same tree, so the two travel together and line up on a
+restore into a fresh container. `rom.path` may be an XISO (`.iso`), a
+bare `.xex`, an extracted dump (a folder holding `default.xex`), or an XBLA /
+Games on Demand title folder: the broker walks the console's own layout
+(`[Content/<XUID>/]<TITLE_ID>/000D0000|00007000/<package>`) and boots the STFS
+package it finds there, checked by magic so DLC, title updates and the `.data`
+payload beside a GoD package are passed over.
 
 ### Launch a game with save data
 
