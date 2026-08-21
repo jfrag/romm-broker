@@ -125,6 +125,14 @@ Controllers are pre-set up.
 
 Adjust graphics settings as desired and run a game to confirm.
 
+> **Special note:** Saving a state in RPCS3 always closes the game, and there
+> is no live in-game load either, so a single game launch captures a state
+> only on exit (via the same in-game save-state hotkey a player would use)
+> and resumes at the next launch by booting straight into that state rather
+> than loading it after the fact. RPCS3's IPC has no save/load-state opcode
+> at all, so it is used only to confirm a launch actually reached a running
+> game.
+
 ## Cemu
 
 Cemu needs everything set up by hand: controller profiles, audio, and

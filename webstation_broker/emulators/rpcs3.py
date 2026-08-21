@@ -1,13 +1,6 @@
-"""RPCS3 (PlayStation 3) launcher: config.yml patching, PKG install hook,
-and SIGTERM shutdown.
-
-RPCS3 has no runtime control channel and installs no signal handler; the
-whole lifecycle is CLI + config file. Save states exist only as GUI actions,
-so persistence is the game's own save data, which the emulator writes to
-plain host files the moment the game saves: cellSaveData saves under
-`dev_hdd0/home/00000001/savedata/`, cellGameData saves under
-`dev_hdd0/game/`. Nothing needs flushing at exit, which makes SIGTERM (a
-hard kill) a safe stop.
+"""RPCS3 (PlayStation 3) launcher: config.yml/ipc.yml patching, PKG install
+hook, PINE-driven boot verification, and save states via the emulator's own
+exit-on-save hotkey.
 
 Boot formats: decrypted .iso images and disc folder rips
 (PS3_GAME/USRDIR/EBOOT.BIN) boot directly. A .pkg is an installer, not an
@@ -16,6 +9,33 @@ image: the first activation installs it via `--headless --installpkg` into
 EBOOT.BIN. .rap/.edat licenses are plain files copied into
 `dev_hdd0/home/00000001/exdata/`.
 
+Save states: unlike PCSX2, RPCS3 has no live save/load. Pressing the
+save-state hotkey always terminates the process once the state is written,
+and loading one means booting RPCS3 pointed straight at the .SAVESTAT file
+(auto-detected by magic bytes, not extension) instead of a normal boot
+target, functionally the same as booting a ROM. So the broker follows
+DuckStation's model rather than PCSX2's: no live supports_states, a resume
+loads by choosing what to boot before the process starts, and a save
+happens by triggering the hotkey and waiting for the process to exit rather
+than by keeping it running. States are per-title, at
+DATA_DIR/savestates/<title_id>/, which is a sibling of dev_hdd0 rather than
+something under it; a symlink into dev_hdd0/savestates is what lets the
+existing save archive (keyed to dev_hdd0-relative paths) carry it without
+moving save_root out from under the subtrees already archived.
+
+PINE: RPCS3's IPC is PINE-compatible but only implements the protocol's
+generic opcodes (memory access, version/title/status queries) - there is no
+save/load-state opcode the way PCSX2's variant adds one. The broker uses it
+for nothing but boot verification (MsgStatus) and, for boots (a bare .iso)
+whose title id the on-disk layout cannot supply, a title id lookup (MsgID)
+once the game is confirmed running.
+
+RPCS3 installs no signal handler, so a plain kill (no state requested, or
+the hotkey/wait having failed) is a safe stop: whatever the game already
+wrote to its own save data is on disk the moment it's written. cellSaveData
+saves under `dev_hdd0/home/00000001/savedata/`, cellGameData saves under
+`dev_hdd0/game/`.
+
 The emulator is expected to be brought to a working state in desktop mode
 (firmware, GPU settings, controllers) before automated launching.
 """
@@ -23,9 +43,12 @@ The emulator is expected to be brought to a working state in desktop mode
 import logging
 import os
 import shutil
+import socket as _socket
+import struct
 import subprocess
 import time
 from pathlib import Path
+from threading import Thread
 
 from .base import Emulator, base_launch_env
 
@@ -45,10 +68,14 @@ def _default_data_dir() -> str:
 
 DATA_DIR = Path(os.environ.get("RPCS3_DATA_DIR", _default_data_dir()))
 CONFIG_PATH = DATA_DIR / "config.yml"
+IPC_PATH = DATA_DIR / "ipc.yml"
 DEV_HDD0 = DATA_DIR / "dev_hdd0"
 USER_HOME = DEV_HDD0 / "home" / "00000001"
 EXDATA_DIR = USER_HOME / "exdata"
 GAME_DIR = DEV_HDD0 / "game"
+# RPCS3 always writes states here, never under dev_hdd0; see _ensure_sstate_link.
+SSTATE_ROOT = DATA_DIR / "savestates"
+_SSTATE_LINK = DEV_HDD0 / "savestates"
 RPCS3_LOG_PATH = Path(os.environ.get("RPCS3_LOG_PATH", "/config/rpcs3.log"))
 # PKG decryption/extraction can run minutes for multi-GB packages.
 INSTALL_TIMEOUT = float(os.environ.get("RPCS3_INSTALL_TIMEOUT", "1800"))
@@ -63,7 +90,8 @@ _ROM_SEARCH_GLOBS = ("*", "*/*", "*/*/*")
 _EBOOT_EXTS = (".bin", ".self", ".elf")
 
 # config.yml values forced before every launch. RPCS3 fills missing keys
-# with defaults, so a partial file is a valid config.
+# with defaults, so a partial file is a valid config. Keyed ("section", key);
+# section "" is a flat top-level key, for ipc.yml which has no sections.
 _CONFIG_PATCHES: dict[tuple[str, str], str] = {
     ("Miscellaneous", "Automatically start games after boot"): "true",
     # Game quit (or XMB exit) ends the process, so alive() tracks the game.
@@ -72,6 +100,36 @@ _CONFIG_PATCHES: dict[tuple[str, str], str] = {
     # freeze the game invisibly.
     ("Miscellaneous", "Pause emulation on RPCS3 focus loss"): "false",
 }
+_IPC_PATCHES: dict[tuple[str, str], str] = {
+    # Off by default; the broker only ever reads status/title over it, so the
+    # port is left at whatever it already is (Linux uses the fixed
+    # $XDG_RUNTIME_DIR/rpcs3.sock path below regardless of the configured port).
+    ("", "IPC Server enabled"): "true",
+}
+
+XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
+PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "rpcs3.sock"
+
+# RPCS3's generic PINE opcodes (rpcs3/3rdparty/pine/pine_server.h). No
+# save/load-state opcode exists in this set, unlike PCSX2's PINE variant.
+_PINE_MSG_ID = 0x0C
+_PINE_MSG_STATUS = 0x0F
+
+BOOT_WAIT = float(os.environ.get("RPCS3_BOOT_WAIT", "90.0"))
+# A full state write (compressed PS3 RAM + VRAM) is a heavier write than the
+# other cores' states, so this is generous.
+STATE_WAIT = float(os.environ.get("RPCS3_STATE_WAIT", "60.0"))
+
+_XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
+# StartupWMClass in rpcs3/rpcs3.desktop. --no-gui suppresses the Qt main
+# window entirely, so the render window is the only one carrying this class
+# once a game is running - no title filtering needed the way PPSSPP's shared
+# menu/game class needs.
+_WINDOW_CLASS = "rpcs3"
+# Default binding for gw_savestate_1 (rpcs3qt/shortcut_settings.cpp). RPCS3
+# has four such shortcuts, but every one just writes a new auto-numbered
+# state (rpcs3/Emu/savestate_utils.cpp), so slot 1 is as good as any other.
+_SAVE_STATE_KEY = "ctrl+alt+1"
 
 
 def _rpcs3_bin() -> str:
@@ -111,18 +169,17 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
     return min(ranked)[3]
 
 
-def _patch_config() -> None:
-    """Force broker-required config.yml values before every launch.
-
-    config.yml is two-level YAML: unindented `Section:` headers over
-    2-space-indented `Key: value` lines. Patched line-wise so every other
-    setting the user tuned through the GUI survives untouched."""
+def _patch_yaml_file(path: Path, patches: dict[tuple[str, str], str], seed: str = "") -> None:
+    """Force ("section", "key") -> value into a two-level YAML file
+    (unindented "Section:" headers over 2-space "key: value" lines) before
+    every launch, or a flat "key: value" when section is "". RPCS3 fills
+    missing keys with defaults, so a partial file is a valid config."""
     try:
-        if not CONFIG_PATH.exists():
-            log.info("config.yml not found at %s, seeding one", CONFIG_PATH)
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text("")
-        lines = CONFIG_PATH.read_text().splitlines()
+        if not path.exists():
+            log.info("%s not found, seeding one", path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(seed)
+        lines = path.read_text().splitlines()
         section = ""
         applied: set[tuple[str, str]] = set()
         new_lines: list[str] = []
@@ -133,15 +190,16 @@ def _patch_config() -> None:
                 continue
             stripped = line.strip()
             matched = False
-            for (sec, key), val in _CONFIG_PATCHES.items():
+            for (sec, key), val in patches.items():
                 if section == sec and stripped.startswith(f"{key}:"):
-                    new_lines.append(f"  {key}: {val}")
+                    prefix = "  " if sec else ""
+                    new_lines.append(f"{prefix}{key}: {val}")
                     applied.add((sec, key))
                     matched = True
                     break
             if not matched:
                 new_lines.append(line)
-        missing = [(s, k, v) for (s, k), v in _CONFIG_PATCHES.items() if (s, k) not in applied]
+        missing = [(s, k, v) for (s, k), v in patches.items() if (s, k) not in applied]
         if missing:
             present = {
                 ln.strip()[:-1]
@@ -149,7 +207,9 @@ def _patch_config() -> None:
                 if ln and not ln[0].isspace() and ln.rstrip().endswith(":")
             }
             for sec, key, val in missing:
-                if sec in present:
+                if not sec:
+                    new_lines.append(f"{key}: {val}")
+                elif sec in present:
                     out: list[str] = []
                     inserted = False
                     for ln in new_lines:
@@ -161,11 +221,42 @@ def _patch_config() -> None:
                 else:
                     new_lines.extend([f"{sec}:", f"  {key}: {val}"])
                     present.add(sec)
-        tmp = CONFIG_PATH.with_suffix(".tmp")
+        tmp = path.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
-        tmp.replace(CONFIG_PATH)
+        tmp.replace(path)
     except Exception:
-        log.exception("config.yml patch failed, broker settings NOT applied")
+        log.exception("%s patch failed, broker settings NOT applied", path.name)
+
+
+def _patch_config() -> None:
+    _patch_yaml_file(CONFIG_PATH, _CONFIG_PATCHES)
+
+
+def _patch_ipc() -> None:
+    _patch_yaml_file(IPC_PATH, _IPC_PATCHES)
+
+
+def _ensure_sstate_link() -> None:
+    """Make dev_hdd0/savestates resolve to DATA_DIR/savestates.
+
+    RPCS3 always writes states to DATA_DIR/savestates, a sibling of
+    dev_hdd0 rather than something under it, but save_root has to stay
+    dev_hdd0 so the archive subtrees already in use (home/00000001/savedata,
+    game/) keep resolving as they always have. A symlink is what lets
+    "savestates" join save_subtrees without moving save_root."""
+    try:
+        SSTATE_ROOT.mkdir(parents=True, exist_ok=True)
+        DEV_HDD0.mkdir(parents=True, exist_ok=True)
+        if _SSTATE_LINK.is_symlink():
+            if _SSTATE_LINK.resolve() != SSTATE_ROOT.resolve():
+                _SSTATE_LINK.unlink()
+                _SSTATE_LINK.symlink_to(SSTATE_ROOT, target_is_directory=True)
+        elif not _SSTATE_LINK.exists():
+            _SSTATE_LINK.symlink_to(SSTATE_ROOT, target_is_directory=True)
+        # Anything else is a real directory already sitting there; leave it
+        # alone rather than deleting whatever put it there.
+    except OSError as exc:
+        log.warning("could not link savestates dir: %s", exc)
 
 
 def _run_headless(args: list[str], what: str) -> None:
@@ -302,6 +393,130 @@ def _install_pkgs(rom: Path) -> Path:
     return eboot
 
 
+def _state_dir_for(serial: str | None) -> Path | None:
+    return (SSTATE_ROOT / serial) if serial else None
+
+
+def _state_snapshot(serial: str | None) -> dict:
+    d = _state_dir_for(serial)
+    if d is None or not d.is_dir():
+        return {}
+    snap = {}
+    for pattern in ("*.SAVESTAT", "*.SAVESTAT.zst", "*.SAVESTAT.gz"):
+        for p in d.glob(pattern):
+            try:
+                st = p.stat()
+                snap[p] = (st.st_size, st.st_mtime)
+            except OSError:
+                pass
+    return snap
+
+
+def _newest_state(serial: str | None) -> Path | None:
+    """Newest state file for `serial`. RPCS3 already isolates every title
+    under its own savestates/<title_id>/ dir, so newest-by-mtime in there is
+    always this title's own most recent capture."""
+    best: tuple[float, Path] | None = None
+    for p, (_size, mtime) in _state_snapshot(serial).items():
+        if best is None or mtime > best[0]:
+            best = (mtime, p)
+    return best[1] if best is not None else None
+
+
+def _changed_state(serial: str | None, before: dict) -> Path | None:
+    for p, cur in _state_snapshot(serial).items():
+        if before.get(p) != cur:
+            return p
+    return None
+
+
+def _wait_for_state_write(serial: str | None, before: dict, deadline: float) -> Path | None:
+    """Poll the title's savestate dir until a new/changed file's size holds
+    steady for STABLE_SECS, or the deadline passes.
+
+    RPCS3 exiting is not itself proof the write finished: the hotkey ends
+    the process once the state is captured, but nothing here can tell
+    whether compression to disk still trails that. Polling the file's own
+    size is the only confirmation there is, the same as every other
+    emulator's write-confirmation loop."""
+    STABLE_SECS = 0.5
+    POLL_SECS = 0.2
+    target: Path | None = None
+    last_size: int | None = None
+    stable_since: float | None = None
+    while time.monotonic() < deadline:
+        p = _changed_state(serial, before)
+        if p is None:
+            time.sleep(POLL_SECS)
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            time.sleep(POLL_SECS)
+            continue
+        if target != p:
+            target, last_size, stable_since = p, size, time.monotonic()
+        elif size != last_size:
+            last_size, stable_since = size, time.monotonic()
+        elif stable_since is not None and time.monotonic() - stable_since >= STABLE_SECS:
+            log.info("save state write complete: %s (%d bytes)", target.name, last_size)
+            return target
+        time.sleep(POLL_SECS)
+    return target
+
+
+def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> bytes | None:
+    """One PINE request. Wire format (LE): u32 total size, u8 opcode, payload;
+    reply is u32 size, u8 result (0 = OK), payload. Same wire format PCSX2's
+    PINE variant uses; RPCS3 just implements a smaller opcode set (no
+    save/load-state) on top of it."""
+    packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(PINE_SOCKET))
+            sock.sendall(packet)
+            header = _pine_recv_exact(sock, 5)
+            if header is None:
+                return None
+            size, result = struct.unpack("<IB", header)
+            body = b""
+            if size > 5:
+                body = _pine_recv_exact(sock, size - 5) or b""
+            if result != 0:
+                log.warning("PINE opcode 0x%02X rejected (result %d)", opcode, result)
+                return None
+            return body
+    except OSError as exc:
+        log.warning("PINE request failed on %s (opcode 0x%02X): %s", PINE_SOCKET, opcode, exc)
+        return None
+
+
+def _pine_status() -> int | None:
+    """0 running, 1 paused, 2 shutdown, None if IPC is down or disabled."""
+    body = _pine_request(_PINE_MSG_STATUS, timeout=2.0)
+    if body is None or len(body) < 4:
+        return None
+    return struct.unpack("<I", body[:4])[0]
+
+
+def _pine_title_id() -> str | None:
+    body = _pine_request(_PINE_MSG_ID, timeout=2.0)
+    if not body:
+        return None
+    return body.split(b"\0", 1)[0].decode("ascii", "replace") or None
+
+
 class Rpcs3(Emulator):
     name = "rpcs3"
     display_name = "RPCS3"
@@ -316,9 +531,22 @@ class Rpcs3(Emulator):
     # teardown of the AppImage wrapper.
     term_timeout = float(os.environ.get("RPCS3_STOP_WAIT", "2"))
 
+    def __init__(self):
+        super().__init__()
+        self._launch_seq = 0
+
+    def clear_working_slot(self) -> None:
+        """RPCS3 has no fixed slot to clear, but activate() calls this before
+        it ever reads save_subtrees to restore an archive, which makes it the
+        one place that is safe to create the savestates symlink: it runs on
+        every activate, but never during a bare construction (registry
+        sweeps build every emulator against real, unredirected paths)."""
+        _ensure_sstate_link()
+
     @property
     def save_subtrees(self) -> tuple[str, ...]:
-        """cellSaveData saves plus the cellGameData save dirs under game/.
+        """cellSaveData saves, save states, plus the cellGameData save dirs
+        under game/.
 
         game/ mixes save data with installed PKG titles and RPCS3's ＄locks
         dir, so the dump enumerates only the dirs without a bootable
@@ -326,8 +554,8 @@ class Rpcs3(Emulator):
         but previously dumped save dirs, and those dirs don't exist on disk
         yet, so the whole game/ prefix is declared to let them through."""
         if self._restoring:
-            return ("home/00000001/savedata", "game")
-        subtrees = ["home/00000001/savedata"]
+            return ("home/00000001/savedata", "game", "savestates")
+        subtrees = ["home/00000001/savedata", "savestates"]
         subtrees += [f"game/{d.name}" for d in _gamedata_dirs()]
         return tuple(subtrees)
 
@@ -348,23 +576,61 @@ class Rpcs3(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
+    def _xdotool(self, *args: str) -> str | None:
+        """Run xdotool, returning its stdout, or None if it failed."""
+        try:
+            result = subprocess.run(
+                [_XDOTOOL, *args],
+                env=base_launch_env(),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            log.warning("xdotool %s failed: %s", " ".join(args), exc)
+            return None
+        if result.returncode != 0:
+            log.warning("xdotool %s: %s", " ".join(args), result.stderr.strip())
+            return None
+        return result.stdout
+
+    def _game_window(self) -> str | None:
+        out = self._xdotool("search", "--class", _WINDOW_CLASS)
+        if not out:
+            log.warning("no rpcs3 window found")
+            return None
+        return out.split()[0]
+
+    def _send_key(self, key: str) -> bool:
+        """Focus the render window and send `key` through XTEST.
+
+        Activating first is what makes this survive the player clicking back
+        into the page: XTEST delivers to whatever holds focus, so a key sent
+        at an unfocused RPCS3 goes to the desktop instead."""
+        win_id = self._game_window()
+        if win_id is None:
+            return False
+        if self._xdotool("windowactivate", "--sync", win_id) is None:
+            return False
+        return self._xdotool("key", "--clearmodifiers", key) is not None
+
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
         self._restoring = False
-        if resume_slot is not None:
-            log.info(
-                "rpcs3 save states are unsupported, resume_slot %s ignored "
-                "(game resumes from its own save data)",
-                resume_slot,
-            )
+        self.boot_failed = False
+        self._launch_seq += 1
+        seq = self._launch_seq
+
         _patch_config()
+        _patch_ipc()
         boot = _install_pkgs(rom_path) if rom_path.suffix.lower() == ".pkg" else rom_path
 
-        # Save dirs are named with the title serial as prefix; remember it so
-        # the exit dump can be scoped to this title. Installed titles boot
-        # from game/<serial>/USRDIR/EBOOT.BIN, disc rips carry a PARAM.SFO
-        # next to USRDIR. An .iso has no readable serial, so those sessions
-        # fall back to shipping the save dirs written while the game ran.
+        # Save dirs (and now states) are named with the title serial as
+        # prefix; remember it so the exit dump can be scoped to this title.
+        # Installed titles boot from game/<serial>/USRDIR/EBOOT.BIN, disc
+        # rips carry a PARAM.SFO next to USRDIR. An .iso has no readable
+        # serial from the path alone; the boot watchdog fills it in from
+        # PINE once the game is confirmed running.
         if boot.name.upper().startswith("EBOOT"):
             if boot.is_relative_to(GAME_DIR):
                 self._session_serial = boot.parent.parent.name
@@ -372,16 +638,89 @@ class Rpcs3(Emulator):
                 self._session_serial = _sfo_title_id(boot.parent.parent / "PARAM.SFO")
         else:
             self._session_serial = None
-        self._session_start = time.time()
 
+        # RPCS3 has no boot-time state-load flag of its own, but it detects a
+        # savestate by magic bytes regardless of what is passed as the boot
+        # target, so pointing it at the state file IS the boot-time load.
+        target = boot
+        if resume_slot is not None:
+            if self._session_serial is None:
+                log.warning(
+                    "resume requested but %s has no known title id, booting fresh",
+                    rom_path.name,
+                )
+            else:
+                state = _newest_state(self._session_serial)
+                if state is None:
+                    log.warning(
+                        "resume requested but no savestate in %s",
+                        SSTATE_ROOT / self._session_serial,
+                    )
+                else:
+                    target = state
+
+        self._session_start = time.time()
         log.info(
             "launching rpcs3 (rom=%s, boot=%s, serial=%s)",
-            rom_path, boot, self._session_serial,
+            rom_path, target, self._session_serial,
         )
-        self._spawn([_rpcs3_bin(), "--no-gui", "--fullscreen", str(boot)], _launch_env())
+        self._spawn([_rpcs3_bin(), "--no-gui", "--fullscreen", str(target)], _launch_env())
+        Thread(target=self._boot_watchdog, args=(seq,), daemon=True).start()
+
+    def _boot_watchdog(self, seq: int) -> None:
+        """Confirm the freshly launched game reaches a running state via
+        PINE, and opportunistically resolve the title id via MsgID for boots
+        that had no serial from the file path alone (a bare .iso).
+
+        A process still alive when the deadline passes without ever
+        reporting running is the boot-error-dialog case: RPCS3 does not exit
+        on its own, so nothing else in the broker would ever notice."""
+        deadline = time.monotonic() + BOOT_WAIT
+        while time.monotonic() < deadline:
+            if self._launch_seq != seq:
+                log.info("boot watchdog: launch superseded, abandoning")
+                return
+            if _pine_status() == 0:
+                if not self._session_serial:
+                    title = _pine_title_id()
+                    if title:
+                        self._session_serial = title
+                        log.info("boot watchdog: resolved title id %s via PINE", title)
+                return
+            time.sleep(1.0)
+
+        if self._launch_seq != seq:
+            return
+        if self.alive():
+            self.boot_failed = True
+            log.warning(
+                "boot watchdog: rpcs3 never reported a running state and is "
+                "still alive, treating as a boot failure"
+            )
+        else:
+            log.warning("boot watchdog: rpcs3 exited before ever reporting running")
 
     def save_and_exit(self, slot: int | None) -> dict:
-        self.stop()
+        saved = False
+        state_file = None
+        if slot is not None and self.alive():
+            if not self._session_serial:
+                log.warning("save-and-exit: no known title id, cannot locate a state to save")
+            else:
+                before = _state_snapshot(self._session_serial)
+                if not self._send_key(_SAVE_STATE_KEY):
+                    log.warning("save-and-exit: could not send the save-state hotkey")
+                else:
+                    p = _wait_for_state_write(
+                        self._session_serial, before, time.monotonic() + STATE_WAIT
+                    )
+                    if p is not None:
+                        saved = True
+                        st = p.stat()
+                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                    else:
+                        log.warning("save-and-exit: no new state file appeared")
+
         # The dump ships files newer than the session baseline. A save is a
         # directory tree the game rewrites only partially, and sibling dirs
         # belong to other titles, so refresh every mtime in this title's
@@ -394,7 +733,14 @@ class Rpcs3(Emulator):
                         os.utime(p, (now, now))
                     except OSError:
                         pass
-        return {"state_saved": None, "state_slot": None, "state_file": None}
+
+        self.stop()
+        return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
+
+    def stop(self) -> None:
+        # Invalidate any in-flight boot watchdog before the kill.
+        self._launch_seq += 1
+        super().stop()
 
     def _session_save_dirs(self) -> list[Path]:
         """This title's save dirs: name prefixed with the session serial, or
