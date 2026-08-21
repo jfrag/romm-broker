@@ -124,3 +124,100 @@ def test_a_versions_dir_with_no_usable_binary_resolves_to_nothing(versions_dir):
     (versions_dir / "v0.1.0 - Empty").mkdir()
 
     assert shadps4._resolve_binary() is None
+
+
+class _FakeStdin:
+    def __init__(self, fail: bool = False):
+        self.written: list[bytes] = []
+        self.flush_count = 0
+        self.fail = fail
+
+    def write(self, data: bytes) -> None:
+        if self.fail:
+            raise BrokenPipeError()
+        self.written.append(data)
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+
+class _FakeProc:
+    def __init__(self, pid: int = 4242):
+        self.pid = pid
+        self.stdin = _FakeStdin()
+        self.wait_calls: list[float | None] = []
+        self.wait_exc: Exception | None = None
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.wait_calls.append(timeout)
+        if self.wait_exc is not None:
+            raise self.wait_exc
+        return 0
+
+
+def test_launch_stops_first_then_spawns_with_ipc_enabled(monkeypatch, versions_dir, rom_root):
+    binary = _make_release(versions_dir, "v0.17.0 - Only Release")
+    stopped = []
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: stopped.append(True))
+    spawned = {}
+
+    def fake_spawn(self, cmd, env, stdin_pipe=False):
+        spawned["cmd"] = cmd
+        spawned["env"] = env
+        spawned["stdin_pipe"] = stdin_pipe
+        self._proc = _FakeProc()
+
+    monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
+    rom = rom_root / "game.zar"
+    rom.write_bytes(b"")
+    emu = shadps4.Shadps4()
+
+    emu.launch(rom, resume_slot=None)
+
+    assert stopped == [True]
+    assert spawned["cmd"] == [str(binary), "-f", "true", "-g", str(rom)]
+    assert spawned["env"]["SHADPS4_ENABLE_IPC"] == "true"
+    assert spawned["stdin_pipe"] is True
+    assert emu._proc.stdin.written == [b"RUN\n", b"START\n"]
+
+
+def test_launch_logs_and_ignores_a_resume_slot(monkeypatch, versions_dir, rom_root, caplog):
+    _make_release(versions_dir, "v0.17.0 - Only Release")
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+
+    def fake_spawn(self, cmd, env, stdin_pipe=False):
+        self._proc = _FakeProc()
+
+    monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
+    rom = rom_root / "game.zar"
+    rom.write_bytes(b"")
+    emu = shadps4.Shadps4()
+
+    with caplog.at_level("INFO"):
+        emu.launch(rom, resume_slot=3)
+
+    assert "resume_slot" in caplog.text
+    assert emu._proc.stdin.written == [b"RUN\n", b"START\n"]
+
+
+def test_launch_raises_when_no_binary_is_available(monkeypatch, tmp_path, rom_root):
+    monkeypatch.setattr(shadps4, "VERSIONS_DIR", tmp_path / "does-not-exist")
+    monkeypatch.delenv("SHADPS4_BIN", raising=False)
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    spawned = []
+    monkeypatch.setattr(
+        shadps4.Shadps4,
+        "_spawn",
+        lambda self, cmd, env, stdin_pipe=False: spawned.append(cmd),
+    )
+    rom = rom_root / "game.zar"
+    rom.write_bytes(b"")
+    emu = shadps4.Shadps4()
+
+    with pytest.raises(RuntimeError):
+        emu.launch(rom, resume_slot=None)
+
+    assert spawned == []
