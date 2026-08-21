@@ -55,3 +55,72 @@ def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(rom_
     missing = rom_root / "nope"
 
     assert shadps4.Shadps4().resolve_rom_file(missing) is None
+
+
+@pytest.fixture
+def versions_dir(monkeypatch, tmp_path):
+    d = tmp_path / "versions"
+    d.mkdir()
+    monkeypatch.setattr(shadps4, "VERSIONS_DIR", d)
+    monkeypatch.delenv("SHADPS4_BIN", raising=False)
+    return d
+
+
+def _make_release(base: Path, folder_name: str, bin_name: str = "Shadps4-sdl.AppImage") -> Path:
+    folder = base / folder_name
+    folder.mkdir(parents=True)
+    binary = folder / bin_name
+    binary.write_bytes(b"")
+    return binary
+
+
+def test_an_explicit_override_wins_over_everything(versions_dir, monkeypatch):
+    _make_release(versions_dir, "v0.17.0 - Garbage Collector's Edition")
+    monkeypatch.setenv("SHADPS4_BIN", "/opt/custom/shadps4")
+
+    assert shadps4._resolve_binary() == Path("/opt/custom/shadps4")
+
+
+def test_the_pre_release_folder_beats_every_numbered_release(versions_dir):
+    _make_release(versions_dir, "v99.0.0 - Newest Looking Number")
+    pre = _make_release(versions_dir, "Pre-release")
+
+    assert shadps4._resolve_binary() == pre
+
+
+def test_the_highest_semver_release_wins_by_number_not_by_string(versions_dir):
+    _make_release(versions_dir, "v0.9.9 - A")
+    newest = _make_release(versions_dir, "v0.9.10 - B")
+
+    assert shadps4._resolve_binary() == newest
+
+
+def test_release_folder_precedence_across_more_than_two_versions(versions_dir):
+    _make_release(versions_dir, "v0.9.9 - A")
+    _make_release(versions_dir, "v0.9.10 - B")
+    newest = _make_release(
+        versions_dir, "v0.17.0 - Garbage Collector's Edition - 2026-07-30"
+    )
+
+    assert shadps4._resolve_binary() == newest
+
+
+def test_a_folder_whose_name_does_not_parse_as_a_version_is_skipped_not_fatal(versions_dir):
+    (versions_dir / "notes").mkdir()
+    (versions_dir / "notes" / "Shadps4-sdl.AppImage").write_bytes(b"")
+    newest = _make_release(versions_dir, "v0.5.0 - Only Real Release")
+
+    assert shadps4._resolve_binary() == newest
+
+
+def test_a_missing_versions_dir_resolves_to_nothing(monkeypatch, tmp_path):
+    monkeypatch.setattr(shadps4, "VERSIONS_DIR", tmp_path / "does-not-exist")
+    monkeypatch.delenv("SHADPS4_BIN", raising=False)
+
+    assert shadps4._resolve_binary() is None
+
+
+def test_a_versions_dir_with_no_usable_binary_resolves_to_nothing(versions_dir):
+    (versions_dir / "v0.1.0 - Empty").mkdir()
+
+    assert shadps4._resolve_binary() is None
