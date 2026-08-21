@@ -184,8 +184,19 @@ class Xenia(Emulator):
             return None
         # An extracted dump boots via its executable.
         default_xex = path / "default.xex"
-        if default_xex.is_file():
-            return default_xex
+        try:
+            if default_xex.is_file():
+                if default_xex.resolve().is_relative_to(ROM_ROOT):
+                    return default_xex
+                return None  # symlink escapes ROM_ROOT
+            if default_xex.exists() or default_xex.is_symlink():
+                # present but not a regular file: dangling symlink, or a
+                # symlink to a directory/device/fifo. is_file() misses these,
+                # and falling through to the candidate search would silently
+                # boot something else instead of the dump's own executable.
+                return None
+        except OSError:
+            return None
         candidates: list[Path] = []
         for pattern in _ROM_SEARCH_GLOBS:
             try:
@@ -201,7 +212,7 @@ class Xenia(Emulator):
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
         self.stop()
-        if resume_slot:
+        if resume_slot is not None:
             log.info(
                 "xenia has no save states, resume_slot %s ignored "
                 "(game resumes from its own save data)",

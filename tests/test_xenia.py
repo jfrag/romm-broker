@@ -1,5 +1,6 @@
 """Xenia ROM resolution and the launch command line."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,47 @@ def test_resolve_boots_an_extracted_dump_from_its_default_xex(rom_root):
     xex = _touch(game / "default.xex")
 
     assert xenia.Xenia().resolve_rom_file(game) == xex
+
+
+def test_resolve_accepts_a_default_xex_that_symlinks_inside_the_rom_root(rom_root):
+    shared = rom_root / "SharedAssets"
+    real_xex = _touch(shared / "actual.xex")
+    game = rom_root / "game"
+    game.mkdir()
+    (game / "default.xex").symlink_to(real_xex)
+
+    assert xenia.Xenia().resolve_rom_file(game) == game / "default.xex"
+
+
+def test_resolve_refuses_a_default_xex_that_symlinks_outside_the_rom_root(rom_root, tmp_path):
+    outside = tmp_path / "outside.xex"
+    outside.write_bytes(b"xex")
+    game = rom_root / "game"
+    game.mkdir()
+    (game / "default.xex").symlink_to(outside)
+
+    assert xenia.Xenia().resolve_rom_file(game) is None
+
+
+def test_resolve_refuses_a_dangling_default_xex_symlink(rom_root):
+    game = rom_root / "game"
+    game.mkdir()
+    (game / "default.xex").symlink_to(rom_root / "does-not-exist")
+
+    assert xenia.Xenia().resolve_rom_file(game) is None
+
+
+def test_resolve_refuses_a_default_xex_symlink_to_a_non_regular_file_outside_the_rom_root(
+    rom_root, tmp_path
+):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.mkfifo(outside / "pipe")
+    game = rom_root / "game"
+    game.mkdir()
+    (game / "default.xex").symlink_to(outside / "pipe")
+
+    assert xenia.Xenia().resolve_rom_file(game) is None
 
 
 def test_resolve_prefers_an_iso_over_a_stray_xex(rom_root):
