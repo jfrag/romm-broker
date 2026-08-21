@@ -113,8 +113,14 @@ class Shadps4(Emulator):
         if not path.is_dir():
             return None
         eboot = path / "eboot.bin"
-        if eboot.is_file():
-            return eboot
+        try:
+            if eboot.is_file():
+                if eboot.resolve().is_relative_to(ROM_ROOT):
+                    return eboot
+                else:
+                    return None  # Refuse symlink escapes
+        except OSError:
+            return None
         return path  # shadps4 appends eboot.bin to directory paths itself
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
