@@ -223,7 +223,7 @@ class Azahar(Emulator):
                     if not high.is_dir() or not _HEX8_RE.match(high.name):
                         continue
                     for title in sorted(high.iterdir()):
-                        if not title.is_dir():
+                        if not title.is_dir() or not _HEX8_RE.match(title.name):
                             continue
                         try:
                             if any(
@@ -245,10 +245,13 @@ class Azahar(Emulator):
         # titles' saves stay filtered out.
         now = time.time()
         for d in self._modified_title_saves():
-            for p in d.rglob("*"):
-                if p.is_file():
-                    try:
-                        os.utime(p, (now, now))
-                    except OSError as exc:
-                        log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
+            try:
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        try:
+                            os.utime(p, (now, now))
+                        except OSError as exc:
+                            log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
+            except OSError as exc:
+                log.warning("could not walk %s, save dump may be incomplete: %s", d, exc)
         return {"state_saved": None, "state_slot": None, "state_file": None}
