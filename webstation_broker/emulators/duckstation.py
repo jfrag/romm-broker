@@ -18,6 +18,7 @@ CLI and settings:
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 
 from .base import Emulator, base_launch_env
@@ -179,10 +180,13 @@ def _newest_resume_state() -> Path | None:
 
 
 def _changed_resume_state(before: dict) -> Path | None:
+    best: tuple[float, Path] | None = None
     for p, cur in _resume_snapshot().items():
         if before.get(p) != cur:
-            return p
-    return None
+            mtime = cur[1]
+            if best is None or mtime > best[0]:
+                best = (mtime, p)
+    return best[1] if best is not None else None
 
 
 class Duckstation(Emulator):
@@ -195,6 +199,27 @@ class Duckstation(Emulator):
     # SIGTERM's graceful shutdown serializes the resume state before exiting;
     # give it room before the SIGKILL escalation discards it.
     term_timeout = float(os.environ.get("DUCKSTATION_STOP_WAIT", "30"))
+
+    def clear_working_slot(self) -> None:
+        """Drop every resume state left in SSTATE_DIR before a restore.
+
+        Unlike RPCS3's per-title savestates/<serial>/ layout, DuckStation
+        writes every title's <serial>_resume.sav into one flat directory, so a
+        leftover from an earlier game or session in this container is
+        otherwise indistinguishable from a state the archive is about to
+        restore: _newest_resume_state() picks whichever file is newest with no
+        serial filter at all. Anything still here belongs to a session that
+        already exited, so dropping it all is what keeps a stale, unrelated
+        resume state from being served as the new game's own; the same
+        trade-off RPCS3's clear_working_slot makes."""
+        if not SSTATE_DIR.is_dir():
+            return
+        for stale in SSTATE_DIR.glob("*_resume.sav"):
+            try:
+                stale.unlink()
+                log.info("cleared stale resume state %s", stale.name)
+            except OSError as exc:
+                log.warning("could not clear stale resume state %s: %s", stale.name, exc)
 
     def resolve_rom_file(self, path: Path) -> Path | None:
         if path.is_file():
@@ -229,16 +254,38 @@ class Duckstation(Emulator):
         state_file = None
         was_alive = self.alive()
         before = _resume_snapshot()
+        proc = self._proc
         self.stop()
-        # DuckStation writes its resume state on the way out whatever we ask
-        # for, so an exit with no state requested just leaves it unreported and
-        # the emulator resumes from it locally as usual.
+        # SaveStateOnExit is forced true in _patch_ini, so DuckStation writes
+        # its resume state on every graceful shutdown regardless of `slot`;
+        # an exit with no state requested only skips reporting it here, the
+        # file still lands in the save archive dump since it is newer than
+        # the session baseline. We can only trust that write if SIGTERM was
+        # enough: a SIGKILL escalation (term_timeout exceeded), or stop()
+        # never confirming the process died at all, can cut the write off
+        # mid-flight. A killed process's changed file is discarded outright
+        # rather than just left unreported, since the archive dump sweeps up
+        # anything with a fresh mtime whether or not this method reports it.
+        killed = proc is None or proc.returncode is None or proc.returncode == -signal.SIGKILL
         if was_alive and slot is not None:
             p = _changed_resume_state(before)
-            saved = p is not None
-            if p is not None:
-                st = p.stat()
-                state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
-            else:
+            if killed:
+                log.warning(
+                    "duckstation had to be force-killed, discarding possibly-incomplete resume state"
+                )
+                if p is not None:
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        log.warning("could not discard incomplete resume state %s: %s", p, exc)
+            elif p is None:
                 log.warning("no resume state written during shutdown")
+            else:
+                try:
+                    st = p.stat()
+                except OSError as exc:
+                    log.warning("could not stat resume state %s: %s", p, exc)
+                else:
+                    saved = True
+                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
