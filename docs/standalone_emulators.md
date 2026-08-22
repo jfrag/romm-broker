@@ -206,3 +206,24 @@ it back.
 > game already wrote to its own save survives. The RetroArch core supports both
 > save states and a proper exit. Use standalone Azahar when you want its own
 > interface, and pick `retroarch` otherwise.
+
+## Flycast
+
+Flycast needs the Dreamcast BIOS pair, `dc_boot.bin` and `dc_flash.bin`.
+Upload them and place them in `/config/.local/share/flycast`, the same flat
+directory VMU saves and save states live in.
+
+Controllers are pre-configured. Set your graphics and audio preferences from
+the desktop and test a game.
+
+> **Special note:** A RetroArch core also covers Dreamcast (`dc`
+> defaults to it), for anyone who prefers RetroArch's shared save-state UI and
+> hotkeys. Standalone Flycast has neither a control socket nor a SIGTERM
+> handler, so the only way the broker asks it to shut down cleanly is an
+> Alt+F4 keypress into its window, which is also the only moment it will
+> write a save state. That means, like DuckStation, there is no mid-session
+> save/load: a launch resumes
+> from whatever state was written on the previous clean exit, and the current
+> session's state is written once, on exit. Use standalone Flycast for its own
+> interface and settings, and pick `retroarch` if you'd rather manage
+> Dreamcast alongside your other RetroArch cores.

@@ -168,6 +168,10 @@ Timings are in seconds.
 | `XENIA_BIN` | `/opt/xenia/AppRun` | Xenia Edge binary |
 | `XENIA_DATA_DIR` | `/config/xenia` | Xenia's `--storage_root`: config, cache, the signed-in profile and the `content/` tree the save archive ships |
 | `XENIA_LOG_PATH` | `/config/xenia.log` | where Xenia's stdout/stderr is captured |
+| `FLYCAST_BIN` | `/opt/flycast/AppRun` | Flycast binary |
+| `FLYCAST_DATA_DIR` | `/config/.local/share/flycast` | Flycast's data root (VMU saves, save state, BIOS); `$XDG_DATA_HOME/flycast` when that is set |
+| `FLYCAST_LOG_PATH` | `/config/flycast.log` | where Flycast's stdout/stderr is captured |
+| `FLYCAST_STOP_WAIT` | `20` | how long an Alt+F4 close request gets to reach `dc_exit()` (and write the resume state) before SIGTERM |
 
 ## Deployment
 
@@ -283,6 +287,28 @@ Games on Demand title folder: the broker walks the console's own layout
 (`[Content/<XUID>/]<TITLE_ID>/000D0000|00007000/<package>`) and boots the STFS
 package it finds there, checked by magic so DLC, title updates and the `.data`
 payload beside a GoD package are passed over.
+
+`emulator: "flycast"` launches the Flycast Dreamcast emulator; `emulator:
+"retroarch"` with `rom.platform: "dc"` covers the same platform through its
+own core for anyone who would rather manage Dreamcast alongside their other
+RetroArch games. Standalone Flycast has neither a control socket nor a
+SIGTERM handler, so like DuckStation there is no mid-session save or load:
+resume is boot-time only, driven by transient `-config` overrides
+(`Dreamcast.AutoLoadState`/`AutoSaveState`, both under the literal section
+`config`, not `Dreamcast`) rather than an edited ini. The only graceful exit
+path is an Alt+F4 keypress into the focused Flycast window (the container's
+compositor treats that as a close request), which the broker sends through
+xdotool; that is also the only point `Dreamcast.AutoSaveState` gets written,
+so exit asks for the close and only falls back to SIGTERM if it doesn't land
+within `FLYCAST_STOP_WAIT` (default 20 s). The save state itself is one
+deterministic file, `<rom-basename>.state` in `FLYCAST_DATA_DIR`, so unlike
+DuckStation the broker never has to guess which file in the directory is the
+current game's at launch time; a restore still clears every leftover
+`*.state` first, since the name is only unambiguous once the rom is known and
+that happens after the clear, not before it. `rom.path` may be a disc image
+(`.chd`, `.gdi`, `.cdi`, `.cue`) or a homebrew `.elf`; VMU saves and the save
+state both live loose in `FLYCAST_DATA_DIR`, which ships as a single save
+subtree.
 
 ### Launch a game with save data
 
