@@ -19,20 +19,40 @@ from .saves import SAVE_FILE_MAX_BYTES
 
 log = logging.getLogger(__name__)
 
-# Serializes whole-card operations. Staging and backup paths are derived from
-# the card name alone, so two concurrent replaces would rmtree each other
-# mid-write.
 LOCK = Lock()
+"""Serializes whole-card operations.
+
+Staging and backup paths are derived from the card name alone, so two
+concurrent replaces would rmtree each other mid-write.
+"""
 
 _FILE_CARD_ERROR = "slot 1 holds a single-file memory card, a folder card is required"
+"""Error string returned when the slot holds a single-file card instead of a folder card."""
 
 
 def _card_files(card: Path) -> list[Path]:
+    """List every regular file in the card directory, sorted, skipping symlinks.
+
+    Args:
+        card: The folder card's directory.
+
+    Returns:
+        The files found, in sorted order.
+    """
     return [p for p in sorted(card.rglob("*")) if p.is_file() and not p.is_symlink()]
 
 
 def _is_blank_marker(path: Path, card: Path, marker: str | None) -> bool:
-    """True for the marker file while it is still the empty one we laid down."""
+    """Whether `path` is the marker file while it is still the empty one we laid down.
+
+    Args:
+        path: A file inside the card.
+        card: The folder card's directory.
+        marker: The marker filename the emulator expects, or None when it has none.
+
+    Returns:
+        True only for the marker file while it is still zero bytes.
+    """
     if marker is None or path != card / marker:
         return False
     try:
@@ -49,6 +69,10 @@ def ensure_card(card: Path, marker: str | None) -> None:
     game has nowhere to save. The marker goes down empty, which is exactly what
     PCSX2 writes when it creates a folder card, and stays empty until the card
     is formatted.
+
+    Args:
+        card: The folder card's directory, created if missing.
+        marker: The marker filename to touch inside it, or None to skip the marker.
     """
     card.mkdir(parents=True, exist_ok=True)
     if marker:
@@ -59,8 +83,16 @@ def build_archive(card: Path, marker: str | None = None) -> bytes | None | str:
     """Zip the whole card at `card`, members relative to the card root.
 
     Relative so the image carries no trace of the card's name and can be laid
-    down on a container that calls its card something else. Returns the zip
-    bytes, None when the slot holds no card, or an error string.
+    down on a container that calls its card something else. A card holding
+    nothing but the blank marker counts as no card at all.
+
+    Args:
+        card: The folder card's directory.
+        marker: The marker filename the emulator expects, or None when it has none.
+
+    Returns:
+        The zip bytes, None when the slot holds no card, or an error string when
+        the slot holds a single-file card or the card exceeds `SAVE_FILE_MAX_BYTES`.
     """
     if card.exists() and not card.is_dir():
         return _FILE_CARD_ERROR
@@ -98,8 +130,18 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
     The whole card is replaced with no per-file merge: that is what isolates
     the next player on a pooled container from the last one. Extraction goes to
     a staging directory that is swapped over the live card, so a failure part
-    way through never leaves a half-wiped card. Returns the file count written,
-    or an error string.
+    way through never leaves a half-wiped card.
+
+    Args:
+        card: The folder card's directory to replace.
+        content: The zip image of the card, members relative to the card root.
+        marker: The marker filename to lay down before the members, or None to
+            skip it.
+
+    Returns:
+        The number of files written, or an error string when the slot holds a
+        single-file card, the body is not a zip, the archive is too large, a
+        member escapes the card dir, or the swap fails.
     """
     if card.exists() and not card.is_dir():
         return _FILE_CARD_ERROR

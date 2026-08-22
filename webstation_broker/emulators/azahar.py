@@ -1,5 +1,4 @@
-"""Azahar (Nintendo 3DS) launcher: qt-config.ini patching and SIGTERM
-shutdown.
+"""Azahar (Nintendo 3DS) launcher: qt-config.ini patching and SIGTERM shutdown.
 
 Azahar has no control API reachable from outside the process. Its only
 network surface is a UDP RPC server that reads and writes emulated memory,
@@ -24,17 +23,30 @@ import logging
 import os
 import re
 import time
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Library root a resolved ROM must live under (env `ROM_ROOT`, default `/romm`)."""
 
 
 def _xdg_dir(var: str, fallback: str) -> str:
-    """Azahar's Linux layout: one `azahar-emu` directory per XDG root."""
+    """One of Azahar's XDG directories.
+
+    Azahar's Linux layout: one `azahar-emu` directory per XDG root.
+
+    Args:
+        var: The XDG environment variable to honour when set to an absolute path.
+        fallback: The path under `$HOME` used otherwise, such as `.config`.
+
+    Returns:
+        The `azahar-emu` directory under the chosen root.
+    """
     xdg = os.environ.get(var)
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "azahar-emu")
@@ -42,48 +54,59 @@ def _xdg_dir(var: str, fallback: str) -> str:
 
 
 USER_DIR = Path(os.environ.get("AZAHAR_USER_DIR", _xdg_dir("XDG_DATA_HOME", ".local/share")))
+"""Azahar's data root, the save root (env `AZAHAR_USER_DIR`, default `$XDG_DATA_HOME/azahar-emu`)."""
 CONFIG_DIR = Path(os.environ.get("AZAHAR_CONFIG_DIR", _xdg_dir("XDG_CONFIG_HOME", ".config")))
+"""Azahar's config directory (env `AZAHAR_CONFIG_DIR`, default `$XDG_CONFIG_HOME/azahar-emu`)."""
 CONFIG_PATH = CONFIG_DIR / "qt-config.ini"
+"""The qt-config.ini patched before every launch."""
 AZAHAR_LOG_PATH = Path(os.environ.get("AZAHAR_LOG_PATH", "/config/azahar.log"))
+"""The emulator log file (env `AZAHAR_LOG_PATH`, default `/config/azahar.log`)."""
 
-# The console and SD card ids Azahar files saves under. Both are fixed
-# all-zeros rather than generated per install, so these paths are the same in
-# every container and a dumped save restores where the next session looks.
 SYSTEM_ID = "0" * 32
+"""The console id Azahar files saves under.
+
+Fixed all-zeros rather than generated per install, so these paths are the
+same in every container and a dumped save restores where the next session
+looks.
+"""
 SDCARD_ID = "0" * 32
+"""The SD card id Azahar files saves under, fixed all-zeros like `SYSTEM_ID`."""
 
 SDMC_DIR = USER_DIR / "sdmc" / "Nintendo 3DS" / SYSTEM_ID / SDCARD_ID
+"""The emulated SD card's per-console directory."""
 NAND_DATA_DIR = USER_DIR / "nand" / "data" / SYSTEM_ID
+"""The emulated NAND's per-console data directory."""
 
-# Roots holding save trees, each keyed <titleHigh>/<titleLow>. SD title saves
-# are where a game's own saves land; extdata carries the larger side data some
-# games keep (photos, downloaded content), and sysdata the system's own.
 _SAVE_GROUP_ROOTS = (
     SDMC_DIR / "title",
     SDMC_DIR / "extdata",
     NAND_DATA_DIR / "extdata",
     NAND_DATA_DIR / "sysdata",
 )
+"""Roots holding save trees, each keyed `<titleHigh>/<titleLow>`.
 
-# Formats Azahar boots directly, best first; a folder holding several
-# candidates picks by this order. No .cia: that is an installable package
-# rather than something the emulator boots.
+SD title saves are where a game's own saves land; extdata carries the larger
+side data some games keep (photos, downloaded content), and sysdata the
+system's own.
+"""
+
 ROM_EXTENSIONS = (
     ".3ds", ".cci", ".zcci", ".cxi", ".zcxi", ".app",
     ".3dsx", ".z3dsx", ".elf", ".axf", ".bin",
 )
-# A library folder wrapping a game adds a level, so search two deep.
+"""Formats Azahar boots directly, best first; a folder holding several candidates picks by this order.
+
+No .cia: that is an installable package rather than something the emulator
+boots.
+"""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
-# Updates and DLC sit beside base games in library folders; boot the base game.
+"""Glob patterns a ROM folder is searched with; a library folder wrapping a game adds a level."""
 _ADDON_RE = re.compile(r"(?:^|[^a-z0-9])(?:update|upd|dlc|patch)(?:[^a-z0-9]|$)", re.IGNORECASE)
+"""Matches update and DLC names: they sit beside base games in library folders, and the base game boots."""
 
-# Title dirs under a save group root are <titleHigh>/<titleLow>, both 8 hex.
 _HEX8_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+"""Matches a title id half: title dirs under a save group root are `<titleHigh>/<titleLow>`, both 8 hex."""
 
-# qt-config.ini keys forced before every launch, by ini section. Only the ones
-# that would otherwise put something in front of the game: two that phone home
-# and prompt, and the close confirmation that would leave a modal behind in a
-# session nobody can click.
 _CONFIG_PATCHES: dict[str, dict[str, str]] = {
     "UI": {
         "confirmClose": "false",
@@ -91,9 +114,28 @@ _CONFIG_PATCHES: dict[str, dict[str, str]] = {
         "enable_discord_presence": "false",
     },
 }
+"""qt-config.ini keys forced before every launch, by ini section.
+
+Only the ones that would otherwise put something in front of the game: two
+that phone home and prompt, and the close confirmation that would leave a
+modal behind in a session nobody can click.
+"""
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Pick the best bootable file among `candidates`.
+
+    Hidden files, non-files and anything resolving outside `ROM_ROOT` are
+    skipped. Ranking prefers base games over updates and DLC, then the
+    `ROM_EXTENSIONS` order, then the shallowest path, then the lowercased name.
+
+    Args:
+        candidates: Paths found under `base` by the search globs.
+        base: The directory the candidates were searched from.
+
+    Returns:
+        The resolved path of the best candidate, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -125,7 +167,7 @@ def _patch_config() -> None:
     Patched key-wise, and with raw parsing, so everything else in the file
     survives: Azahar rewrites this whole file on exit, and it holds the
     player's own settings alongside QSettings-encoded keys that would not
-    round-trip through interpolation.
+    round-trip through interpolation. Failures are logged, not raised.
     """
     try:
         parser = configparser.RawConfigParser()
@@ -156,32 +198,75 @@ def _patch_config() -> None:
 
 
 class Azahar(Emulator):
+    """Nintendo 3DS via Azahar, driven by command line flags and config file patching.
+
+    Azahar has no control API reachable from outside the process, so the
+    broker pins qt-config.ini before every launch (no close confirmation, no
+    update check, no Discord presence) and boots windowed with `-w`:
+    fullscreen Azahar stops rendering when the display resizes under it,
+    which happens whenever the player resizes their browser. Azahar installs
+    no SIGTERM handler, so the stop is a hard kill and the dump takes
+    whatever the game had already committed to disk.
+
+    There are no reachable save states: persistence is the game's own save
+    data under the emulated SD card and NAND, and the archive is scoped to
+    those save trees. At exit every file in the title save dirs written
+    during the session gets its mtime refreshed so the delta dump ships
+    those saves whole while other titles' saves stay filtered out. A resume
+    slot is logged and ignored.
+
+    Attributes:
+        name: Provider key, `azahar`.
+        display_name: Human-readable name.
+        save_root: The data root the save subtrees hang off.
+        save_subtrees: The SD title and extdata trees plus the NAND extdata and sysdata trees.
+        rom_extensions: Bootable formats, best first.
+        log_path: The emulator log file.
+        term_timeout: SIGTERM grace before SIGKILL (env `AZAHAR_STOP_WAIT`, default 5).
+    """
+
     name = "azahar"
     display_name = "Azahar"
     save_root = USER_DIR
-    # Scoped to the save trees: the rest of the data root is config, cache,
-    # shaders and system titles, none of which belong in a save archive.
     save_subtrees = (
         f"sdmc/Nintendo 3DS/{SYSTEM_ID}/{SDCARD_ID}/title",
         f"sdmc/Nintendo 3DS/{SYSTEM_ID}/{SDCARD_ID}/extdata",
         f"nand/data/{SYSTEM_ID}/extdata",
         f"nand/data/{SYSTEM_ID}/sysdata",
     )
+    """The save trees under the data root.
+
+    Scoped to the save trees: the rest of the data root is config, cache,
+    shaders and system titles, none of which belong in a save archive.
+    """
     rom_extensions = ROM_EXTENSIONS
     log_path = AZAHAR_LOG_PATH
-    # No SIGTERM handler: the default action ends the process at once, and
-    # whatever the game committed is already on disk. The grace window only
-    # covers process-group teardown.
     term_timeout = float(os.environ.get("AZAHAR_STOP_WAIT", "5"))
+    """SIGTERM grace before SIGKILL (env `AZAHAR_STOP_WAIT`, default 5).
 
-    def __init__(self):
+    No SIGTERM handler: the default action ends the process at once, and
+    whatever the game committed is already on disk. The grace window only
+    covers process-group teardown.
+    """
+
+    def __init__(self) -> None:
+        """Initialise the process handle and a zero session baseline."""
         super().__init__()
         self._session_start = 0.0
 
     def prepare_restore(self) -> None:
+        """Stop a running Azahar so the archive can be extracted under it."""
         self.stop()
 
     def resolve_rom_file(self, path: Path) -> Path | None:
+        """The file Azahar should boot for `path`.
+
+        Args:
+            path: A ROM file, or a folder searched up to two levels deep.
+
+        Returns:
+            The file itself, the best-ranked bootable file in the folder, or None.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -195,6 +280,12 @@ class Azahar(Emulator):
         return _pick_rom_file(candidates, path)
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+        """Patch qt-config.ini and boot the game windowed.
+
+        Args:
+            rom_path: The file to boot.
+            resume_slot: Ignored with a log line; there are no reachable save states.
+        """
         self.stop()
         _patch_config()
         if resume_slot:
@@ -213,7 +304,12 @@ class Azahar(Emulator):
         self._spawn(cmd, base_launch_env())
 
     def _modified_title_saves(self) -> list[Path]:
-        """Title save dirs holding a file written while the session ran."""
+        """Title save dirs holding a file written while the session ran.
+
+        Returns:
+            The `<titleHigh>/<titleLow>` directories under every save group
+            root touched since launch.
+        """
         selected: list[Path] = []
         for root in _SAVE_GROUP_ROOTS:
             if not root.is_dir():
@@ -237,7 +333,15 @@ class Azahar(Emulator):
                 continue
         return selected
 
-    def save_and_exit(self, slot: int) -> dict:
+    def save_and_exit(self, slot: int) -> dict[str, Any]:
+        """Stop Azahar and mark this session's title saves for the dump.
+
+        Args:
+            slot: Ignored; there are no save states.
+
+        Returns:
+            `state_saved`, `state_slot` and `state_file`, all None.
+        """
         self.stop()
         # The dump ships files newer than the session baseline. A 3DS save is
         # a directory tree the game rewrites only partially, so refresh every

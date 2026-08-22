@@ -1,10 +1,13 @@
-"""Room websocket: presence, chat, webcam/mic binary fanout, resolution
-negotiation, and input assignment.
+"""Room websocket: presence, chat, webcam/mic binary fanout, resolution negotiation, and input assignment.
 
 Binary wire format:
-  [0..7] 8-byte ASCII publicId of sender
-  [8]    0x01 video frame / 0x02 audio frame / 0x03 video config / 0x04 pcm
-  [9..]  payload
+
+```
+[0..7] 8-byte ASCII publicId of sender
+[8]    0x01 video frame / 0x02 audio frame / 0x03 video config / 0x04 pcm
+[9..]  payload
+```
+
 The publicId indirection keeps real tokens out of the media byte stream.
 """
 
@@ -23,7 +26,26 @@ router = APIRouter()
 
 
 @router.websocket("/ws/room")
-async def room_websocket(websocket: WebSocket):
+async def room_websocket(websocket: WebSocket) -> None:
+    """Join the play session's room and relay its presence, chat, control and media traffic.
+
+    The `token` query parameter must be the session's controller token or a
+    minted viewer token, otherwise the socket is closed with 1008. Text frames
+    are JSON actions: the controller may assign gamepad slots, mouse/keyboard
+    control and the designated speaker and request resolutions; viewers may
+    rename themselves (rate limited to one change per two seconds); anyone may
+    chat, report their resolution and send video/audio control messages. Binary
+    frames are media in the module's wire format and are fanned out to the
+    other members, except from read-only viewers, frames over 1 MiB, and audio
+    from anyone but the designated speaker while one is set.
+
+    On disconnect the member is removed from the room; a departing viewer also
+    loses its slot, mouse/keyboard ownership and speaker role, is dropped from
+    the session, and the token map is pushed to selkies.
+
+    Args:
+        websocket: The incoming room connection.
+    """
     token = websocket.query_params.get("token")
     sess = session.SESSION
     if sess is None or not sess.get("active") or not token:

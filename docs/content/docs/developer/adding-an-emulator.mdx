@@ -1,0 +1,87 @@
+---
+title: "Adding an emulator"
+description: "The steps to bring a new launcher into the registry, from the Emulator subclass to the image and the docs."
+---
+
+Emulators are added by subclassing
+[`emulators.base.Emulator`](/docs/developer/reference/emulators/base/Emulator)
+and registering the class in `emulators/__init__.py`. The special `desktop`
+type is the smallest example; `xenia` is a complete one with no control
+interface, `ppsspp` a complete one with hotkey-driven save states.
+
+<Steps>
+<Step>
+### Decide what the emulator can do
+
+Work out, from the desktop, how the emulator persists and whether it can be
+driven from outside the process:
+
+- Where its save data lives relative to a single root. Those paths become
+  `save_root` and `save_subtrees`; keep the subtrees tight, a save archive
+  should never carry config, caches or shaders.
+- Whether it can save and load state on command (a socket, a stdin protocol,
+  a hotkey against a known window). If it can, `supports_states = True` and
+  `state_slot` is the one slot you will work in.
+- How it shuts down cleanly. Most need a SIGTERM grace longer than the base
+  5 s; some need a protocol message first.
+- What `rom.path` looks like for its platform (a disc image, a folder, a
+  package that has to be installed first).
+</Step>
+<Step>
+### Write the launcher
+
+Create `webstation_broker/emulators/<name>.py`. Read every tunable from the
+environment at module top with an attribute docstring naming the variable and
+default, then the class:
+
+```python
+class Newemu(Emulator):
+    """One-paragraph account of how the broker drives it and what persists."""
+
+    name = "newemu"
+    display_name = "NewEmu"
+    save_root = DATA_DIR
+    save_subtrees = ("saves",)
+    rom_extensions = (".iso", ".bin")
+    log_path = LOG_PATH
+    term_timeout = float(os.environ.get("NEWEMU_STOP_WAIT", "10"))
+
+    def resolve_rom_file(self, path: Path) -> Path | None: ...
+    def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+        self.stop()
+        self._spawn([BIN, str(rom_path)], base_launch_env())
+```
+
+Use `base_launch_env()` for the environment so the process lands on the
+selkies display, and `_spawn` so output is captured and the pid recorded.
+Override `save_state`, `load_state`, `state_path` and `state_target` only if
+`supports_states` is on; override `save_and_exit` if a clean shutdown needs
+more than SIGTERM. Keep the rationale for every non-obvious choice in the
+docstrings; the reference is generated from them.
+</Step>
+<Step>
+### Register it
+
+Add the import and the registry entry in
+[`emulators/__init__.py`](/docs/developer/reference/emulators). The key is
+what RomM sends as `emulator` in the activate payload.
+</Step>
+<Step>
+### Test it
+
+Add `tests/test_<name>.py`. The existing suites show the pattern: stub
+`_spawn`, point the data directories at `tmp_path`, and assert on the argv,
+the environment, the files the save hooks touch, and the state-file naming.
+Nothing in the tests needs a display or a real binary.
+</Step>
+<Step>
+### Update the image and the docs
+
+The container has to ship the binary: add it to the runtime stage of
+docker-webstation's `Dockerfile` on the `romm` branch, plus any default
+config and controller profile under `root/defaults/`. Then document the
+launcher here: its row in [Supported emulators](/docs/emulators), its
+variables under [Emulator settings](/docs/configuration/emulators), and its
+first-run steps under [Emulator setup](/docs/emulators/setup).
+</Step>
+</Steps>

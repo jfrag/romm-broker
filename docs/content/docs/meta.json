@@ -1,0 +1,16 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "---Running it---",
+    "container",
+    "configuration",
+    "deployment",
+    "emulators",
+    "---Using it---",
+    "api",
+    "releases",
+    "---",
+    "developer"
+  ]
+}

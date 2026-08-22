@@ -1,0 +1,53 @@
+---
+title: "Dev mode"
+description: "Run the broker from a source checkout mounted into the container, with uvicorn and vite hot reload."
+---
+
+`BROKER_DEV_MODE=true` makes the container run the broker from source mounted
+at `/broker` instead of the copy baked into the image.
+
+```bash
+git clone https://github.com/romm-streaming/romm-broker.git
+cd romm-broker
+docker run --rm -it \
+  -e BROKER_DEV_MODE=true \
+  -e PUID=1000 -e PGID=1000 \
+  -v $(pwd):/broker \
+  -v /path/to/roms:/romm \
+  -v /path/to/config:/config \
+  -p 3001:3001 \
+  lscr.io/linuxserver/webstation:romm bash
+```
+
+What changes:
+
+- The `svc-broker` service pip-installs `/broker` editable, runs
+  `uvicorn --reload` on 8000 watching `webstation_broker/`, and runs the vite
+  dev server on 5173. nginx's room location is templated to 5173, so the page
+  and its assets come from vite with hot reload.
+- **The exit save upload is disabled.** The archive is written to
+  `BROKER_EXPORT_DIR` and the exit report's `upload` object says
+  `mode: "report-only"` with what would have been sent. Pull it back with the
+  [export routes](/docs/api/archives) if you need it.
+- Without source at `/broker/pyproject.toml` the service logs a message and
+  sleeps instead of failing the container.
+
+uvicorn's reloader restarts the broker process on every edit. The broker
+records the running emulator's pid in `BROKER_PID_FILE` precisely so that a
+restarted broker can still kill it: a reload mid-session kills the orphaned
+emulator on startup rather than stacking a second one on top.
+
+## Running outside the container
+
+The broker is a plain FastAPI app and runs anywhere for tests and API work:
+
+```bash
+uv venv && uv pip install -e . pytest
+.venv/bin/pytest -q
+.venv/bin/ruff check webstation_broker tests
+.venv/bin/uvicorn --factory webstation_broker.app:create_app --reload
+```
+
+Launching emulators needs the container's display and binaries, so outside
+the image the tests stub the launchers. See the
+[developer guide](/docs/developer) for the layout and conventions.

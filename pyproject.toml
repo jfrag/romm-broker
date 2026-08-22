@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webstation-broker"
-version = "0.3.0"
+version = "0.4.0"
 description = "Session broker and collaboration interface for the RomM webstation container"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,4 +28,10 @@ line-length = 110
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I"]
+# D enforces Google-style docstrings, ANN enforces type hints on every
+# signature; both feed the generated developer reference.
+select = ["E", "F", "W", "I", "D", "ANN"]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

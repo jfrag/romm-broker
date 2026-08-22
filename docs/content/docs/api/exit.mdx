@@ -1,0 +1,70 @@
+---
+title: "Exit"
+description: "Ending a session with POST /api/session/exit: the final state, the save delta, and the upload to the callback origin."
+---
+
+From the room UI's exit button (controller token) or directly:
+
+```bash
+curl -k -X POST 'https://localhost:3001/streaming/api/session/exit?slot=10' \
+  -H 'X-Broker-Secret: <shared secret>'
+```
+
+Saves state (into the working slot, whatever `slot` says), stops the emulator,
+dumps the save delta, and uploads it to the callback origin as multipart form
+data: `POST {base_url}{BROKER_SAVE_UPLOAD_PATH}` with an `archive` file part
+(zip, `{session_id}-{timestamp}.zip`) plus `session_id`, `emulator`, and
+when the rom carried them `rom_id` / `rom_name` form fields. If activate
+supplied `callback.token`, it is sent as `Authorization: Bearer <token>`.
+
+Query parameters:
+
+| Parameter | Default | Purpose |
+| --- | --- | --- |
+| `token` | none | The controller token; lets the room UI exit without the secret. |
+| `slot` | `0` | The state slot to save into. Resolved to the emulator's working slot like everywhere else; the report echoes the one used. |
+| `save` | `true` | `false` (or `0`) stops without writing a state. The game's own save data is still flushed and shipped: not writing a state is the whole of "exit without saving", and discarding an in-game save the player made at a save point would be losing real progress. |
+
+Slot 0 is a real slot on this broker, which is why `save` is a separate flag:
+there is no slot number left to spend on meaning "do not save".
+
+## The callback origin
+
+The callback base URL is derived from the activate request (the parent
+origin) unless the activate payload overrides it:
+
+```json
+"callback": { "base_url": "https://romm.example.com", "token": "<upload token>" }
+```
+
+Same-origin deployments do not need to send one: the broker sits under the
+parent's `SUBFOLDER`, so the origin that served the activate request is the
+parent. The derivation reads `X-Forwarded-Proto` and `X-Forwarded-Host` when a
+proxy sets them, else `Host`.
+
+## Report-only and failed uploads
+
+In dev mode (`BROKER_DEV_MODE=true`) the upload is skipped: the archive is
+written to `BROKER_EXPORT_DIR` and the exit report's `upload` object is
+`mode: "report-only"` with what would have been sent. Outside dev mode a
+failed upload also writes the archive there so nothing is lost, and the
+report's `upload` object carries `mode: "failed"` with the error. Either way the
+[export routes](/docs/api/archives) hand the archive back. The summary is posted
+to the room chat before the room is torn down.
+
+## The exit report
+
+The response carries everything the parent needs to file the session:
+
+| Field | Meaning |
+| --- | --- |
+| `status` | `exited` |
+| `session_id`, `emulator`, `rom` | Echoed from activate. |
+| `state_saved`, `state_slot`, `state_file` | Whether a final state was written, into which slot, and its filename. `state_saved` is `false` with `save=0`; the file is then fetchable through the state-file GET until the next activate. |
+| `save_dump` | The delta that was zipped: the archive name and size and the list of `files` with their paths relative to the save root. |
+| `upload` | `mode` of `uploaded`, `failed` or `report-only`, with the target `url`, the HTTP status, and on failure the `error` and the `path` the archive was written to. |
+
+After the report the room websocket is closed, the token map pushed to selkies
+is emptied so every stream disconnects, and the session is retired. The
+emulator object outlives it just long enough for the state-file and screenshot
+GETs to answer.

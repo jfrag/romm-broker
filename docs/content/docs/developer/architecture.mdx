@@ -1,0 +1,85 @@
+---
+title: "Architecture"
+description: "How the modules fit together: the single session, the emulator contract, save data flow, and the room."
+---
+
+## One session, module globals
+
+The container hosts exactly one play session at a time, so
+[`session`](/docs/developer/reference/session) keeps the active session and the
+room roster as module globals rather than in a store. `SESSION` holds the
+controller token, the viewers with their tokens and input assignments, the
+save baseline (the launch time the exit dump measures against), and the
+`Emulator` instance. `LAST_EXIT` keeps the exited session's emulator alive
+until the next activate so the state-file GET can still answer.
+
+## The request path
+
+[`app.create_app`](/docs/developer/reference/app) builds the FastAPI app and
+mounts it under `settings.PREFIX`. The lifespan hook belongs to whichever app
+is actually served: Starlette never hands the lifespan scope to a mounted
+sub-app, so when a prefix is set the outer app owns it. On startup it reaps any
+emulator left behind by an earlier broker process, using the pid record in
+`BROKER_PID_FILE`.
+
+[`api`](/docs/developer/reference/api) holds every REST endpoint. Activate is
+the long one: secret check, registry lookup, rom resolution under `ROM_ROOT`,
+working-slot clear, archive restore, launch, token mint, selkies push, and the
+deferred resume watchdog. Exit mirrors it: final state, stop, delta dump,
+upload, room teardown, token clear.
+
+[`room`](/docs/developer/reference/room) is the websocket the room UI connects
+to. It fans out chat and media between participants, carries input
+reassignment (which ends in a token push to selkies), and tears the room down
+on exit.
+
+## The emulator contract
+
+[`emulators.base.Emulator`](/docs/developer/reference/emulators/base/Emulator)
+is the contract every launcher implements. A subclass describes itself through
+class attributes (`name`, `save_root`, `save_subtrees`, `supports_states`,
+`state_slot`, `term_timeout`, ...) and overrides `launch` and
+`resolve_rom_file`. Everything else is an optional hook with a safe default:
+the save-state hooks, `swap_disc`, `memory_card_path`, `prepare_restore`,
+`save_and_exit`.
+
+The base class owns the process plumbing. `_spawn` starts the emulator in its
+own session with output captured to `log_path` and records its pid; `stop`
+sends SIGTERM to the process group and escalates to SIGKILL after
+`term_timeout`; `_forget` drops the handle and the pid record together so a
+graceful exit never leaves a stale record for the next broker to hunt.
+
+Launchers differ in how they are driven:
+
+| Mechanism | Launchers |
+| --- | --- |
+| A control socket or stdin protocol | PCSX2 (PINE), RetroArch (network commands), shadPS4 (stdin IPC) |
+| xdotool hotkeys against the render window | Dolphin, PPSSPP |
+| Command line flags and config pinning only, SIGTERM to stop | DuckStation, Cemu, Azahar, Eden, RPCS3, xemu, Xenia |
+
+## Save data flow
+
+[`saves`](/docs/developer/reference/saves) restores an archive into
+`save_root` scoped to `save_subtrees`, skipping members outside them and never
+overwriting a newer file, and dumps a delta of everything modified since the
+session's `save_baseline`. [`callback`](/docs/developer/reference/callback)
+uploads that delta to the parent; failures are reported, never raised, because
+the exit teardown has to finish regardless.
+[`memcard`](/docs/developer/reference/memcard) handles the whole-card sync for
+emulators with a `memory_card_subtree`, serialised against the save routes
+with a lock.
+
+## Input routing
+
+[`selkies`](/docs/developer/reference/selkies) builds the token map from the
+session (`{token: {role, slot, mk_control}}`) and POSTs it to the selkies
+control plane. selkies enforces it per streaming connection, so the broker
+never touches input itself; reassigning a gamepad in the room is a state change
+plus a push. Clearing the map on exit is what disconnects every stream.
+
+## Where things are configured
+
+[`settings`](/docs/developer/reference/settings) reads the broker-wide
+variables once at import. Each launcher reads its own at the top of its module
+so a setting sits next to the code that uses it; the
+[emulator settings](/docs/configuration/emulators) page is the index of them.

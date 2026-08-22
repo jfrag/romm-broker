@@ -1,12 +1,13 @@
 """FastAPI application factory.
 
-The app is mounted under settings.PREFIX (default /streaming) so the same
+The app is mounted under `settings.PREFIX` (default `/streaming`) so the same
 paths work behind nginx, a reverse proxy, or uvicorn directly. Outside dev
 mode the built frontend is served as static files at the prefix root; in dev
 mode vite serves the frontend instead.
 """
 
 import logging
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import anyio.to_thread
@@ -24,19 +25,35 @@ logging.basicConfig(
 
 
 @asynccontextmanager
-async def _lifespan(_app: FastAPI):
-    # A fresh broker holds no session, so an emulator recorded by the process
-    # that came before is playing to nobody. Killing it here rather than at the
-    # next activate is what keeps it killable at all: exit answers 409 without a
-    # session, so otherwise the only way out is launching another game.
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Reap an emulator orphaned by a previous broker process before serving.
+
+    A fresh broker holds no session, so an emulator recorded by the process
+    that came before is playing to nobody. Killing it here rather than at the
+    next activate is what keeps it killable at all: exit answers 409 without a
+    session, so otherwise the only way out is launching another game.
+
+    Args:
+        _app: The application being started; unused.
+
+    Yields:
+        Nothing; control passes to the running application once the orphan is reaped.
+    """
     await anyio.to_thread.run_sync(reap_orphan)
     yield
 
 
 def create_app() -> FastAPI:
-    # The lifespan belongs to whichever app is actually served. Starlette never
-    # hands the lifespan scope to a mounted sub-app, so a startup hook on the
-    # inner app would silently never run behind a prefix.
+    """Build the broker application, mounted under the configured prefix.
+
+    The lifespan belongs to whichever app is actually served. Starlette never
+    hands the lifespan scope to a mounted sub-app, so a startup hook on the
+    inner app would silently never run behind a prefix.
+
+    Returns:
+        The application to serve: a bare root app with the broker mounted at
+        `settings.PREFIX` when a prefix is set, otherwise the broker app itself.
+    """
     prefixed = bool(settings.PREFIX)
     inner = FastAPI(
         title="webstation-broker", lifespan=None if prefixed else _lifespan

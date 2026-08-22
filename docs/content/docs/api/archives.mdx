@@ -1,0 +1,80 @@
+---
+title: "Save archives"
+description: "Moving save archives in and out of the container, and syncing a whole memory card, over the import, export and memory-card routes."
+---
+
+## Save archive transfer
+
+Activate's `save.archive` is a container path, but the parent is a separate
+service holding bytes, so archives move over these endpoints in both
+directions.
+
+```
+PUT    /streaming/api/session/imports/{name}.zip   body: raw zip
+GET    /streaming/api/session/exports
+GET    /streaming/api/session/exports/{name}.zip
+DELETE /streaming/api/session/exports/{name}.zip
+```
+
+All four take `X-Broker-Secret`. The upload returns
+`{"status": "stored", "name": ..., "path": ..., "size": ...}`; feed that
+`path` back as `save.archive` on activate. Names must be a bare `.zip`
+basename, the body must start with the zip magic, and the size ceiling is the
+same 256 MB the dump uses.
+
+Pulling covers the two cases the exit push cannot: dev mode, where the upload
+is disabled and the archive only ever lands on disk, and a failed upload,
+where the archive on disk is the only remaining copy of the save data. Delete
+each archive once the parent has stored it.
+
+```bash
+# hand a save archive to the container, then launch with it
+curl -k -X PUT https://localhost:3001/streaming/api/session/imports/4471.zip \
+  -H 'X-Broker-Secret: <shared secret>' --data-binary @4471.zip
+# -> {"status": "stored", "name": "4471.zip", "path": "/config/broker-imports/4471.zip", "size": 12345}
+
+# list, fetch and discard what exit left behind
+curl -k https://localhost:3001/streaming/api/session/exports -H 'X-Broker-Secret: <shared secret>'
+curl -k https://localhost:3001/streaming/api/session/exports/abc123-1723600000.zip \
+  -H 'X-Broker-Secret: <shared secret>' -o abc123.zip
+curl -k -X DELETE https://localhost:3001/streaming/api/session/exports/abc123-1723600000.zip \
+  -H 'X-Broker-Secret: <shared secret>'
+```
+
+## What an archive holds
+
+An archive is a zip of the emulator's save subtrees, with member paths
+relative to the emulator's save root (for PCSX2, `memcards/...` and
+`sstates/...`). On restore, members outside the subtrees are skipped, and a
+member is not written over a file that is newer on disk, so an old archive
+never rolls a session back. On dump, only files modified since launch are
+included, so an archive is a delta rather than the whole tree.
+
+## Memory cards
+
+PCSX2's Slot 1 memory card is a folder card the broker owns. Rather than
+carrying it inside every save archive, RomM can sync the whole card against
+the player with its own routes:
+
+```
+GET /streaming/api/session/memory-card?emulator=pcsx2
+PUT /streaming/api/session/memory-card?emulator=pcsx2   body: raw zip of the card
+```
+
+Both take `X-Broker-Secret`. The GET serves the card as a zip with an
+`X-Memory-Card-Slot: 1` header. A `404` carrying `X-Memory-Card: absent` is
+the broker confirming the slot is empty, which is what tells RomM the card is
+safe to wipe; every other failure reads as "could not be captured", so a card
+RomM never managed to read is not destroyed on the next claim.
+
+The PUT wipes Slot 1 and lays down the card being sent. It is refused with
+`409` while a session is up: the emulator holds the card open for as long as
+the game runs, and swapping it underneath corrupts it. RomM hydrates before
+activate and evacuates after exit, so the card is only ever replaced with
+nothing running.
+
+When the card is synced this way, activate is told with
+`save.memory_card_synced: true`. The card then travels as its own image, so the
+restore passes over a stale card inside an older archive and the exit dump
+leaves the card subtree out. `400` from either route means the named emulator
+has no memory card, `422` that the emulator is unknown.

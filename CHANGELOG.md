@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.4.0](https://github.com/romm-streaming/romm-broker/compare/v0.3.0...v0.4.0) (2026-08-21)
+
+
+### Features
+
+* add xenia emulator support ([c8bd030](https://github.com/romm-streaming/romm-broker/commit/c8bd030))
+* documentation site built with Fumadocs and deployed to GitHub Pages from a workflow, with the guide split out of the README and a developer reference generated from the Python docstrings
+
+
+### Documentation
+
+* Google-style docstrings and type hints across the package and the test suite, enforced by ruff's pydocstyle and annotation rules in CI
+* move the reverse proxy and emulator setup guides into the docs site and trim the README down to a pointer
+
+
+### Continuous Integration
+
+* run the test suite and lint the tests alongside the package
+
 ## [0.3.0](https://github.com/romm-streaming/romm-broker/compare/v0.2.0...v0.3.0) (2026-08-17)
 
 

@@ -1,5 +1,4 @@
-"""PPSSPP (Sony PSP) launcher: ROM resolution, ini patching, and save states
-over the emulator's own hotkeys.
+"""PPSSPP (Sony PSP) launcher: ROM resolution, ini patching, and hotkey save states.
 
 PPSSPP has no control socket. Everything the broker needs pinned lives in two
 inis, both patched before every launch. ppsspp.ini gets FirstRun and
@@ -27,59 +26,92 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from threading import Thread
+from typing import Any
 
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Root of the RomM library mount (env `ROM_ROOT`, default `/romm`).
+
+A resolved ROM must sit under it; candidates resolving outside are discarded.
+"""
 
 CONFIG_DIR = Path(os.environ.get("PPSSPP_CONFIG_DIR", "/config/.config/ppsspp"))
+"""PPSSPP's config root (env `PPSSPP_CONFIG_DIR`, default `/config/.config/ppsspp`)."""
 PSP_DIR = CONFIG_DIR / "PSP"
+"""The emulated memory stick root, holding save data, states and the system inis."""
 SYSTEM_DIR = PSP_DIR / "SYSTEM"
+"""Directory holding ppsspp.ini and controls.ini."""
 INI_PATH = SYSTEM_DIR / "ppsspp.ini"
+"""The main ini the broker patches before every launch."""
 CONTROLS_INI_PATH = SYSTEM_DIR / "controls.ini"
+"""The control mapping ini the broker patches before every launch."""
 STATE_DIR = PSP_DIR / "PPSSPP_STATE"
+"""Directory PPSSPP writes its `.ppst` save states and their `.jpg` screenshots into."""
 PPSSPP_LOG_PATH = Path(os.environ.get("PPSSPP_LOG_PATH", "/config/ppsspp.log"))
+"""Log file the broker tails for this emulator (env `PPSSPP_LOG_PATH`, default `/config/ppsspp.log`)."""
 
-# The one slot the broker works in. RomM holds the library of states, so a
-# requested slot resolves to this one and the routes echo the effective slot.
 STATE_SLOT = int(os.environ.get("PPSSPP_STATE_SLOT", "1"))
+"""The one slot the broker works in (env `PPSSPP_STATE_SLOT`, default 1).
 
-# F1-F12 never reach PPSSPP through this container's streaming/input stack
-# (confirmed empirically: bound and unbound alike, nothing was ever
-# delivered), so the working hotkeys are the bracket keys instead. The
-# device-1 code is NKCODE (device 1 is the keyboard; device 10 entries
-# elsewhere in this file are the gamepad's own, unrelated numbering) per
-# PPSSPP's Qt/NKCodeFromQt.h, which maps Qt::Key_BracketLeft/Right to
-# NKCODE_LEFT_BRACKET/RIGHT_BRACKET (71/72, Common/Input/KeyCodes.h) - not the
-# 132/134 an earlier remap-UI capture recorded, which traced back to the same
-# broken injection path this binding works around.
+RomM holds the library of states, so a requested slot resolves to this one
+and the routes echo the effective slot.
+"""
+
 SAVE_KEY = "bracketleft"
+"""xdotool key for saving the working slot.
+
+F1-F12 never reach PPSSPP through this container's streaming/input stack
+(confirmed empirically: bound and unbound alike, nothing was ever
+delivered), so the working hotkeys are the bracket keys instead. The
+device-1 code is NKCODE (device 1 is the keyboard; device 10 entries
+elsewhere in this file are the gamepad's own, unrelated numbering) per
+PPSSPP's `Qt/NKCodeFromQt.h`, which maps `Qt::Key_BracketLeft/Right` to
+`NKCODE_LEFT_BRACKET/RIGHT_BRACKET` (71/72, `Common/Input/KeyCodes.h`), not
+the 132/134 an earlier remap-UI capture recorded, which traced back to the
+same broken injection path this binding works around.
+"""
 LOAD_KEY = "bracketright"
+"""xdotool key for loading the working slot; see `SAVE_KEY` for why it is a bracket key."""
 
 STATE_WAIT = float(os.environ.get("PPSSPP_STATE_WAIT", "20.0"))
+"""Seconds a save state has to land on disk after the save hotkey (env `PPSSPP_STATE_WAIT`, default 20)."""
 RESUME_LOAD_WAIT = float(os.environ.get("PPSSPP_RESUME_LOAD_WAIT", "90.0"))
-# How long the window has to be up before a hotkey is worth sending.
+"""Seconds a deferred resume waits for a state file to arrive (env `PPSSPP_RESUME_LOAD_WAIT`, default 90)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("PPSSPP_RESUME_LOAD_SETTLE", "5.0"))
+"""How long the window has to be up before a hotkey is worth sending (env `PPSSPP_RESUME_LOAD_SETTLE`).
 
-# All formats PPSSPP boots directly, best (most likely to be the verified,
-# compressed copy) first; a folder holding several candidates picks by this
-# order. PSP has no multi-disc titles, so there is no disc number to rank on.
+Defaults to 5 seconds.
+"""
+
 ROM_EXTENSIONS = (".chd", ".cso", ".pbp", ".iso", ".elf", ".prx")
+"""All formats PPSSPP boots directly, best first.
+
+Best means most likely to be the verified, compressed copy; a folder holding
+several candidates picks by this order. PSP has no multi-disc titles, so
+there is no disc number to rank on.
+"""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 
-# "<game id>_<version>_<slot>.ppst", the name PPSSPP builds for a save state;
-# the screenshot beside it shares the same stem with a .jpg extension.
 _STATE_NAME_RE = re.compile(r"^(?P<prefix>[^/]+)_(?P<slot>\d+)\.ppst$")
+"""Matches `<game id>_<version>_<slot>.ppst`, the name PPSSPP builds for a save state.
+
+The screenshot beside it shares the same stem with a `.jpg` extension.
+"""
 
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 _WINDOW_CLASS = "PPSSPPQt"
-# Before a game is running the title is just "PPSSPP <ver>"; once one is
-# loaded PPSSPP appends " - <id> : <name>", which is what a hotkey needs.
 _GAME_TITLE_MARK = " - "
+"""Substring a PPSSPP window title gains once a game is running.
+
+Before a game is running the title is just `PPSSPP <ver>`; once one is
+loaded PPSSPP appends ` - <id> : <name>`, which is what a hotkey needs.
+"""
 
 _INI_SECTION = "General"
 _INI_PATCHES: dict[tuple[str, str], str] = {
@@ -87,17 +119,33 @@ _INI_PATCHES: dict[tuple[str, str], str] = {
     (_INI_SECTION, "CheckForNewVersion"): "CheckForNewVersion = False",
     (_INI_SECTION, "StateSlot"): f"StateSlot = {STATE_SLOT}",
 }
+"""Settings forced into ppsspp.ini: no first-run wizard, no update toast, and the working slot pinned."""
 
-# device-1 (keyboard) NKCODE for the bracket keys; see the SAVE_KEY/LOAD_KEY
-# note above for where 71/72 come from.
 _CONTROLS_SECTION = "ControlMapping"
 _CONTROLS_PATCHES: dict[tuple[str, str], str] = {
     (_CONTROLS_SECTION, "Save State"): "Save State = 1-71",
     (_CONTROLS_SECTION, "Load State"): "Load State = 1-72",
 }
+"""Bindings forced into controls.ini: device-1 (keyboard) NKCODE for the bracket keys.
+
+See the `SAVE_KEY` note for where 71/72 come from.
+"""
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+    """Pick the best bootable ROM out of a set of candidate paths.
+
+    Hidden files, unsupported extensions, non-files and anything resolving
+    outside `ROM_ROOT` are dropped. The rest rank by position in
+    `ROM_EXTENSIONS`, then by depth and name.
+
+    Args:
+        candidates: Paths found under the ROM folder.
+        base: The ROM folder the candidates are relative to.
+
+    Returns:
+        The resolved path of the winning ROM, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -121,10 +169,21 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
 
 
 def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, str], str]) -> None:
-    """Force `patches` ("section", "key") -> "key = value" into the ini at
-    `path` before every launch. Written and read with a leading UTF-8 BOM,
-    matching PPSSPP's own files: a naive scan without utf-8-sig would loosen
-    the BOM onto the first `[section]` line and never match it."""
+    """Force a set of settings into one of PPSSPP's inis before every launch.
+
+    Written and read with a leading UTF-8 BOM, matching PPSSPP's own files: a
+    naive scan without `utf-8-sig` would loosen the BOM onto the first
+    `[section]` line and never match it. A missing file is seeded with just
+    the forced settings and PPSSPP fills in the rest. Existing keys are
+    rewritten in place, missing ones are added under their section (created
+    when absent), and the result is written through a temp file. Any failure
+    is logged rather than raised so the launch still goes ahead.
+
+    Args:
+        path: The ini file to patch.
+        default_section: Section header to seed when the file does not exist yet.
+        patches: `(section, key)` to `key = value` lines to force in.
+    """
     try:
         if not path.exists():
             # First run: write just the forced settings, PPSSPP fills in the rest.
@@ -181,15 +240,23 @@ def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, s
 
 
 def _patch_config() -> None:
+    """Patch both ppsspp.ini and controls.ini with the broker's forced settings."""
     _patch_ini_file(INI_PATH, _INI_SECTION, _INI_PATCHES)
     _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES)
 
 
 def _state_for_slot(slot: int) -> Path | None:
-    """The newest state in `slot`, or None if it holds nothing."""
+    """Find the most recently written state in `slot`.
+
+    Args:
+        slot: The slot number, matched as the `_<slot>.ppst` suffix.
+
+    Returns:
+        The newest state in `slot` by mtime, or None if it holds nothing.
+    """
     if not STATE_DIR.is_dir():
         return None
-    candidates = []
+    candidates: list[tuple[float, Path]] = []
     for p in STATE_DIR.glob(f"*_{slot}.ppst"):
         try:
             candidates.append((p.stat().st_mtime, p))
@@ -200,10 +267,16 @@ def _state_for_slot(slot: int) -> Path | None:
     return max(candidates)[1]
 
 
-def _snapshot() -> dict:
+def _snapshot() -> dict[Path, tuple[int, float]]:
+    """Snapshot every state in the broker's working slot.
+
+    Returns:
+        A dict of state path to `(size, mtime)`, empty when the directory is missing. Files that
+        vanish mid-scan are skipped.
+    """
     if not STATE_DIR.is_dir():
         return {}
-    snap = {}
+    snap: dict[Path, tuple[int, float]] = {}
     for p in STATE_DIR.glob(f"*_{STATE_SLOT}.ppst"):
         try:
             st = p.stat()
@@ -213,10 +286,21 @@ def _snapshot() -> dict:
     return snap
 
 
-def _wait_for_state_write(before: dict, deadline: float) -> bool:
-    """Poll the slot until a write completes (size stable for 0.5 s) or the
-    deadline passes. The hotkey is fire-and-forget, so the file appearing and
-    settling is the only confirmation there is."""
+def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float) -> bool:
+    """Poll the working slot until a write completes or the deadline passes.
+
+    A write counts as complete once the file's size has been stable for 0.5 s.
+    The hotkey is fire-and-forget, so the file appearing and settling is the
+    only confirmation there is. A target that disappears mid-write is dropped
+    and the scan starts over.
+
+    Args:
+        before: Snapshot from `_snapshot` taken before the hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+
+    Returns:
+        True once a new or modified state has settled, False on timeout.
+    """
     STABLE_SECS = 0.5
     POLL_SECS = 0.1
     target: Path | None = None
@@ -248,11 +332,19 @@ def _wait_for_state_write(before: dict, deadline: float) -> bool:
 
 
 def _restamp_slot(filename: str, slot: int) -> str | None:
-    """The same state named for `slot`, or None if it is not a state name.
+    """Rename a state for `slot`, keeping the game id and version that tie it to its game.
 
     PPSSPP resolves a state by the game id (and version) in the name, so that
     is what has to survive the trip; the slot a stored capture happens to
-    carry is rewritten into this broker's one working slot."""
+    carry is rewritten into this broker's one working slot.
+
+    Args:
+        filename: The basename a stored state arrived with.
+        slot: The slot to stamp into the name.
+
+    Returns:
+        The same state named for `slot`, or None if `filename` is not a state name.
+    """
     match = _STATE_NAME_RE.match(filename)
     if match is None:
         return None
@@ -260,6 +352,40 @@ def _restamp_slot(filename: str, slot: int) -> str | None:
 
 
 class Ppsspp(Emulator):
+    """Sony PSP sessions on PPSSPPQt.
+
+    The broker launches `PPSSPPQt --fullscreen -- <rom>` after patching both
+    of PPSSPP's inis: ppsspp.ini so a fresh container never shows the setup
+    wizard or an update toast and so the working state slot is pinned, and
+    controls.ini so Save State and Load State are bound to the bracket keys,
+    the only hotkeys that reach PPSSPP through this container's input stack.
+    Both files carry a UTF-8 BOM that the patcher strips and restores. Save
+    and load are hotkey only: the game window is activated, the key is sent
+    through XTEST, and for a save the state directory is polled until the
+    file settles, since the hotkey gives no acknowledgement. There is no
+    boot-time state-load flag, so a resume always goes through a deferred
+    thread that waits for the state file and then sends the load hotkey once
+    the window has been up long enough.
+
+    Save data (`SAVEDATA`) and states (`PPSSPP_STATE`) both ride the save
+    archive. A state is named for the game id and version, so pushed names
+    are restamped into the broker's slot and the working slot is cleared
+    before a boot. PPSSPP writes a `.jpg` screenshot beside every state, so
+    the thumbnail comes from that file rather than the streamed canvas, and
+    clearing a state drops its screenshot too.
+
+    Attributes:
+        name: RomM platform key, `ppsspp`.
+        display_name: Human-readable name shown in the UI.
+        save_root: The emulated memory stick root, which the save subtrees hang off.
+        save_subtrees: `SAVEDATA` and `PPSSPP_STATE`, the directories the save archive carries.
+        rom_extensions: Bootable ROM formats, best first.
+        supports_states: True, states are saved and loaded over the bracket hotkeys.
+        state_slot: The one slot the broker works in, echoed back as the effective slot.
+        state_dir: Where PPSSPP writes `.ppst` files.
+        log_path: The PPSSPP log the broker exposes.
+    """
+
     name = "ppsspp"
     display_name = "PPSSPP"
     save_root = PSP_DIR
@@ -270,11 +396,23 @@ class Ppsspp(Emulator):
     state_dir = STATE_DIR
     log_path = PPSSPP_LOG_PATH
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Set up the process state and the launch sequence counter that fences deferred loads."""
         super().__init__()
         self._launch_seq = 0
 
     def resolve_rom_file(self, path: Path) -> Path | None:
+        """Resolve a RomM path to the ROM to boot.
+
+        A file is taken as is. A directory is searched one level deep for the
+        best candidate by `_pick_rom_file`.
+
+        Args:
+            path: The ROM file or folder RomM handed over.
+
+        Returns:
+            The ROM to pass to PPSSPPQt, or None when there is nothing bootable.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -288,7 +426,14 @@ class Ppsspp(Emulator):
         return _pick_rom_file(candidates, path)
 
     def _xdotool(self, *args: str) -> str | None:
-        """Run xdotool, returning its stdout, or None if it failed."""
+        """Run one xdotool command against the session display.
+
+        Args:
+            *args: Arguments passed to the xdotool binary.
+
+        Returns:
+            Its stdout, or None if it could not be run, timed out, or exited non-zero.
+        """
         try:
             result = subprocess.run(
                 [_XDOTOOL, *args],
@@ -306,10 +451,14 @@ class Ppsspp(Emulator):
         return result.stdout
 
     def _game_window(self) -> str | None:
-        """The window id PPSSPP is running the game in, or None.
+        """Find the window PPSSPP is running the game in.
 
         Picked by title rather than the first match: before a game is loaded
-        the same class is a menu window a hotkey does nothing useful to."""
+        the same class is a menu window a hotkey does nothing useful to.
+
+        Returns:
+            The X window id as xdotool prints it, or None when no game window is up.
+        """
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if out is None:
             return None
@@ -326,6 +475,12 @@ class Ppsspp(Emulator):
         Activating first is what makes this survive the player clicking back
         into the page: XTEST delivers to whatever holds focus, so a key sent
         at an unfocused PPSSPP goes to the desktop instead.
+
+        Args:
+            key: The key name in xdotool's syntax, for example `bracketleft`.
+
+        Returns:
+            True when the window was found, activated and the key sent, False otherwise.
         """
         win_id = self._game_window()
         if win_id is None:
@@ -335,6 +490,16 @@ class Ppsspp(Emulator):
         return self._xdotool("key", "--clearmodifiers", key) is not None
 
     def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+        """Stop any running instance, patch the inis, and start PPSSPPQt.
+
+        The binary comes from env `PPSSPP_BIN` (default `PPSSPPQt`). With
+        `resume_slot` set, a deferred thread waits for the state file and
+        loads it over the hotkey once the window is up.
+
+        Args:
+            rom_path: The ROM to boot.
+            resume_slot: Slot to resume from, or None to boot clean.
+        """
         self.stop()
         _patch_config()
         self._launch_seq += 1
@@ -352,6 +517,16 @@ class Ppsspp(Emulator):
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _deferred_load_state(self, seq: int) -> None:
+        """Wait for the resume state to arrive, then load it over the hotkey.
+
+        Gives the file `RESUME_LOAD_WAIT` to appear, then `RESUME_LOAD_SETTLE`
+        for the window to be ready. Abandons itself whenever `seq` no longer
+        matches the current launch, so a superseded launch never gets a stray
+        load.
+
+        Args:
+            seq: The launch sequence number this load belongs to.
+        """
         deadline = time.monotonic() + RESUME_LOAD_WAIT
         if not self.wait_for_state(deadline):
             log.warning("resume: no state file ever arrived")
@@ -366,26 +541,47 @@ class Ppsspp(Emulator):
         log.info("resume: deferred load %s", "delivered" if ok else "failed")
 
     def save_state(self, slot: int) -> bool:
-        """`slot` is what RomM asked for and is ignored: this saves into
-        STATE_SLOT and the caller reads the effective slot back off
-        state_slot."""
+        """Save a state into the broker's slot over the hotkey and wait for it to land.
+
+        `slot` is what RomM asked for and is ignored: this saves into
+        `STATE_SLOT` and the caller reads the effective slot back off
+        `state_slot`.
+
+        Args:
+            slot: The slot RomM requested; not used.
+
+        Returns:
+            True once the state file has been written and settled within `STATE_WAIT`, False if
+            the hotkey could not be sent or the write never completed.
+        """
         before = _snapshot()
         if not self._send_key(SAVE_KEY):
             return False
         return _wait_for_state_write(before, time.monotonic() + STATE_WAIT)
 
     def load_state(self, slot: int) -> bool:
-        # The hotkey is silent on an empty slot, so an absent file has to be
-        # caught here or the caller reads a no-op as success.
+        """Load the broker's slot over the hotkey.
+
+        The hotkey is silent on an empty slot, so an absent file has to be
+        caught here or the caller reads a no-op as success.
+
+        Args:
+            slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
+
+        Returns:
+            True when a state file exists and the hotkey was sent, False otherwise.
+        """
         if self.state_path() is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
         return self._send_key(LOAD_KEY)
 
     def state_path(self) -> Path | None:
+        """Return the newest state file in the broker's slot, or None when it holds nothing."""
         return _state_for_slot(STATE_SLOT)
 
     def state_screenshot_path(self) -> Path | None:
+        """Return the `.jpg` PPSSPP wrote beside the current state, or None when there is none."""
         state = self.state_path()
         if state is None:
             return None
@@ -393,10 +589,13 @@ class Ppsspp(Emulator):
         return shot if shot.is_file() else None
 
     def clear_working_slot(self) -> None:
-        """A state is named for the game it was taken from, and the game id
-        only comes off the running disc, so a leftover cannot be told apart
-        from the state of the game about to boot. Anything still here belongs
-        to a session that has already exited and whose states RomM holds."""
+        """Delete every state in the broker's slot, and its screenshot, before a new session boots.
+
+        A state is named for the game it was taken from, and the game id only
+        comes off the running disc, so a leftover cannot be told apart from
+        the state of the game about to boot. Anything still here belongs to a
+        session that has already exited and whose states RomM holds.
+        """
         if not STATE_DIR.is_dir():
             return
         for stale in STATE_DIR.glob(f"*_{STATE_SLOT}.ppst"):
@@ -408,9 +607,19 @@ class Ppsspp(Emulator):
                 log.warning("could not clear stale state %s: %s", stale.name, exc)
 
     def state_target(self, filename: str) -> Path | None:
-        """With the slot already holding a state, a pushed name has to match
-        it; otherwise the game id is taken on trust, bounded to a
-        `<game>_<slot>.ppst` basename in the state dir."""
+        """Map a pushed state's filename to where it may be written.
+
+        With the slot already holding a state, a pushed name has to match it;
+        otherwise the game id is taken on trust, bounded to a
+        `<game>_<slot>.ppst` basename in the state dir.
+
+        Args:
+            filename: The basename RomM is pushing.
+
+        Returns:
+            The path to write to, or None when the name is not a state name, carries a path
+            component, or does not match the state already in the slot.
+        """
         if "/" in filename or filename in ("", ".", ".."):
             return None
         restamped = _restamp_slot(filename, STATE_SLOT)
@@ -421,9 +630,20 @@ class Ppsspp(Emulator):
             return existing if restamped == existing.name else None
         return STATE_DIR / restamped
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+        """Save a state if asked, then stop the emulator.
+
+        Args:
+            slot: Slot RomM asked to save into (resolved to `STATE_SLOT`), or None to exit
+                without saving a state.
+
+        Returns:
+            A dict with `state_saved` (bool), `state_slot` (the effective slot, or None when no
+            save was requested) and `state_file` (a dict of `path`, `size` and `mtime` for the
+            saved state, or None).
+        """
         saved = False
-        state_file = None
+        state_file: dict[str, Any] | None = None
         if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
@@ -439,6 +659,6 @@ class Ppsspp(Emulator):
         }
 
     def stop(self) -> None:
-        # Invalidate any in-flight deferred state load before the kill.
+        """Invalidate any in-flight deferred state load before the kill."""
         self._launch_seq += 1
         super().stop()

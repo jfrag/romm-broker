@@ -1,0 +1,68 @@
+---
+title: "Developer guide"
+description: "Repository layout, the local toolchain, tests and lint, and the conventions the code follows."
+---
+
+## Repository layout
+
+```
+webstation_broker/       FastAPI app (pip installable, console script webstation-broker)
+  api.py                 activate / join / exit / status / state and archive REST endpoints
+  room.py                collab websocket (chat, webcam fanout, resolution, input passing)
+  session.py             single-session state, room broadcast, gamepad/MK assignment
+  selkies.py             token pushes to the selkies control plane
+  saves.py               save archive restore on activate, delta dump on exit
+  memcard.py             whole memory card capture and hydrate
+  callback.py            exit-time save archive upload to the parent
+  settings.py            environment-driven configuration
+  app.py                 application factory, SUBFOLDER mount, orphan reaping on start
+  emulators/             one launcher per emulator, all subclassing emulators.base.Emulator
+frontend/                vite vanilla-JS room interface
+tests/                   pytest suite; launchers are stubbed, nothing needs a display
+docs/                    this site (Fumadocs, static export to GitHub Pages)
+```
+
+## Toolchain
+
+Python 3.11 or newer. The repository uses [uv](https://docs.astral.sh/uv/) for
+environments but plain `pip` works the same:
+
+```bash
+uv venv
+uv pip install -e . pytest "ruff==0.16.1"
+.venv/bin/pytest -q
+.venv/bin/ruff check webstation_broker tests
+```
+
+CI runs the same lint, builds the app factory to catch import errors, and runs
+the tests. Dependencies are deliberately few: FastAPI, uvicorn, httpx and
+pyfatx (for xemu's FATX images).
+
+## Conventions
+
+- **Google-style docstrings everywhere.** Every module, class, function and
+  test carries one, with `Args:`, `Returns:` and `Raises:` sections. The
+  [Python reference](/docs/developer/reference) is generated from them, so a
+  docstring is documentation, not decoration. Module constants and class
+  attributes get attribute docstrings (a string literal on the line after the
+  assignment) so they show up too.
+- **Type hints on every signature.** PEP 604 unions (`str | None`), builtin
+  generics, `dict[str, Any]` for loosely shaped payloads.
+- **ruff enforces both.** `pyproject.toml` enables the `D` rules with the
+  Google convention and the `ANN` rules alongside `E`, `F`, `W` and `I`, and CI
+  fails on any of them.
+- **Keep the rationale.** This codebase explains *why* in docstrings and
+  comments: why a slot is parked, why a card is wiped before a launch, why a
+  pid is recorded. Preserve that when you touch code; it is what keeps the
+  next person from undoing a fix.
+- **No em dashes** in prose, docs or docstrings.
+- **Conventional commits.** `feat:` and `fix:` subjects drive the release
+  bump; see [Releases](/docs/releases).
+
+## Running against a real container
+
+Launching an emulator needs the container's display and binaries, so the
+tests stub the launchers. For end-to-end work run the image in
+[dev mode](/docs/container/dev-mode) with the checkout mounted at `/broker`;
+uvicorn reloads on every edit and the room page is served by vite with hot
+reload.

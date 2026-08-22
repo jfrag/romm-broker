@@ -1,0 +1,46 @@
+---
+title: "Broker settings"
+description: "Every environment variable the broker itself reads, with its default and what it controls."
+---
+
+All configuration is by environment variable, read once at import time. None
+of these need setting inside the stock image except `BROKER_SECRET`, and
+`SUBFOLDER` when the container is mounted somewhere other than `/streaming/`.
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `SUBFOLDER` | `/streaming/` | URL prefix for the whole app. The same value drives the container's nginx templating, the FastAPI mount and the vite base. |
+| `BROKER_SECRET` | unset | Shared secret for the lifecycle endpoints, sent as the `X-Broker-Secret` header. Unset disables the check. |
+| `BROKER_HOST` | `127.0.0.1` | Interface uvicorn binds. nginx is the only intended client. |
+| `BROKER_PORT` | `8000` | Port uvicorn binds. The image's nginx template points at 8000. |
+| `ROM_ROOT` | `/romm` | Activate rejects rom paths outside this root. |
+| `BROKER_EXPORT_DIR` | `/config/broker-exports` | Where exit writes save archives: always in dev mode, otherwise only when the upload fails. |
+| `BROKER_IMPORT_DIR` | `/config/broker-imports` | Where uploaded save archives land, ready to pass to activate as `save.archive`. |
+| `BROKER_FRONTEND_DIST` | `/usr/share/webstation-broker/www` | The built room UI served outside dev mode. |
+| `BROKER_DISPLAY` | `:0` | X display emulators are launched onto. |
+| `BROKER_WAYLAND_DISPLAY` | `wayland-0` | Wayland display emulators are launched onto. |
+| `BROKER_PID_FILE` | `/config/broker-emulator.json` | Where the running emulator's pid is recorded so a restarted broker can still kill it. |
+| `BROKER_SAVE_UPLOAD_PATH` | `/api/webstation/saves` | Path appended to the callback base URL when exit POSTs the save archive. |
+| `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | Seconds allowed for the exit save upload. |
+| `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | Ceiling on one state file over the state-file routes (256 MiB). RomM caps the same transfer, so raising one end alone only moves which end refuses. |
+| `BROKER_STATE_SCREENSHOT_MAX_BYTES` | `16777216` | Ceiling on the frame served with a state (16 MiB). Same two-sided cap. |
+| `BROKER_GAMEPAD_SLOTS` | `4` | Number of virtual gamepad slots the room can assign. |
+| `BROKER_DEV_MODE` | unset | `true` runs from mounted source with uvicorn and vite hot reload, and disables the exit save upload (report-only). See [Dev mode](/docs/container/dev-mode). |
+
+## Variables the image sets for the broker
+
+These are written by the container's init scripts rather than by you, and are
+listed so their role is clear when reading logs.
+
+| Env var | Set by | Purpose |
+| --- | --- | --- |
+| `SELKIES_CONTROL_URL` | `init-romm-config` | Base URL of the selkies control plane, `http://127.0.0.1:<CUSTOM_WS_PORT><SUBFOLDER>stream`. The broker posts token maps to `<url>/api/tokens`, falling back to `<url>/tokens`. Unset, it tries `127.0.0.1:8082` and `8083` directly. |
+| `SELKIES_MASTER_TOKEN` | `init-romm-config` | Bearer token for those pushes. Generated per boot when not supplied. |
+| `XDG_RUNTIME_DIR` | base image | Where PCSX2's PINE socket is looked for (`pcsx2.sock`), default `/config/.XDG`. |
+
+## Paths the launchers share
+
+`HOME` inside the container is `/config`, and `XDG_CONFIG_HOME` /
+`XDG_DATA_HOME` are honoured where the emulator honours them. The per-launcher
+defaults on the [next page](/docs/configuration/emulators) all fall out of
+that, so none of them need setting unless the image layout changes.
