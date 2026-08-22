@@ -209,6 +209,15 @@ def test_load_state_refuses_an_empty_slot(state_dir):
     assert emu.load_state(1) is False
 
 
+def test_memory_card_is_gamecube_only(tmp_path, monkeypatch):
+    """GC has a physical card, Wii saves live in NAND and have none."""
+    monkeypatch.setattr(dolphin, "USER_DIR", tmp_path)
+    emu = dolphin.Dolphin()
+    assert emu.memory_card_path(platform="ngc") == tmp_path / "GC"
+    assert emu.memory_card_path(platform="wii") is None
+    assert emu.memory_card_path() is None
+
+
 def test_exit_reports_the_working_slot_without_a_running_emulator(state_dir, monkeypatch):
     monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
     undo = _touch(state_dir / "lastState.sav")

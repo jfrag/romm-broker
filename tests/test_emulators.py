@@ -52,10 +52,12 @@ def test_a_memory_card_comes_with_everything_the_card_routes_need(name):
         assert emu.memory_card_path() is None
         return
 
-    # The card travels on its own routes, so it has to be nameable, findable,
-    # and removable from the save archive.
-    assert emu.memory_card_marker
-    assert emu.memory_card_path() is not None
+    # The card travels on its own routes, so it has to be removable from the
+    # save archive. Findability is platform-gated for an emulator whose card
+    # exists on only some of the platforms it serves (Dolphin: GC, not Wii),
+    # so that half of the contract is exercised in that emulator's own tests
+    # instead of here. A marker is only required for emulators (PCSX2) whose
+    # own runtime refuses a markerless folder.
     assert emu.memory_card_subtree in emu.save_subtrees
 
 

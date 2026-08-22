@@ -230,9 +230,12 @@ class Dolphin(Emulator):
     name = "dolphin"
     display_name = "Dolphin"
     save_root = USER_DIR
-    # GC holds the memory cards, Wii the NAND; both ride the save archive, so
-    # nothing here needs the whole-card routes.
+    # GC holds the memory cards, Wii the NAND. GC's card also rides the
+    # whole-card routes when a container opts in (memory_card_subtree below);
+    # Wii has no physical card, so its NAND only ever moves through the save
+    # archive.
     save_subtrees = ("StateSaves", "GC", "Wii")
+    memory_card_subtree = "GC"
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
@@ -242,6 +245,15 @@ class Dolphin(Emulator):
     def __init__(self):
         super().__init__()
         self._launch_seq = 0
+
+    def memory_card_path(self, platform: str | None = None) -> Path | None:
+        """The whole GC/ tree, or None for Wii (NAND, no physical card).
+
+        Returns the tree rather than one region's Card A folder: Dolphin
+        buckets a GCI folder card by the disc's region (GC/<region>/Card A),
+        and a library can mix regions, so syncing has to carry all of them
+        rather than guessing one."""
+        return USER_DIR / "GC" if platform == "ngc" else None
 
     def resolve_rom_file(self, path: Path) -> Path | None:
         if path.is_file():

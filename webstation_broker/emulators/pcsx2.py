@@ -377,7 +377,7 @@ class Pcsx2(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def memory_card_path(self) -> Path | None:
+    def memory_card_path(self, platform: str | None = None) -> Path | None:
         return MEMCARD_DIR / SLOT1_CARD_NAME
 
     def _ensure_folder_card(self) -> None:

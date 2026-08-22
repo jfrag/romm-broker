@@ -258,12 +258,14 @@ class Emulator:
         after the loaded content can tell a stale one apart on sight and leave
         this alone; the override exists for the ones that cannot."""
 
-    def memory_card_path(self) -> Path | None:
+    def memory_card_path(self, platform: str | None = None) -> Path | None:
         """The directory holding the card the memory-card routes sync, or None.
 
         The broker names the card rather than reading the name out of the
         emulator's own config, because RomM lays a card down before the first
-        launch has written that config."""
+        launch has written that config. `platform` is the ROM's platform slug,
+        for an emulator whose card exists on only one of several platforms it
+        serves (GameCube vs Wii on Dolphin); most emulators ignore it."""
         return None
 
     def state_target(self, filename: str) -> Path | None:

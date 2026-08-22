@@ -645,16 +645,17 @@ async def put_state_file(
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 
 
-def _memory_card(name: str) -> tuple[Path, Optional[str]]:
+def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str]]:
     """The card the named emulator syncs, and the marker file it needs inside.
 
     Named rather than read off the session, because the card is container
     state, not session state: RomM lays one down before activate, when there is
-    no session to resolve it through."""
+    no session to resolve it through. `platform` disambiguates an emulator that
+    only has a card on some of the platforms it serves (Dolphin: GC, not Wii)."""
     emulator = get_emulator(name)
     if emulator is None:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
-    card = emulator.memory_card_path()
+    card = emulator.memory_card_path(platform)
     if card is None:
         raise HTTPException(
             status_code=400,
@@ -666,6 +667,7 @@ def _memory_card(name: str) -> tuple[Path, Optional[str]]:
 @router.get("/api/session/memory-card")
 async def get_memory_card(
     emulator: str = Query(...),
+    platform: Optional[str] = Query(default=None),
     x_broker_secret: Optional[str] = Header(default=None),
 ):
     """Serve the whole Slot-1 card so RomM can file it against the player.
@@ -676,7 +678,7 @@ async def get_memory_card(
     managed to read would be destroyed on the next claim.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator)
+    card, marker = _memory_card(emulator, platform)
     # Contention means a card operation is already in flight, and the caller
     # should come back rather than queue behind it.
     if not memcard.LOCK.acquire(blocking=False):
@@ -705,6 +707,7 @@ async def get_memory_card(
 async def put_memory_card(
     request: Request,
     emulator: str = Query(...),
+    platform: Optional[str] = Query(default=None),
     x_broker_secret: Optional[str] = Header(default=None),
 ):
     """Wipe Slot 1 and lay down the card RomM is sending.
@@ -715,7 +718,7 @@ async def put_memory_card(
     with nothing running.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator)
+    card, marker = _memory_card(emulator, platform)
     content = bytearray()
     async for chunk in request.stream():
         content.extend(chunk)
