@@ -45,6 +45,63 @@ frontend/                vite vanilla-JS room interface
   registering in `emulators/__init__.py`. The special `desktop` type launches
   the full webstation desktop for configuring emulators through the GUI.
 
+## Migrating from a per-emulator broker
+
+If you're running one of the per-emulator broker mods
+(`pcsx2-romm-integration`, `dolphin-romm-integration`,
+`xemu-romm-integration`, `rpcs3-romm-integration`, `eden-romm-integration`),
+those are deprecated. This broker, running inside a single
+[docker-webstation](https://github.com/linuxserver/docker-webstation)
+container, replaces all of them: one container serves every platform instead
+of one container per emulator.
+
+In RomM's `config.yml`, each per-emulator container used a bare `platform:`
+key. One `protocol: webstation` container replaces any number of those with
+a `platforms:` map:
+
+```yaml
+# before: one container per platform
+streaming:
+  containers:
+    - platform: ps2
+      host: https://192.168.1.51:3001
+      broker_host: http://192.168.1.51:8000
+      label: PCSX2
+      memory_card_sync: true
+    - platform: ngc
+      host: https://192.168.1.52:3001
+      broker_host: http://192.168.1.52:8000
+      label: Dolphin
+
+# after: one webstation container serving both
+streaming:
+  containers:
+    - host: https://192.168.1.56:3010
+      protocol: webstation
+      subfolder: /streaming
+      library_path: /romm
+      label: Emulation station
+      platforms:
+        ps2:
+          emulator: pcsx2
+          label: PCSX2
+          memory_card_sync: true
+        ngc:
+          emulator: dolphin
+          label: Dolphin
+```
+
+`subfolder` and `library_path` line up with this broker's own `SUBFOLDER` and
+`ROM_ROOT` env vars (see Configuration below), so set them to match however
+you deploy the container.
+
+Stand up docker-webstation with this broker installed, mount it at the same
+ROM library path your old per-emulator containers used (so save/state history
+keyed to it doesn't reset), confirm streaming works for each platform, then
+remove the old containers. See RomM's `docs/STREAMING_MIGRATION.md` for the
+full guide:
+https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md
+
 ## Configuration
 
 | Env var | Default | Purpose |
