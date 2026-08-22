@@ -47,6 +47,7 @@ import socket as _socket
 import struct
 import subprocess
 import time
+import zipfile
 from pathlib import Path
 from threading import Thread
 
@@ -77,17 +78,38 @@ GAME_DIR = DEV_HDD0 / "game"
 SSTATE_ROOT = DATA_DIR / "savestates"
 _SSTATE_LINK = DEV_HDD0 / "savestates"
 RPCS3_LOG_PATH = Path(os.environ.get("RPCS3_LOG_PATH", "/config/rpcs3.log"))
-# PKG decryption/extraction can run minutes for multi-GB packages.
+# PKG decryption and archive extraction can both run minutes for multi-GB
+# dumps, so this timeout is shared between them.
 INSTALL_TIMEOUT = float(os.environ.get("RPCS3_INSTALL_TIMEOUT", "1800"))
 
 # Boot formats, best first: decrypted ISO and PKG installer beat a bare
 # EBOOT so a folder holding both the rip and its installer picks the image.
-ROM_EXTENSIONS = (".iso", ".pkg", ".bin", ".self", ".elf")
+# Archives sort last since booting one costs an extraction first.
+ROM_EXTENSIONS = (".iso", ".pkg", ".bin", ".self", ".elf", ".7z", ".zip", ".rar")
 # EBOOT.BIN sits three levels down in a disc rip (PS3_GAME/USRDIR/EBOOT.BIN).
 _ROM_SEARCH_GLOBS = ("*", "*/*", "*/*/*")
 # Only executables named EBOOT.* are bootable; other .bin/.self files in a
 # rip (licenses, sdata) are not.
 _EBOOT_EXTS = (".bin", ".self", ".elf")
+_ARCHIVE_EXTS = (".7z", ".zip", ".rar")
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Decrypted PS3 dumps run 2-25GB. With the cache enabled, an archive is
+# extracted once into CACHE_DIR and reused on relaunch; with it disabled
+# (the default), the extraction is removed again once the game stops, so
+# an archived title never leaves a permanent decompressed copy behind.
+CACHE_DIR = Path(os.environ.get("RPCS3_CACHE_DIR", str(DATA_DIR / "extracted")))
+# Off by default: local disk headroom is limited on a typical host, and an
+# unattended cache would otherwise grow until an operator notices. 30GB
+# comfortably fits one large title's decompressed size for anyone who opts
+# in via RPCS3_CACHE_ENABLED.
+CACHE_ENABLED = _truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false"))
+CACHE_MAX_GB = float(os.environ.get("RPCS3_CACHE_MAX_GB", "30"))
+_LAST_ACCESSED_MARKER = ".last_accessed"
 
 # config.yml values forced before every launch. RPCS3 fills missing keys
 # with defaults, so a partial file is a valid config. Keyed ("section", key);
@@ -331,6 +353,153 @@ def _sfo_title_id(sfo: Path) -> str | None:
     return None
 
 
+def _archive_dir_size(path: Path) -> int:
+    total = 0
+    for f in path.rglob("*"):
+        if f.name == _LAST_ACCESSED_MARKER:
+            continue
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _cache_size_bytes() -> int:
+    if not CACHE_DIR.is_dir():
+        return 0
+    return sum(_archive_dir_size(d) for d in CACHE_DIR.iterdir() if d.is_dir())
+
+
+def _touch_last_accessed(game_dir: Path) -> None:
+    try:
+        (game_dir / _LAST_ACCESSED_MARKER).write_text(str(time.time()))
+    except OSError as exc:
+        log.warning("rpcs3 cache: could not update last-accessed marker for %s: %s", game_dir, exc)
+
+
+def _evict_lru(needed_bytes: int, keep: str) -> None:
+    """Evict least-recently-used extracted games until needed_bytes fits
+    within CACHE_MAX_GB. keep is the stem currently being (re-)extracted, so
+    a stale entry for it already removed by the caller is never chosen."""
+    if not CACHE_ENABLED or not CACHE_DIR.is_dir():
+        return
+    max_bytes = int(CACHE_MAX_GB * 1024**3)
+    current = _cache_size_bytes()
+    while current + needed_bytes > max_bytes:
+        candidates = []
+        for game_dir in CACHE_DIR.iterdir():
+            if not game_dir.is_dir() or game_dir.name == keep:
+                continue
+            marker = game_dir / _LAST_ACCESSED_MARKER
+            try:
+                mtime = marker.stat().st_mtime if marker.exists() else 0.0
+            except OSError:
+                mtime = 0.0
+            candidates.append((mtime, game_dir))
+        if not candidates:
+            log.warning(
+                "rpcs3 cache: nothing left to evict, proceeding over the %.0f GB cap", CACHE_MAX_GB
+            )
+            return
+        candidates.sort(key=lambda c: c[0])
+        victim = candidates[0][1]
+        victim_size = _archive_dir_size(victim)
+        log.info("rpcs3 cache: evicting %s (least recently used)", victim.name)
+        try:
+            shutil.rmtree(victim)
+        except OSError as exc:
+            log.warning("rpcs3 cache: could not evict %s: %s", victim, exc)
+            return
+        current -= victim_size
+
+
+def _archive_boot_target(root: Path) -> Path | None:
+    """Best boot target inside an extracted archive: an EBOOT.BIN anywhere
+    (disc rip or PKG-installed layout), or failing that a bare decrypted
+    .iso an archive may hold instead of an unpacked JB folder."""
+    for eboot in root.rglob("EBOOT.BIN"):
+        return eboot
+    for iso in root.rglob("*.iso"):
+        return iso
+    return None
+
+
+def _run_extractor(cmd: list[str], what: str) -> None:
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"{what} failed to run: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
+
+
+def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
+    """zf.extractall() writes a member's path verbatim, so a `../` name in
+    the archive (Zip Slip) can escape dest; reject any member that would."""
+    dest_real = dest.resolve()
+    for member in zf.namelist():
+        target = (dest / member).resolve()
+        if target != dest_real and dest_real not in target.parents:
+            raise RuntimeError(f"zip member escapes extraction dir: {member}")
+    zf.extractall(dest)
+
+
+def _extract_archive(archive: Path, dest: Path) -> None:
+    ext = archive.suffix.lower()
+    log.info("rpcs3: extracting %s (%s)", archive.name, ext)
+    if ext == ".zip":
+        try:
+            with zipfile.ZipFile(archive) as zf:
+                _safe_extract_zip(zf, dest)
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
+    elif ext == ".rar":
+        _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
+    else:
+        # .7z, plus a fallback attempt for any other archive format 7z can
+        # identify (RAR5, tar-in-7z JB dumps, etc).
+        _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
+
+
+def _extract_and_cache(archive: Path) -> Path:
+    """Extract archive into CACHE_DIR, reusing a prior extraction keyed by
+    stem when one already holds a bootable target. Raises on failure so
+    launch() aborts before ever starting rpcs3 on nothing bootable."""
+    game_dir = CACHE_DIR / archive.stem
+
+    if game_dir.is_dir():
+        boot = _archive_boot_target(game_dir)
+        if boot is not None:
+            log.info("rpcs3 cache hit: %s (boot target: %s)", archive.stem, boot.name)
+            _touch_last_accessed(game_dir)
+            return boot
+        log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.stem)
+        shutil.rmtree(game_dir, ignore_errors=True)
+
+    try:
+        needed = int(archive.stat().st_size * 1.1)
+    except OSError:
+        needed = 0
+    _evict_lru(needed, archive.stem)
+
+    game_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        _extract_archive(archive, game_dir)
+    except RuntimeError:
+        shutil.rmtree(game_dir, ignore_errors=True)
+        raise
+
+    boot = _archive_boot_target(game_dir)
+    if boot is None:
+        shutil.rmtree(game_dir, ignore_errors=True)
+        raise RuntimeError(f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso")
+    _touch_last_accessed(game_dir)
+    log.info("rpcs3: extracted %s, booting %s", archive.name, boot)
+    return boot
+
+
 def _pkg_title_id(pkg: Path) -> str | None:
     """Title ID from the PKG header: the content id at offset 0x30 embeds it
     as chars 7-15 (`UP0001-BLUS30443_00-...` -> BLUS30443)."""
@@ -541,6 +710,9 @@ class Rpcs3(Emulator):
     def __init__(self):
         super().__init__()
         self._launch_seq = 0
+        # Only set for an archive boot; stop() removes it when the cache is
+        # disabled so nothing outlives the session it was extracted for.
+        self._extracted_dir: Path | None = None
 
     def clear_working_slot(self) -> None:
         """RPCS3 has no fixed slot to clear, but activate() calls this before
@@ -649,7 +821,14 @@ class Rpcs3(Emulator):
 
         _patch_config()
         _patch_ipc()
-        boot = _install_pkgs(rom_path) if rom_path.suffix.lower() == ".pkg" else rom_path
+        ext = rom_path.suffix.lower()
+        if ext == ".pkg":
+            boot = _install_pkgs(rom_path)
+        elif ext in _ARCHIVE_EXTS:
+            boot = _extract_and_cache(rom_path)
+            self._extracted_dir = CACHE_DIR / rom_path.stem
+        else:
+            boot = rom_path
 
         # Save dirs (and now states) are named with the title serial as
         # prefix; remember it so the exit dump can be scoped to this title.
@@ -778,6 +957,10 @@ class Rpcs3(Emulator):
         # Invalidate any in-flight boot watchdog before the kill.
         self._launch_seq += 1
         super().stop()
+        if not CACHE_ENABLED and self._extracted_dir is not None:
+            log.info("rpcs3 cache disabled: removing extracted copy %s", self._extracted_dir.name)
+            shutil.rmtree(self._extracted_dir, ignore_errors=True)
+            self._extracted_dir = None
 
     def _session_save_dirs(self) -> list[Path]:
         """This title's save dirs: name prefixed with the session serial, or

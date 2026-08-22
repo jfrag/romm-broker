@@ -162,6 +162,17 @@ Adjust graphics settings as desired and run a game to confirm.
 > at all, so it is used only to confirm a launch actually reached a running
 > game and, when a game's title id can't be read from the file path alone,
 > to look it up once the game is confirmed running.
+>
+> A ROM stored as a `.7z`, `.zip`, or `.rar` archive is extracted on launch,
+> since RPCS3 cannot boot an archive directly. By default the extracted
+> copy is removed again once the game stops, so archiving a PS3 dump saves
+> library space without leaving a permanent decompressed copy on local
+> disk. Set `RPCS3_CACHE_ENABLED=true` to keep the extraction around and
+> reuse it on later launches instead, bounded by `RPCS3_CACHE_MAX_GB`
+> (default 30GB, oldest extraction evicted first). The cache lives at
+> `/config/.config/rpcs3/extracted`; if you enable it, point a dedicated
+> bind mount or Docker volume at that path so it doesn't compete with the
+> rest of `/config` for space.
 
 ## Cemu
 
