@@ -913,6 +913,7 @@ class Retroarch(Emulator):
                             st = p.stat()
                         except OSError as exc:
                             log.warning("could not stat saved state %s: %s", p, exc)
+                            saved = False
                         else:
                             state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
             # Flush SRAM so the save dump ships current save data.
