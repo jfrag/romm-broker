@@ -857,6 +857,43 @@ def test_archive_boot_target_is_none_when_nothing_bootable_is_present(cache_dir)
     assert rpcs3._archive_boot_target(root) is None
 
 
+def test_archive_boot_target_refuses_an_eboot_that_symlinks_outside_root(cache_dir, tmp_path):
+    root = cache_dir / "Game"
+    root.mkdir(parents=True)
+    outside = _touch(tmp_path / "outside" / "secret.bin")
+    (root / "EBOOT.BIN").symlink_to(outside)
+
+    assert rpcs3._archive_boot_target(root) is None
+
+
+def test_archive_boot_target_refuses_an_iso_that_symlinks_outside_root(cache_dir, tmp_path):
+    root = cache_dir / "Game"
+    root.mkdir(parents=True)
+    outside = _touch(tmp_path / "outside" / "disc.iso")
+    (root / "disc.iso").symlink_to(outside)
+
+    assert rpcs3._archive_boot_target(root) is None
+
+
+def test_archive_boot_target_accepts_an_eboot_that_symlinks_inside_root(cache_dir):
+    root = cache_dir / "Game"
+    real_eboot = _touch(root / "real" / "actual_eboot.bin")
+    linked = root / "PS3_GAME" / "USRDIR" / "EBOOT.BIN"
+    linked.parent.mkdir(parents=True)
+    linked.symlink_to(real_eboot)
+
+    assert rpcs3._archive_boot_target(root) == linked
+
+
+def test_archive_boot_target_skips_a_dangling_eboot_symlink(cache_dir):
+    root = cache_dir / "Game"
+    root.mkdir(parents=True)
+    (root / "EBOOT.BIN").symlink_to(root / "does-not-exist")
+    iso = _touch(root / "disc.iso")
+
+    assert rpcs3._archive_boot_target(root) == iso
+
+
 def _make_zip(path: Path, members: dict[str, bytes]) -> Path:
     with zipfile.ZipFile(path, "w") as zf:
         for name, data in members.items():
@@ -897,25 +934,95 @@ def test_extract_archive_zip_raises_on_a_corrupt_file(cache_dir, tmp_path):
 
 def test_extract_archive_dispatches_rar_to_unrar(cache_dir, tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd))
+    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
     archive = tmp_path / "Game.rar"
     archive.write_bytes(b"rar")
 
     rpcs3._extract_archive(archive, cache_dir / "Game")
 
-    assert calls[0][0] == "unrar"
-    assert str(archive) in calls[0]
+    assert calls[0] == ["unrar", "lb", "-y", str(archive)]
+    assert calls[1][0] == "unrar" and calls[1][1] == "x"
+    assert str(archive) in calls[1]
 
 
 def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(cache_dir, tmp_path, monkeypatch):
     calls = []
-    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd))
+    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
 
     rpcs3._extract_archive(archive, cache_dir / "Game")
 
-    assert calls[0][0] == "7z"
+    assert calls[0] == ["7z", "l", "-slt", str(archive)]
+    assert calls[1][0] == "7z" and calls[1][1] == "x"
+
+
+def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, what):
+        calls.append(cmd)
+        return "../../etc/passwd\n" if cmd[1] == "lb" else ""
+
+    monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
+    archive = tmp_path / "Evil.rar"
+    archive.write_bytes(b"rar")
+
+    with pytest.raises(RuntimeError, match="escapes"):
+        rpcs3._extract_archive(archive, cache_dir / "Evil")
+
+    assert calls == [["unrar", "lb", "-y", str(archive)]]
+
+
+def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_path, monkeypatch):
+    calls = []
+    slt_output = "Path = Evil.7z\n\n----------\nPath = ../../etc/passwd\nSize = 4\n"
+
+    def fake_run(cmd, what):
+        calls.append(cmd)
+        return slt_output if cmd[1] == "l" else ""
+
+    monkeypatch.setattr(rpcs3, "_run_extractor", fake_run)
+    archive = tmp_path / "Evil.7z"
+    archive.write_bytes(b"7z")
+
+    with pytest.raises(RuntimeError, match="escapes"):
+        rpcs3._extract_archive(archive, cache_dir / "Evil")
+
+    assert calls == [["7z", "l", "-slt", str(archive)]]
+
+
+def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    with pytest.raises(RuntimeError, match="escapes"):
+        rpcs3._reject_unsafe_members(dest, ["../outside.txt"])
+
+
+def test_reject_unsafe_members_allows_normal_paths(tmp_path):
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    rpcs3._reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
+
+
+def test_rar_member_paths_parses_bare_listing(monkeypatch, tmp_path):
+    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: "sub\nsub/file.txt\ntop.txt\n")
+
+    assert rpcs3._rar_member_paths(tmp_path / "Game.rar") == ["sub", "sub/file.txt", "top.txt"]
+
+
+def test_7z_member_paths_parses_slt_listing_and_skips_the_archive_header(monkeypatch, tmp_path):
+    slt_output = (
+        "Path = Game.7z\nType = 7z\n\n"
+        "----------\n"
+        "Path = sub\nSize = 0\n\n"
+        "Path = sub/file.txt\nSize = 3\n"
+    )
+    monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: slt_output)
+
+    assert rpcs3._7z_member_paths(tmp_path / "Game.7z") == ["sub", "sub/file.txt"]
 
 
 def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch):
@@ -939,10 +1046,52 @@ def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch):
         rpcs3._run_extractor(["unrar", "x"], "unrar (Game.rar)")
 
 
+def test_cache_key_differs_for_archives_sharing_a_stem_but_not_an_extension(tmp_path):
+    zip_archive = tmp_path / "Game.zip"
+    zip_archive.write_bytes(b"zip")
+    rar_archive = tmp_path / "Game.rar"
+    rar_archive.write_bytes(b"rar")
+
+    assert rpcs3._cache_key(zip_archive) != rpcs3._cache_key(rar_archive)
+
+
+def test_cache_key_changes_when_a_same_named_archive_is_replaced(tmp_path):
+    archive = tmp_path / "Game.7z"
+    archive.write_bytes(b"original")
+    original_key = rpcs3._cache_key(archive)
+
+    archive.write_bytes(b"a completely different dump")
+    os.utime(archive, (archive.stat().st_mtime + 5, archive.stat().st_mtime + 5))
+
+    assert rpcs3._cache_key(archive) != original_key
+
+
+def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(
+    cache_dir, tmp_path, monkeypatch
+):
+    archive = tmp_path / "Game.7z"
+    archive.write_bytes(b"original dump")
+    stale_eboot = _touch(cache_dir / rpcs3._cache_key(archive) / "EBOOT.BIN")
+
+    archive.write_bytes(b"a completely different, much longer replacement dump")
+    os.utime(archive, (archive.stat().st_mtime + 5, archive.stat().st_mtime + 5))
+
+    def fake_extract(archive_, dest):
+        _touch(dest / "EBOOT.BIN")
+
+    monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
+
+    boot = rpcs3._extract_and_cache(archive)
+
+    assert boot != stale_eboot
+    assert boot.parent != stale_eboot.parent
+
+
 def test_extract_and_cache_reuses_an_existing_bootable_extraction(cache_dir, tmp_path, monkeypatch):
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
-    eboot = _touch(cache_dir / "Game" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
+    key = rpcs3._cache_key(archive)
+    eboot = _touch(cache_dir / key / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
     called = []
     monkeypatch.setattr(rpcs3, "_extract_archive", lambda *a: called.append(a))
 
@@ -950,7 +1099,7 @@ def test_extract_and_cache_reuses_an_existing_bootable_extraction(cache_dir, tmp
 
     assert boot == eboot
     assert called == []
-    assert (cache_dir / "Game" / rpcs3._LAST_ACCESSED_MARKER).exists()
+    assert (cache_dir / key / rpcs3._LAST_ACCESSED_MARKER).exists()
 
 
 def test_extract_and_cache_re_extracts_a_stale_cache_dir_with_no_boot_target(
@@ -958,7 +1107,7 @@ def test_extract_and_cache_re_extracts_a_stale_cache_dir_with_no_boot_target(
 ):
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
-    stale = cache_dir / "Game"
+    stale = cache_dir / rpcs3._cache_key(archive)
     _touch(stale / "readme.txt")
 
     def fake_extract(archive_, dest):
@@ -986,7 +1135,7 @@ def test_extract_and_cache_extracts_and_returns_the_boot_target_on_a_miss(
     boot = rpcs3._extract_and_cache(archive)
 
     assert boot.name == "EBOOT.BIN"
-    assert (cache_dir / "Game" / rpcs3._LAST_ACCESSED_MARKER).exists()
+    assert (cache_dir / rpcs3._cache_key(archive) / rpcs3._LAST_ACCESSED_MARKER).exists()
 
 
 def test_extract_and_cache_cleans_up_and_raises_when_extraction_fails(
@@ -1003,7 +1152,7 @@ def test_extract_and_cache_cleans_up_and_raises_when_extraction_fails(
     with pytest.raises(RuntimeError, match="boom"):
         rpcs3._extract_and_cache(archive)
 
-    assert not (cache_dir / "Game").exists()
+    assert not (cache_dir / rpcs3._cache_key(archive)).exists()
 
 
 def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extracted(
@@ -1016,7 +1165,7 @@ def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extrac
     with pytest.raises(RuntimeError, match="no EBOOT.BIN"):
         rpcs3._extract_and_cache(archive)
 
-    assert not (cache_dir / "Game").exists()
+    assert not (cache_dir / rpcs3._cache_key(archive)).exists()
 
 
 def test_launch_extracts_and_boots_from_an_archive_rom(
@@ -1044,10 +1193,10 @@ def test_stop_removes_the_extraction_when_the_cache_is_disabled(
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
-    game_dir = cache_dir / "Game"
-    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
+    game_dir = cache_dir / rpcs3._cache_key(archive)
+    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
 
     emu = rpcs3.Rpcs3()
     emu.launch(archive, None)
@@ -1065,10 +1214,10 @@ def test_stop_keeps_the_extraction_when_the_cache_is_enabled(
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
-    game_dir = cache_dir / "Game"
-    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
+    game_dir = cache_dir / rpcs3._cache_key(archive)
+    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
 
     emu = rpcs3.Rpcs3()
     emu.launch(archive, None)

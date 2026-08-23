@@ -40,6 +40,7 @@ The emulator is expected to be brought to a working state in desktop mode
 (firmware, GPU settings, controllers) before automated launching.
 """
 
+import hashlib
 import logging
 import os
 import shutil
@@ -381,8 +382,8 @@ def _touch_last_accessed(game_dir: Path) -> None:
 
 def _evict_lru(needed_bytes: int, keep: str) -> None:
     """Evict least-recently-used extracted games until needed_bytes fits
-    within CACHE_MAX_GB. keep is the stem currently being (re-)extracted, so
-    a stale entry for it already removed by the caller is never chosen."""
+    within CACHE_MAX_GB. keep is the cache key currently being (re-)extracted,
+    so a stale entry for it already removed by the caller is never chosen."""
     if not CACHE_ENABLED or not CACHE_DIR.is_dir():
         return
     max_bytes = int(CACHE_MAX_GB * 1024**3)
@@ -415,35 +416,72 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
         current -= victim_size
 
 
+def _is_safe_boot_candidate(candidate: Path, root_real: Path) -> bool:
+    """False for anything but a regular file resolving inside root_real, so a
+    symlink planted by the archive cannot point rpcs3 at a path elsewhere on
+    the host."""
+    try:
+        return candidate.is_file() and candidate.resolve().is_relative_to(root_real)
+    except OSError:
+        return False
+
+
 def _archive_boot_target(root: Path) -> Path | None:
     """Best boot target inside an extracted archive: an EBOOT.BIN anywhere
     (disc rip or PKG-installed layout), or failing that a bare decrypted
     .iso an archive may hold instead of an unpacked JB folder."""
+    root_real = root.resolve()
     for eboot in root.rglob("EBOOT.BIN"):
-        return eboot
+        if _is_safe_boot_candidate(eboot, root_real):
+            return eboot
     for iso in root.rglob("*.iso"):
-        return iso
+        if _is_safe_boot_candidate(iso, root_real):
+            return iso
     return None
 
 
-def _run_extractor(cmd: list[str], what: str) -> None:
+def _run_extractor(cmd: list[str], what: str) -> str:
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=INSTALL_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"{what} failed to run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(f"{what} exited {result.returncode}: {result.stderr.strip()}")
+    return result.stdout
+
+
+def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
+    """A `../` (or absolute) member path can escape dest on extraction (Zip
+    Slip); reject any member whose resolved path would land outside dest
+    before anything is written."""
+    dest_real = dest.resolve()
+    for member in members:
+        target = (dest / member).resolve()
+        if target != dest_real and dest_real not in target.parents:
+            raise RuntimeError(f"archive member escapes extraction dir: {member}")
 
 
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
     """zf.extractall() writes a member's path verbatim, so a `../` name in
     the archive (Zip Slip) can escape dest; reject any member that would."""
-    dest_real = dest.resolve()
-    for member in zf.namelist():
-        target = (dest / member).resolve()
-        if target != dest_real and dest_real not in target.parents:
-            raise RuntimeError(f"zip member escapes extraction dir: {member}")
+    _reject_unsafe_members(dest, zf.namelist())
     zf.extractall(dest)
+
+
+def _rar_member_paths(archive: Path) -> list[str]:
+    """Bare member paths from `unrar lb`: one path per line, no header or
+    column formatting to parse around."""
+    listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})")
+    return [line for line in listing.splitlines() if line]
+
+
+def _7z_member_paths(archive: Path) -> list[str]:
+    """Member paths from `7z l -slt`, the only 7z listing mode that gives a
+    full untruncated path per entry. Everything before the `----------`
+    separator describes the archive itself, not its contents."""
+    listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z list ({archive.name})")
+    _, _, body = listing.partition("----------\n")
+    return [line[len("Path = ") :] for line in body.splitlines() if line.startswith("Path = ")]
 
 
 def _extract_archive(archive: Path, dest: Path) -> None:
@@ -456,33 +494,51 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         except (zipfile.BadZipFile, OSError) as exc:
             raise RuntimeError(f"zip extraction of {archive.name} failed: {exc}") from exc
     elif ext == ".rar":
+        _reject_unsafe_members(dest, _rar_member_paths(archive))
         _run_extractor(["unrar", "x", "-y", str(archive), f"{dest}/"], f"unrar ({archive.name})")
     else:
         # .7z, plus a fallback attempt for any other archive format 7z can
         # identify (RAR5, tar-in-7z JB dumps, etc).
+        _reject_unsafe_members(dest, _7z_member_paths(archive))
         _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
+
+
+def _cache_key(archive: Path) -> str:
+    """Cache dir name for archive: its stem plus a short hash of the file's
+    own name, size, and mtime. A bare stem collides two archives that share
+    a name but differ in extension, and survives a same-named re-upload
+    with different content, either of which would otherwise serve up
+    whatever is sitting in the old cache dir as if it were the new ROM."""
+    try:
+        st = archive.stat()
+        fingerprint = f"{archive.name}:{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        fingerprint = archive.name
+    digest = hashlib.sha1(fingerprint.encode()).hexdigest()[:12]
+    return f"{archive.stem}-{digest}"
 
 
 def _extract_and_cache(archive: Path) -> Path:
     """Extract archive into CACHE_DIR, reusing a prior extraction keyed by
-    stem when one already holds a bootable target. Raises on failure so
-    launch() aborts before ever starting rpcs3 on nothing bootable."""
-    game_dir = CACHE_DIR / archive.stem
+    _cache_key when one already holds a bootable target. Raises on failure
+    so launch() aborts before ever starting rpcs3 on nothing bootable."""
+    key = _cache_key(archive)
+    game_dir = CACHE_DIR / key
 
     if game_dir.is_dir():
         boot = _archive_boot_target(game_dir)
         if boot is not None:
-            log.info("rpcs3 cache hit: %s (boot target: %s)", archive.stem, boot.name)
+            log.info("rpcs3 cache hit: %s (boot target: %s)", archive.name, boot.name)
             _touch_last_accessed(game_dir)
             return boot
-        log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.stem)
+        log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.name)
         shutil.rmtree(game_dir, ignore_errors=True)
 
     try:
         needed = int(archive.stat().st_size * 1.1)
     except OSError:
         needed = 0
-    _evict_lru(needed, archive.stem)
+    _evict_lru(needed, key)
 
     game_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -826,7 +882,7 @@ class Rpcs3(Emulator):
             boot = _install_pkgs(rom_path)
         elif ext in _ARCHIVE_EXTS:
             boot = _extract_and_cache(rom_path)
-            self._extracted_dir = CACHE_DIR / rom_path.stem
+            self._extracted_dir = CACHE_DIR / _cache_key(rom_path)
         else:
             boot = rom_path
 

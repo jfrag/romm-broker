@@ -203,15 +203,11 @@ class Duckstation(Emulator):
     def clear_working_slot(self) -> None:
         """Drop every resume state left in SSTATE_DIR before a restore.
 
-        Unlike RPCS3's per-title savestates/<serial>/ layout, DuckStation
-        writes every title's <serial>_resume.sav into one flat directory, so a
-        leftover from an earlier game or session in this container is
-        otherwise indistinguishable from a state the archive is about to
-        restore: _newest_resume_state() picks whichever file is newest with no
-        serial filter at all. Anything still here belongs to a session that
-        already exited, so dropping it all is what keeps a stale, unrelated
-        resume state from being served as the new game's own; the same
-        trade-off RPCS3's clear_working_slot makes."""
+        All titles share one flat directory, and _newest_resume_state()
+        picks whichever file is newest with no serial filter. A leftover
+        from an earlier session is otherwise indistinguishable from the
+        state a restore is about to write, so clearing everything here is
+        what keeps a stale file from being served as the new game's own."""
         if not SSTATE_DIR.is_dir():
             return
         for stale in SSTATE_DIR.glob("*_resume.sav"):
