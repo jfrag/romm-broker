@@ -429,8 +429,12 @@ class Ppsspp(Emulator):
             if saved:
                 p = self.state_path()
                 if p is not None:
-                    st = p.stat()
-                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                    try:
+                        st = p.stat()
+                    except OSError as exc:
+                        log.warning("could not stat saved state %s: %s", p, exc)
+                    else:
+                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         return {
             "state_saved": saved,

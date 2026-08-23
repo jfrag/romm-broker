@@ -146,8 +146,10 @@ class Shadps4(Emulator):
         # The IPC input thread starts with the process and stdin buffers early
         # writes; RUN then START release the run/start semaphores so the game
         # boots without waiting on the 5 s RUN deadline.
-        self._ipc_send("RUN")
-        self._ipc_send("START")
+        if not self._ipc_send("RUN"):
+            log.warning("shadps4 IPC RUN failed, game may not boot until the 5 s RUN deadline")
+        if not self._ipc_send("START"):
+            log.warning("shadps4 IPC START failed, game may not boot")
 
     def _ipc_send(self, cmd: str) -> bool:
         proc = self._proc

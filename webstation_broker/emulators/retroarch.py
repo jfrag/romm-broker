@@ -909,8 +909,12 @@ class Retroarch(Emulator):
                 if saved:
                     p = self.state_path()
                     if p is not None:
-                        st = p.stat()
-                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                        try:
+                            st = p.stat()
+                        except OSError as exc:
+                            log.warning("could not stat saved state %s: %s", p, exc)
+                        else:
+                            state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
             # Flush SRAM so the save dump ships current save data.
             self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
         self._quit()
@@ -951,8 +955,6 @@ class Retroarch(Emulator):
                 self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
-            except (BrokenPipeError, OSError):
-                pass
             except subprocess.TimeoutExpired:
                 log.warning(
                     "%s did not exit after QUIT, escalating to SIGTERM", self.name

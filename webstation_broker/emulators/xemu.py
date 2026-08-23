@@ -498,6 +498,8 @@ class Xemu(Emulator):
             except (AssertionError, OSError) as exc:
                 log.warning("could not inject %s into the HDD image: %s",
                             "/".join(parts), exc)
+        # pyfatx has no close()/flush(); __del__ is the only way to trigger
+        # fatx_close_device and commit these writes to the image.
         del fs
         return written
 
@@ -543,6 +545,8 @@ class Xemu(Emulator):
                         log.warning("could not stage %s: %s", dest, exc)
                         continue
                     extracted += 1
+        # pyfatx has no close()/flush(); __del__ is the only way to trigger
+        # fatx_close_device and release the image.
         del fs
         return extracted
 

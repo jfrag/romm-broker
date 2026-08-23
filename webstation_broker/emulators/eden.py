@@ -10,9 +10,9 @@ container brings its matching profile along and the paths line up.
 
 Shutdown: Eden's Qt frontend routes SIGTERM through the event loop into a
 normal window close (graceful emulation teardown). SIGINT is _exit(1) in
-Eden never use it. The close path pops a confirmation dialog unless the
-`confirmStop` UI setting is Ask_Never, so that is patched before every
-launch.
+Eden, so the broker never sends it. The close path pops a confirmation
+dialog unless the `confirmStop` UI setting is Ask_Never, so that is patched
+before every launch.
 """
 
 import logging
