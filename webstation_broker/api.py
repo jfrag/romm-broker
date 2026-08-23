@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -100,12 +101,26 @@ def _landing_url(token: str) -> str:
     return f"{settings.PREFIX}/?token={token}"
 
 
+def _check_callback_scheme(base_url: str) -> None:
+    """Reject anything but http(s), so a malicious base_url can't turn the
+    exit-save upload into a file:// read or point it at a non-HTTP internal
+    service. Defense in depth: this route already requires the caller to
+    hold BROKER_SECRET, but the callback base_url itself is otherwise
+    unrestricted (split-origin deployments need it to point anywhere)."""
+    scheme = urlsplit(base_url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=422, detail=f"callback.base_url must be http(s): {base_url!r}"
+        )
+
+
 def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict:
     """Where the exit save archive goes. Same-origin deployments don't need
     to send a base_url: the broker sits under the parent's SUBFOLDER, so the
     origin that served the activate request IS the parent. An explicit
     base_url still wins for split-origin setups."""
     if body_cb and body_cb.base_url:
+        _check_callback_scheme(body_cb.base_url)
         return {"base_url": body_cb.base_url, "token": body_cb.token, "derived": False}
     proto = (
         request.headers.get("x-forwarded-proto") or request.url.scheme
@@ -560,7 +575,8 @@ async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)):
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"could not read state file: {exc}")
+        log.warning("state-file: could not stat %s: %s", path, exc)
+        raise HTTPException(status_code=500, detail="could not read state file")
     if size > settings.STATE_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="state file exceeds size limit")
     log.info("state-file: serving %s (%d bytes)", path.name, size)
@@ -591,11 +607,22 @@ async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=N
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"could not read screenshot: {exc}")
+        log.warning("state-screenshot: could not stat %s: %s", path, exc)
+        raise HTTPException(status_code=500, detail="could not read screenshot")
     if size > settings.STATE_SCREENSHOT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
     log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
     return FileResponse(path, media_type="image/png")
+
+
+def _unlink_best_effort(path: Path) -> None:
+    """tmp.unlink(missing_ok=True) still raises if the parent turned out not
+    to be a directory at all; the cleanup itself must never crash a request
+    that is already reporting the failure that led here."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("could not remove temp file %s: %s", path, exc)
 
 
 @router.put("/api/session/state-file")
@@ -635,11 +662,12 @@ async def put_state_file(
             raise HTTPException(status_code=400, detail="empty request body")
         os.replace(tmp, target)
     except HTTPException:
-        tmp.unlink(missing_ok=True)
+        _unlink_best_effort(tmp)
         raise
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"could not write state file: {exc}")
+        _unlink_best_effort(tmp)
+        log.warning("state-file: could not write %s: %s", target, exc)
+        raise HTTPException(status_code=500, detail="could not write state file")
 
     log.info("state-file: stored %s (%d bytes)", target.name, written)
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}

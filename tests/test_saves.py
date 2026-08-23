@@ -175,6 +175,34 @@ def test_write_import_lands_the_archive_under_its_final_name(tmp_path, monkeypat
     assert list((tmp_path / "imports").glob("*.part")) == []
 
 
+def test_restore_refuses_an_archive_with_too_many_entries(tmp_path, monkeypatch):
+    from webstation_broker import settings
+
+    monkeypatch.setattr(settings, "SAVE_FILE_MAX_ENTRIES", 2)
+    content = _zip({"GC/a.bin": b"1", "GC/b.bin": b"2", "GC/c.bin": b"3"})
+
+    result = saves.extract_save_archive(content, tmp_path, ("GC",))
+
+    assert "more than 2 entries" in result["error"]
+    assert not (tmp_path / "GC").exists()
+
+
+def test_restore_skips_a_member_whose_directory_resolves_outside_root(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    (root / "GC").mkdir(parents=True)
+    (root / "GC" / "linked").symlink_to(outside, target_is_directory=True)
+
+    result = saves.extract_save_archive(
+        _zip({"GC/linked/card.raw": b"x"}), root, ("GC",)
+    )
+
+    assert result["failed"] == 1
+    assert result["written"] == 0
+    assert not (outside / "card.raw").exists()
+
+
 def test_write_export_persists_the_dump(tmp_path, monkeypatch):
     from webstation_broker import settings
 

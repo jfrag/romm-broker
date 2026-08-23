@@ -58,6 +58,12 @@ FRONTEND_DIST = Path(
 # just moves which end refuses.
 STATE_FILE_MAX_BYTES = int(os.environ.get("BROKER_STATE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 
+# Ceiling on the number of members a save/memory-card archive may contain,
+# independent of SAVE_FILE_MAX_BYTES: a byte-size cap alone doesn't stop an
+# archive of huge numbers of near-zero-byte deeply-nested entries from
+# exhausting inodes or hanging the restore walk.
+SAVE_FILE_MAX_ENTRIES = int(os.environ.get("BROKER_SAVE_FILE_MAX_ENTRIES", "10000"))
+
 # Same two-sided cap for the frame served alongside a state. Matches RomM's
 # own ceiling on the transfer.
 STATE_SCREENSHOT_MAX_BYTES = int(os.environ.get("BROKER_STATE_SCREENSHOT_MAX_BYTES", str(16 * 1024 * 1024)))

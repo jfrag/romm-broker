@@ -21,6 +21,13 @@ from . import session
 log = logging.getLogger(__name__)
 router = APIRouter()
 
+# Comfortably above any legitimate text frame (chat caps at 500 chars,
+# username at 25); rejects a flood of oversized frames before json.loads
+# ever runs on them.
+MAX_TEXT_FRAME_BYTES = 8 * 1024
+
+CHAT_COOLDOWN_SECONDS = 1.0
+
 
 @router.websocket("/ws/room")
 async def room_websocket(websocket: WebSocket):
@@ -69,6 +76,8 @@ async def room_websocket(websocket: WebSocket):
                 break
 
             if "text" in message:
+                if len(message["text"]) > MAX_TEXT_FRAME_BYTES:
+                    continue
                 data = json.loads(message["text"])
                 action = data.get("action")
                 data["sender_token"] = token
@@ -107,8 +116,12 @@ async def room_websocket(websocket: WebSocket):
                         await session.broadcast_state()
 
                 elif action == "send_chat_message":
+                    now = time.time()
+                    if now - connection_info.get("last_chat_message", 0) < CHAT_COOLDOWN_SECONDS:
+                        continue
                     text = data.get("message", "").strip()
                     if text and 1 <= len(text) <= 500:
+                        connection_info["last_chat_message"] = now
                         await session.broadcast_to_room(
                             {
                                 "type": "chat_message",
@@ -121,7 +134,15 @@ async def room_websocket(websocket: WebSocket):
                         )
 
                 elif action in ("video_state", "audio_state", "force_cursor_render"):
-                    await session.broadcast_to_room({"type": "control", "payload": data})
+                    # Self-reported (webcam/mic) or self-triggered (gaming-mode
+                    # cursor baking by a non-controller viewer, so this can't be
+                    # gated to the controller); sender_token above already stops
+                    # a client from spoofing another user's identity in it. The
+                    # only thing left to enforce is that state is actually a
+                    # boolean flag, not an arbitrary value forwarded verbatim
+                    # into the Selkies input channel.
+                    if data.get("state") in (0, 1):
+                        await session.broadcast_to_room({"type": "control", "payload": data})
 
                 elif action == "request_resolutions" and is_controller:
                     await session.broadcast_to_room({"type": "request_resolutions"})

@@ -17,6 +17,14 @@ def sstate_dir(monkeypatch, tmp_path):
     return d
 
 
+@pytest.fixture
+def rom_root(monkeypatch, tmp_path):
+    root = tmp_path / "romm"
+    root.mkdir()
+    monkeypatch.setattr(pcsx2, "ROM_ROOT", root)
+    return root
+
+
 def _touch(path: Path, mtime=None) -> Path:
     path.write_bytes(b"state")
     if mtime is not None:
@@ -219,3 +227,14 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(monkeypatch,
     assert len(started) == 1
     assert started[0][0] == "_boot_watchdog"
     assert started[0][1] == (None, emu._launch_seq)
+
+
+def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
+    rom_root, tmp_path
+):
+    outside = tmp_path / "elsewhere.iso"
+    outside.write_bytes(b"iso")
+    linked = rom_root / "Game.iso"
+    linked.symlink_to(outside)
+
+    assert pcsx2.Pcsx2().resolve_rom_file(linked) is None

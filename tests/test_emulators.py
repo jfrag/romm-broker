@@ -185,3 +185,30 @@ def test_an_emulator_does_not_support_disc_swap_by_default():
 def test_swapping_a_disc_on_the_base_class_is_not_implemented():
     with pytest.raises(NotImplementedError):
         base.Emulator().swap_disc(Path("/romm/game/disc2.chd"))
+
+
+def test_the_launch_env_strips_named_secrets(monkeypatch):
+    monkeypatch.setenv("BROKER_SECRET", "s3cret")
+    monkeypatch.setenv("SELKIES_MASTER_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh")
+
+    env = base.base_launch_env()
+
+    assert "BROKER_SECRET" not in env
+    assert "SELKIES_MASTER_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+@pytest.mark.parametrize(
+    "name", ["SOME_API_SECRET", "OAUTH_TOKEN", "DB_PASSWORD", "AWS_ACCESS_KEY"]
+)
+def test_the_launch_env_strips_anything_secret_shaped(monkeypatch, name):
+    monkeypatch.setenv(name, "sensitive")
+
+    assert name not in base.base_launch_env()
+
+
+def test_the_launch_env_keeps_ordinary_variables(monkeypatch):
+    monkeypatch.setenv("SOME_HARMLESS_VAR", "keep-me")
+
+    assert base.base_launch_env()["SOME_HARMLESS_VAR"] == "keep-me"

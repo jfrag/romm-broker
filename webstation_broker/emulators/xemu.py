@@ -527,6 +527,7 @@ class Xemu(Emulator):
             log.warning("no save directories found on %s for title %s; the "
                         "archive will be empty", self.hdd_image, self._title_id or "<all>")
         extracted = 0
+        staging_real = self.staging_dir.resolve()
         for src in roots:
             for root, _dirs, filenames in fs.walk(src):
                 for name in filenames:
@@ -538,6 +539,13 @@ class Xemu(Emulator):
                                     fatx_path, exc)
                         continue
                     dest = self.staging_dir / fatx_path.lstrip("/")
+                    # Defense in depth: fs.walk()/read() surface whatever the
+                    # emulated guest wrote to its save partition, so a `..`
+                    # component (however unlikely from libfatx) is rejected
+                    # here rather than trusted to stay under staging_dir.
+                    if not dest.resolve().is_relative_to(staging_real):
+                        log.warning("save path escapes staging dir: %s", fatx_path)
+                        continue
                     try:
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_bytes(data)
@@ -552,6 +560,14 @@ class Xemu(Emulator):
 
     def resolve_rom_file(self, path: Path) -> Path | None:
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None

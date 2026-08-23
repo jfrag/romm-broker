@@ -366,6 +366,14 @@ class Pcsx2(Emulator):
 
     def resolve_rom_file(self, path: Path) -> Path | None:
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None

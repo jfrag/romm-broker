@@ -100,6 +100,17 @@ def test_resolve_gives_up_on_a_path_that_is_not_there(rom_root):
     assert dolphin.Dolphin().resolve_rom_file(rom_root / "gone") is None
 
 
+def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
+    rom_root, tmp_path
+):
+    outside = tmp_path / "elsewhere.rvz"
+    outside.write_bytes(b"rvz")
+    linked = rom_root / "Game.rvz"
+    linked.symlink_to(outside)
+
+    assert dolphin.Dolphin().resolve_rom_file(linked) is None
+
+
 @pytest.mark.parametrize(
     ("filename", "expected"),
     [

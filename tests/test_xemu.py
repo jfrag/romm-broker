@@ -139,6 +139,16 @@ def test_a_symlink_out_of_the_rom_root_is_rejected(rom_root, tmp_path):
     assert xemu.Xemu.resolve_rom_file(None, folder) is None
 
 
+def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
+    rom_root, tmp_path
+):
+    outside = tmp_path / "elsewhere.iso"
+    outside.write_bytes(b"x")
+    linked = rom_root / "Game.iso"
+    linked.symlink_to(outside)
+    assert xemu.Xemu.resolve_rom_file(None, linked) is None
+
+
 # ── HDD image location ───────────────────────────────────────────────────────
 
 
@@ -466,6 +476,18 @@ def test_extract_is_empty_when_the_title_never_saved(emulator):
     emulator._title_id = "4D530064"
 
     assert emulator._extract_saves() == 0
+
+
+def test_extract_skips_a_save_path_that_escapes_the_staging_dir(emulator):
+    """libfatx does not reserve ".." as a directory name, so a save partition
+    can carry a literal ".." entry that fs.walk() reports as-is; reassembled
+    into a path and resolved on the staging side, that walks straight back
+    out of staging_dir unless the extractor catches it first."""
+    _seed(emulator.hdd_image, "/UDATA/../../evil.dat", b"stolen")
+    emulator._title_id = None
+
+    assert emulator._extract_saves() == 0
+    assert not (emulator.staging_dir.parent / "evil.dat").exists()
 
 
 def test_inject_writes_staged_files_into_the_image(emulator):

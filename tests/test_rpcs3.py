@@ -1007,6 +1007,70 @@ def test_reject_unsafe_members_allows_normal_paths(tmp_path):
     rpcs3._reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
 
 
+def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path):
+    dest = tmp_path / "dest"
+    (dest / "sub").mkdir(parents=True)
+    (dest / "sub" / "file.txt").write_bytes(b"x")
+
+    rpcs3._reject_escaped_tree(dest)
+
+
+def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_path):
+    """The pre-extraction listing check can be fooled by a control character
+    that renders differently in unrar/7z's text listing than in the archive's
+    real central directory, so this walks what actually landed on disk -- a
+    symlink is exactly the kind of real filesystem object that check could
+    never catch before extraction ran."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    (dest / "escape").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(RuntimeError, match="escapes cache dir"):
+        rpcs3._reject_escaped_tree(dest)
+
+
+def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
+    cache_dir, tmp_path, monkeypatch
+):
+    """A second launch racing in while the first is mid-extraction must wait
+    for _CACHE_LOCK rather than run its own extraction concurrently, which
+    could interleave writes into the same not-yet-populated game_dir or have
+    one call evict the directory the other is about to boot from."""
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+
+    entered = threading.Event()
+    release = threading.Event()
+    entry_count = []
+
+    def fake_extract_archive(_archive: Path, dest: Path) -> None:
+        entry_count.append(1)
+        entered.set()
+        release.wait(timeout=5)
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "EBOOT.BIN").write_bytes(b"x")
+
+    monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract_archive)
+
+    first = threading.Thread(target=rpcs3._extract_and_cache, args=(archive,))
+    first.start()
+    assert entered.wait(timeout=5)
+
+    second = threading.Thread(target=rpcs3._extract_and_cache, args=(archive,))
+    second.start()
+    time.sleep(0.2)
+    # Still 1: the second call is blocked on _CACHE_LOCK, not free to run its
+    # own extraction while the first is still inside the critical section.
+    assert entry_count == [1]
+
+    release.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+
 def test_rar_member_paths_parses_bare_listing(monkeypatch, tmp_path):
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: "sub\nsub/file.txt\ntop.txt\n")
 

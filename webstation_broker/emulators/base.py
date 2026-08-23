@@ -20,11 +20,23 @@ XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 # emulator on top of the first.
 PID_FILE = Path(os.environ.get("BROKER_PID_FILE", "/config/broker-emulator.json"))
 
+# Explicitly named broker secrets, plus a suffix pattern for anything shaped
+# like one, stripped from every spawned emulator's environment. RetroArch in
+# particular dlopen()s third-party cores with no sandboxing; a compromised
+# core inheriting these could impersonate the broker's own API client.
+_SENSITIVE_ENV_VARS = {"BROKER_SECRET", "SELKIES_MASTER_TOKEN", "GITHUB_TOKEN"}
+_SENSITIVE_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_PASSWORD", "_KEY")
+
 
 def base_launch_env() -> dict[str, str]:
     """Environment apps are launched into: the broker's own environment,
-    pointed at the running labwc session's displays."""
-    env = dict(os.environ)
+    pointed at the running labwc session's displays, with secret-shaped
+    variables stripped out (see _SENSITIVE_ENV_VARS)."""
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _SENSITIVE_ENV_VARS and not k.endswith(_SENSITIVE_ENV_SUFFIXES)
+    }
     env["WAYLAND_DISPLAY"] = os.environ.get("BROKER_WAYLAND_DISPLAY", "wayland-0")
     env["DISPLAY"] = os.environ.get("BROKER_DISPLAY", ":0")
     # s6 services get a minimal PATH; emulator binaries live in /usr/games.

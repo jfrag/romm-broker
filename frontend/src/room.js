@@ -1441,7 +1441,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const overlay = document.createElement('div');
         overlay.className = 'video-overlay';
         overlay.innerHTML = `
-            <span class="username">${username}</span>
+            <span class="username">${escapeHTML(username)}</span>
             <div class="remote-controls">
                 ${controllerControls}
                 <button class="remote-control-btn mute-audio" data-token="${token}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
@@ -2316,8 +2316,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 case 'user_joined': content = t('systemMessages.userJoined', { username: escapeHTML(data.username) }); break;
                 case 'user_left': content = t('systemMessages.userLeft', { username: escapeHTML(data.username) }); break;
                 case 'username_changed': content = t('systemMessages.usernameChanged', { old_username: escapeHTML(data.old_username), new_username: escapeHTML(data.new_username) }); break;
-                case 'gamepad_change': content = data.message; break;
-                case 'mk_change': content = data.message; break;
+                case 'gamepad_change': content = escapeHTML(data.message); break;
+                case 'mk_change': content = escapeHTML(data.message); break;
             }
             msgEl.className = 'system-message';
             msgEl.innerHTML = `<span>${content}</span>`;

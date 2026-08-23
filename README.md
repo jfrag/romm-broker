@@ -107,7 +107,9 @@ https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md
 | Env var | Default | Purpose |
 | --- | --- | --- |
 | `SUBFOLDER` | `/streaming/` | URL prefix for the whole app |
-| `BROKER_SECRET` | unset | shared secret for the lifecycle endpoints (`X-Broker-Secret` header); unset disables auth |
+| `BROKER_SECRET` | unset | shared secret for the lifecycle endpoints (`X-Broker-Secret` header); **required** — the broker refuses to start without it unless `BROKER_DEV_MODE=true` is also set |
+| `BROKER_DEV_MODE` | unset | `true` explicitly opts into running with no `BROKER_SECRET` (local development only; every lifecycle endpoint is unauthenticated) |
+| `BROKER_SAVE_FILE_MAX_ENTRIES` | `10000` | ceiling on member count in a save/memory-card archive, independent of the byte-size cap |
 | `ROM_ROOT` | `/romm` | activate rejects rom paths outside this root |
 | `BROKER_EXPORT_DIR` | `/config/broker-exports` | where exit writes save archives (always in dev mode, otherwise only when the upload fails) |
 | `BROKER_IMPORT_DIR` | `/config/broker-imports` | where uploaded save archives land, ready to pass to activate as `save.archive` |

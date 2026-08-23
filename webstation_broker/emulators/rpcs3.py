@@ -50,7 +50,7 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 
 from .base import Emulator, base_launch_env
 
@@ -111,6 +111,12 @@ CACHE_DIR = Path(os.environ.get("RPCS3_CACHE_DIR", str(DATA_DIR / "extracted")))
 CACHE_ENABLED = _truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false"))
 CACHE_MAX_GB = float(os.environ.get("RPCS3_CACHE_MAX_GB", "30"))
 _LAST_ACCESSED_MARKER = ".last_accessed"
+
+# Serializes cache-dir mutation: eviction picking a victim, extraction of a
+# new one, and the boot-target lookup that follows all touch the same
+# CACHE_DIR tree, so one launch's eviction can't rmtree a directory another
+# launch is mid-extracting into or about to boot from.
+_CACHE_LOCK = Lock()
 
 # config.yml values forced before every launch. RPCS3 fills missing keys
 # with defaults, so a partial file is a valid config. Keyed ("section", key);
@@ -484,6 +490,39 @@ def _7z_member_paths(archive: Path) -> list[str]:
     return [line[len("Path = ") :] for line in body.splitlines() if line.startswith("Path = ")]
 
 
+def _reject_escaped_tree(dest: Path) -> None:
+    """Post-extraction safety net for the .rar/.7z paths.
+
+    unrar/7z extraction is trusted to confine writes under dest -- 7z's own
+    extractor collapses `..` path components against the destination root --
+    but the pre-extraction member-name check above parses each tool's own
+    *text listing* to decide what's "safe" before anything is written, and a
+    member name holding a raw control character can render differently (or
+    get silently merged with the next line) in that listing than in the
+    archive's real central directory. Rather than trust the listing as a
+    proxy for what actually landed on disk, walk the real result: any
+    symlink whose target resolves outside dest is a real filesystem object
+    the listing-based check could never catch (no such thing exists until
+    after extraction), and any entry that isn't contained under dest at all
+    means the extractor's own traversal protection didn't hold -- both are
+    treated as fatal for the whole archive rather than silently dropped.
+    """
+    dest_real = dest.resolve()
+    # followlinks=False means os.walk never descends through a symlinked
+    # directory, but it still lists one in dirnames for its parent's
+    # iteration -- exactly where this loop catches it.
+    for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
+        base = Path(dirpath)
+        for name in dirnames + filenames:
+            p = base / name
+            try:
+                target_real = p.resolve()
+            except OSError as exc:
+                raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
+            if target_real != dest_real and dest_real not in target_real.parents:
+                raise RuntimeError(f"extracted member escapes cache dir: {p}")
+
+
 def _extract_archive(archive: Path, dest: Path) -> None:
     ext = archive.suffix.lower()
     log.info("rpcs3: extracting %s (%s)", archive.name, ext)
@@ -501,6 +540,8 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         # identify (RAR5, tar-in-7z JB dumps, etc).
         _reject_unsafe_members(dest, _7z_member_paths(archive))
         _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
+    if ext != ".zip":
+        _reject_escaped_tree(dest)
 
 
 def _cache_key(archive: Path) -> str:
@@ -521,38 +562,45 @@ def _cache_key(archive: Path) -> str:
 def _extract_and_cache(archive: Path) -> Path:
     """Extract archive into CACHE_DIR, reusing a prior extraction keyed by
     _cache_key when one already holds a bootable target. Raises on failure
-    so launch() aborts before ever starting rpcs3 on nothing bootable."""
-    key = _cache_key(archive)
-    game_dir = CACHE_DIR / key
+    so launch() aborts before ever starting rpcs3 on nothing bootable.
 
-    if game_dir.is_dir():
+    Holds _CACHE_LOCK for the whole call: eviction, extraction, and the
+    boot-target lookup all touch the same CACHE_DIR tree, so a second launch
+    racing in here must wait rather than potentially evicting the directory
+    this one is mid-extracting into or about to boot from.
+    """
+    with _CACHE_LOCK:
+        key = _cache_key(archive)
+        game_dir = CACHE_DIR / key
+
+        if game_dir.is_dir():
+            boot = _archive_boot_target(game_dir)
+            if boot is not None:
+                log.info("rpcs3 cache hit: %s (boot target: %s)", archive.name, boot.name)
+                _touch_last_accessed(game_dir)
+                return boot
+            log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.name)
+            shutil.rmtree(game_dir, ignore_errors=True)
+
+        try:
+            needed = int(archive.stat().st_size * 1.1)
+        except OSError:
+            needed = 0
+        _evict_lru(needed, key)
+
+        game_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _extract_archive(archive, game_dir)
+        except RuntimeError:
+            shutil.rmtree(game_dir, ignore_errors=True)
+            raise
+
         boot = _archive_boot_target(game_dir)
-        if boot is not None:
-            log.info("rpcs3 cache hit: %s (boot target: %s)", archive.name, boot.name)
-            _touch_last_accessed(game_dir)
-            return boot
-        log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.name)
-        shutil.rmtree(game_dir, ignore_errors=True)
-
-    try:
-        needed = int(archive.stat().st_size * 1.1)
-    except OSError:
-        needed = 0
-    _evict_lru(needed, key)
-
-    game_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        _extract_archive(archive, game_dir)
-    except RuntimeError:
-        shutil.rmtree(game_dir, ignore_errors=True)
-        raise
-
-    boot = _archive_boot_target(game_dir)
-    if boot is None:
-        shutil.rmtree(game_dir, ignore_errors=True)
-        raise RuntimeError(f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso")
-    _touch_last_accessed(game_dir)
-    log.info("rpcs3: extracted %s, booting %s", archive.name, boot)
+        if boot is None:
+            shutil.rmtree(game_dir, ignore_errors=True)
+            raise RuntimeError(f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso")
+        _touch_last_accessed(game_dir)
+        log.info("rpcs3: extracted %s, booting %s", archive.name, boot)
     return boot
 
 

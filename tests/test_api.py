@@ -519,6 +519,94 @@ def test_exiting_nothing_is_a_conflict(client):
     assert client.post(f"{API}/session/exit").status_code == 409
 
 
+# ── callback.base_url scheme validation ─────────────────────────────────
+
+
+def test_activate_refuses_a_non_http_callback_scheme(client, broker_dirs, fake_emulator):
+    response = _activate(
+        client, broker_dirs, callback={"base_url": "file:///etc/passwd", "token": "t"}
+    )
+
+    assert response.status_code == 422
+
+
+def test_activate_accepts_an_http_callback_scheme(
+    client, broker_dirs, fake_emulator, monkeypatch
+):
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    response = _activate(
+        client, broker_dirs, callback={"base_url": "http://romm.example/api", "token": "t"}
+    )
+    assert response.status_code == 200
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["callback"]["base_url"] == "http://romm.example/api"
+    assert body["upload"]["callback"]["derived"] is False
+
+
+def test_activate_accepts_no_callback_and_derives_one(
+    client, broker_dirs, fake_emulator, monkeypatch
+):
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    response = _activate(client, broker_dirs)
+    assert response.status_code == 200
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["callback"]["derived"] is True
+
+
+# ── generic 500s that don't leak filesystem details ─────────────────────
+
+
+def test_state_file_read_failure_reports_no_path_or_exception_text(
+    client, broker_dirs, fake_emulator, tmp_path
+):
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_file = blocker / "state.bin"
+
+    response = client.get(f"{API}/session/state-file")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not read state file"
+    assert str(blocker) not in response.text
+
+
+def test_state_screenshot_read_failure_reports_no_path_or_exception_text(
+    client, broker_dirs, fake_emulator, tmp_path
+):
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_screenshot_path = lambda: blocker / "shot.png"
+
+    response = client.get(f"{API}/session/state-screenshot")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not read screenshot"
+    assert str(blocker) not in response.text
+
+
+def test_state_file_write_failure_reports_no_path_or_exception_text(
+    client, broker_dirs, fake_emulator, tmp_path
+):
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_file = blocker / "GAME.03.p2s"
+
+    response = client.put(
+        f"{API}/session/state-file", params={"filename": "GAME.01.p2s"}, content=b"pushed"
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not write state file"
+    assert str(blocker) not in response.text
+
+
 def test_activate_records_a_multiplayer_session(client, broker_dirs, fake_emulator):
     _activate(client, broker_dirs, multiplayer=True)
 

@@ -44,6 +44,16 @@ def create_app() -> FastAPI:
     inner.include_router(api.router)
     inner.include_router(room.router)
 
+    @inner.middleware("http")
+    async def _no_referrer(request, call_next):
+        # Session/viewer tokens travel as ?token= query params (WS auth has no
+        # header alternative, and the room is iframe-embedded); a leaked
+        # Referer header would hand a live token to whatever the page links
+        # out to.
+        response = await call_next(request)
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
     if not settings.DEV_MODE and settings.FRONTEND_DIST.is_dir():
         inner.mount(
             "/",

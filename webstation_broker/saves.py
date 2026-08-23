@@ -154,6 +154,9 @@ def extract_save_archive(
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             result["error"] = "archive exceeds size limit when extracted"
             return result
+        if len(infos) > settings.SAVE_FILE_MAX_ENTRIES:
+            result["error"] = f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
+            return result
         wanted = []
         for info in infos:
             member = PurePosixPath(info.filename)
@@ -168,10 +171,18 @@ def extract_save_archive(
                 return result
             wanted.append(info)
 
+        root_real = root.resolve()
         for info in wanted:
             target = root / PurePosixPath(info.filename)
             mtime = calendar.timegm(info.date_time)
             try:
+                # Belt-and-suspenders on top of the member-path check above:
+                # confirms the resolved write location is still under root
+                # even if some ancestor directory turned out to be a symlink.
+                if not target.parent.resolve().is_relative_to(root_real):
+                    log.warning("saves: %s resolves outside save dir, skipped", info.filename)
+                    result["failed"] += 1
+                    continue
                 if target.exists() and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK:
                     result["skipped"] += 1
                     continue
@@ -180,7 +191,7 @@ def extract_save_archive(
                 tmp.write_bytes(zf.read(info))
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 log.warning("saves: could not restore %s: %s", info.filename, exc)
                 result["failed"] += 1
                 continue

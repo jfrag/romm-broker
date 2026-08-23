@@ -273,6 +273,20 @@ class TestPlaylistPreference:
         emulator.platform = "dc"
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
 
+    def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path / "romm")
+        (tmp_path / "romm").mkdir()
+        outside = tmp_path / "elsewhere.chd"
+        outside.write_bytes(b"x")
+        linked = tmp_path / "romm" / "Game.chd"
+        linked.symlink_to(outside)
+
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        assert emulator.resolve_rom_file(linked) is None
+
 
 class TestPlaylistHelpers:
     """Reading a .m3u the way RetroArch does: one relative path per line,

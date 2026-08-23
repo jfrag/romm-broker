@@ -15,6 +15,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from threading import Lock
 
+from . import settings
 from .saves import SAVE_FILE_MAX_BYTES
 
 log = logging.getLogger(__name__)
@@ -111,6 +112,8 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
         infos = [i for i in zf.infolist() if not i.is_dir()]
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
+        if len(infos) > settings.SAVE_FILE_MAX_ENTRIES:
+            return f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
         for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
@@ -128,8 +131,14 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
             # the emulator ignores. An image carrying its own marker wins.
             if marker:
                 (staging / marker).touch()
+            staging_real = staging.resolve()
             for info in infos:
                 target = staging / PurePosixPath(info.filename)
+                # Belt-and-suspenders on top of the member-path check above:
+                # confirms the resolved write location is still under the
+                # (still-empty, pre-swap) staging dir.
+                if not target.parent.resolve().is_relative_to(staging_real):
+                    raise ValueError(f"archive member resolves outside staging dir: {info.filename}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(zf.read(info))
                 written += 1
@@ -138,7 +147,7 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
             if card.exists():
                 os.replace(card, backup)
             os.replace(staging, card)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             if not card.exists() and backup.exists():
                 try:

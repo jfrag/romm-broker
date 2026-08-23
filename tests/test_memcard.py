@@ -135,6 +135,19 @@ def test_replace_leaves_no_staging_or_backup_behind(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Slot 1"]
 
 
+def test_replace_refuses_an_archive_with_too_many_entries(tmp_path, monkeypatch):
+    from webstation_broker import settings
+
+    monkeypatch.setattr(settings, "SAVE_FILE_MAX_ENTRIES", 2)
+    card = tmp_path / "Slot 1"
+    content = _zip({"a.bin": b"1", "b.bin": b"2", "c.bin": b"3"})
+
+    result = memcard.replace(card, content, MARKER)
+
+    assert "more than 2 entries" in result
+    assert not card.exists()
+
+
 def test_a_replaced_card_captures_back_to_the_same_members(tmp_path):
     card = tmp_path / "Slot 1"
     image = _zip({MARKER: b"superblock", "BMINE-00001/save.bin": b"mine"})
