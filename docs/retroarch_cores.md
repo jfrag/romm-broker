@@ -1,0 +1,118 @@
+# RetroArch core manifest
+
+`retroarch_platforms.json` maps every RomM platform slug this repo supports to a
+libretro core. Most cores just work once downloaded, but a number of them need
+a BIOS, firmware, or key file dropped into RetroArch's system directory before
+they will actually boot a game rather than sit on a black screen.
+
+This page is a repo-specific summary, not a replacement for libretro's own
+documentation. For anything not covered here, or for exact file names and
+sourcing per core, defer to libretro's
+[core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information),
+which is the authoritative source this table was cross-referenced against.
+
+Setup tiers used below:
+
+- **Required**: the core will not boot a real game without this file in place.
+- **Optional**: the core runs on a built-in HLE implementation; a real file
+  only improves accuracy or fixes specific titles.
+- **None**: nothing to source for this platform.
+
+A few rows are flagged as not confirmed against libretro's hub under the exact
+core name this repo uses (a newer or differently-named core than what the hub
+lists). Treat those as "needs an empirical check the first time you hit them,"
+not as settled.
+
+## Nintendo, cartridge and handheld
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| NES / Famicom | `mesen` | None | Cart dumps boot with nothing extra. |
+| Famicom Disk System | `mesen` | Required | `disksys.rom` in the system dir. Only this platform needs it; plain NES/Famicom carts don't. |
+| SNES / Super Famicom | `snes9x` | None | No BIOS concept for this core. |
+| Nintendo 64 | `mupen64plus_next` | None | |
+| Game Boy / Color | `gambatte` | Optional | A real boot ROM only changes splash timing; every game plays identically without one. |
+| Game Boy Advance | `mgba` | Optional | `gba_bios.bin` fixes a handful of titles that rely on exact BIOS timing; HLE covers the rest. |
+| Virtual Boy | `mednafen_vb` | None | |
+| Nintendo DS | `melonds` | Optional | Real firmware plus `bios7.bin`/`bios9.bin` is recommended; the core falls back to a built-in HLE BIOS. |
+
+## Nintendo, disc and 3D
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| GameCube / Wii | `dolphin` | Optional | HLE boot by default; a real `IPL.bin` improves accuracy. Thumbnails are disabled for this core (a GPU framebuffer grab after save can deadlock the stdin command channel), and it uses a custom save-subtree layout. |
+| 3DS | `azahar` | Optional | Most dumps boot with nothing; encrypted `.3ds`/`.cci` files need decryption keys (`boot9.bin`/`boot11.bin`) in the system dir. Sourced from a GitHub release instead of the buildbot, and uses a custom save-subtree layout. This is the only integration point for 3DS; standalone Azahar has no IPC for the broker to reach it (see [standalone_emulators.md](standalone_emulators.md#azahar)). |
+
+## Sega
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| Genesis/MD, Master System, Game Gear, SG-1000 | `genesis_plus_gx` | None | All four cart platforms on this core boot with nothing extra. |
+| Sega CD | `genesis_plus_gx` | Required | Region CD BIOS (e.g. `bios_CD_U.bin`). Same core as the row above; only this platform needs it. |
+| 32X | `picodrive` | None | Boot code lives on the cartridge itself. |
+| Dreamcast | `flycast` | Required | `dc_boot.bin` and `dc_flash.bin`, matching the standalone Flycast module's requirement (see [standalone_emulators.md](standalone_emulators.md#flycast)). |
+| Saturn | `yabasanshiro` | Required | Region Saturn BIOS. |
+
+## Sony
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| PlayStation | `swanstation` | Required | Region BIOS (e.g. `scph5501.bin`). Not listed on libretro's hub under this exact core name (a newer, DuckStation-derived core), but every PS1 core needs a real BIOS. |
+| PSP | `ppsspp` | None | PPSSPP fully HLEs PSP firmware, no BIOS file to source. The broker auto-symlinks the container's standalone PPSSPP asset tree (`/usr/share/ppsspp/assets`) into RetroArch's system dir, since the core refuses to boot without it; this only works if that package ships in the image. |
+
+## NEC PC Engine
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| PC Engine / TurboGrafx-16 | `mednafen_pce` | None | Cart dumps boot with nothing extra. |
+| TurboGrafx-CD / PCE-CD | `mednafen_pce` | Required | System Card BIOS (e.g. `syscard3.pce`). Same core as the row above; only the CD add-on needs it. |
+| SuperGrafx | `mednafen_supergrafx` | Optional | Most cart dumps run without it; a real SuperGrafx BIOS exists but is not a hard requirement. |
+
+## SNK and arcade
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| Neo Geo AES / MVS | `fbneo` | Required | `neogeo.zip` in the system dir, on top of a correct romset. |
+| Arcade, CPS1, CPS2, CPS3 | `fbneo` | Required | Correctly-built, MAME-compatible non-merged romsets, with BIOS regions bundled inside each game's own zip. The fiddliest tier to test: a "working" romset is tied to the exact MAME revision FBNeo targets, not just having the right files present. |
+| Neo Geo CD | `neocd` | Required | Neo Geo CD BIOS plus font ROM. Not on libretro's flat BIOS hub table; worth confirming empirically before assuming a filename. |
+| Neo Geo Pocket / Color | `mednafen_ngp` | None | Fully HLE'd. |
+
+## Atari
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| Atari 2600 | `stella` | None | |
+| Atari 5200 | `a5200` | Required | `5200.rom`. Not confirmed by this exact core name on libretro's hub (only the generic Atari800 core is listed there); well-documented elsewhere. |
+| Atari 7800 | `prosystem` | Optional | Enables cart-encryption and high-score-save support a few games expect; most run fine without it. |
+| Lynx | `handy` | Optional | `lynxboot.img`, only a handful of titles need it. |
+| Jaguar | `virtualjaguar` | None | The only platform in this table with savestates disabled entirely (`savestate: false` in the platform config). |
+| Atari ST | `hatari` | Required | TOS ROM (e.g. `tos.img`). |
+
+## Other handhelds and consoles
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| WonderSwan / Color | `mednafen_wswan` | None | Fully HLE'd. |
+| 3DO | `opera` | Required | System boot ROM (e.g. `panafz10.bin`); no HLE path exists for this system. |
+| ColecoVision | `gearcoleco` | Required | `coleco.rom`. |
+| Intellivision | `freeintv` | Required | `exec.bin` plus `grom.bin`. |
+| Vectrex | `vecx` | Optional | The built-in minimal BIOS works; a real `bios.bin` improves a few titles. |
+| Odyssey2 / Videopac | `o2em` | Required | `o2rom.bin`, or `c52.bin` for Videopac+ titles. |
+
+## Home computers
+
+| Platform | Core | Setup | Details |
+| --- | --- | --- | --- |
+| DOS | `dosbox_pure` | None | DOSBox provides its own virtual BIOS. |
+| Amiga | `puae` | Required | Kickstart ROM matching the emulated model (e.g. `kick13.rom`/`kick31.rom`). |
+| Commodore 64 | `vice_x64` | None | VICE ships open-licensed replacement ROMs by default; real Kernal/Basic ROMs are optional. |
+| MSX / MSX2 | `bluemsx` | Required | Machine-specific system ROMs (e.g. `MSX.ROM`, `MSX2.ROM`, `MSX2EXT.ROM`, `DISK.ROM`), varying by region. |
+| ZX Spectrum | `fuse` | None | ROM ships bundled with the core. |
+
+## Source
+
+Generated from `webstation_broker/emulators/retroarch_platforms.json` and
+`webstation_broker/emulators/retroarch.py`, cross-referenced against
+libretro's BIOS Information Hub. Update this table if platform mappings,
+`core_source` overrides, `assets`, `save_subtrees`, `savestate`, or
+`thumbnail` fields change in `retroarch_platforms.json`.

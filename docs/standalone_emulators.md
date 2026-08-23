@@ -143,9 +143,11 @@ launches. You may still want to adjust per-core or general settings from the
 RetroArch main GUI on the desktop. The same menu is reachable during a single
 game launch by pressing **F1**.
 
-BIOS files and other RetroArch assets are too varied to cover here, so see the
-[core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information)
-for what each core expects.
+BIOS files and other RetroArch assets are too varied to cover in full here.
+[retroarch_cores.md](retroarch_cores.md) summarizes what each core this repo
+maps a platform to actually needs; for the authoritative per-core detail,
+defer to libretro's own
+[core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information).
 
 ## RPCS3
 
