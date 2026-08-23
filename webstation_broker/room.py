@@ -17,6 +17,7 @@ from fastapi import APIRouter
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session
+from .api import _ct_eq
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -37,7 +38,7 @@ async def room_websocket(websocket: WebSocket):
         await websocket.close(code=1008)
         return
 
-    is_controller = token == sess["controller_token"]
+    is_controller = _ct_eq(token, sess["controller_token"])
     viewer_ref = session.find_viewer(token)
     is_viewer = viewer_ref is not None
     if not is_controller and not is_viewer:
