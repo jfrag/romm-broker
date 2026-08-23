@@ -2330,6 +2330,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
         
         messagesContainer.appendChild(msgEl);
+        while (messagesContainer.children.length > MAX_STORED_MESSAGES) {
+            messagesContainer.removeChild(messagesContainer.firstChild);
+        }
 
         if (isScrolledToBottom) {
             scrollContainer.scrollTop = scrollContainer.scrollHeight;
