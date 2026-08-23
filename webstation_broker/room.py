@@ -77,7 +77,13 @@ async def room_websocket(websocket: WebSocket):
 
             if "text" in message:
                 if len(message["text"]) > MAX_TEXT_FRAME_BYTES:
-                    continue
+                    # 8 KiB is already comfortably above any legitimate text
+                    # frame, so one oversized frame is abuse, not a benign
+                    # edge case -- close instead of dropping and letting an
+                    # attacker hold the connection open for a repeat flood.
+                    log.warning("room websocket: oversized text frame from %s, closing", username)
+                    await websocket.close(code=1009)
+                    return
                 data = json.loads(message["text"])
                 action = data.get("action")
                 data["sender_token"] = token
@@ -93,8 +99,13 @@ async def room_websocket(websocket: WebSocket):
                     await session.broadcast_state()
 
                 elif action == "set_username" and is_viewer:
+                    # Keyed by token in session.ROOM["cooldowns"], not on
+                    # connection_info: a fresh WebSocket reconnect gets a new
+                    # connection_info every time, which would otherwise reset
+                    # the cooldown for free.
+                    cooldowns = session.ROOM["cooldowns"].setdefault(token, {})
                     now = time.time()
-                    if now - connection_info.get("last_username_change", 0) < 2.0:
+                    if now - cooldowns.get("username", 0) < 2.0:
                         continue
                     new_username = data.get("username", "").strip()
                     if new_username and 1 <= len(new_username) <= 25:
@@ -102,7 +113,7 @@ async def room_websocket(websocket: WebSocket):
                         if old_username == new_username:
                             continue
                         viewer_ref["username"] = new_username
-                        connection_info["last_username_change"] = now
+                        cooldowns["username"] = now
                         connection_info["username"] = new_username
                         username = new_username
                         await session.broadcast_to_room(
@@ -116,12 +127,14 @@ async def room_websocket(websocket: WebSocket):
                         await session.broadcast_state()
 
                 elif action == "send_chat_message":
+                    # Same reconnect-proof keying as set_username above.
+                    cooldowns = session.ROOM["cooldowns"].setdefault(token, {})
                     now = time.time()
-                    if now - connection_info.get("last_chat_message", 0) < CHAT_COOLDOWN_SECONDS:
+                    if now - cooldowns.get("chat", 0) < CHAT_COOLDOWN_SECONDS:
                         continue
                     text = data.get("message", "").strip()
                     if text and 1 <= len(text) <= 500:
-                        connection_info["last_chat_message"] = now
+                        cooldowns["chat"] = now
                         await session.broadcast_to_room(
                             {
                                 "type": "chat_message",

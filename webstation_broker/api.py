@@ -776,7 +776,9 @@ async def put_memory_card(
 
 
 @router.get("/api/session/status")
-async def status():
+async def status(x_broker_secret: Optional[str] = Header(default=None)):
+    _check_secret(x_broker_secret)
+
     sess = session.SESSION
     if sess is None:
         return {"active": False}

@@ -35,7 +35,7 @@ SESSION: Optional[dict] = None
 # to find the file. Dropped at the next activate.
 LAST_EXIT: Optional[dict] = None
 
-ROOM: dict = {"controller": None, "viewers": {}}
+ROOM: dict = {"controller": None, "viewers": {}, "cooldowns": {}}
 
 
 def _session_id(raw) -> str:
@@ -288,3 +288,4 @@ async def notify_session_ended() -> None:
     await broadcast_to_room({"type": "session_ended"})
     ROOM["controller"] = None
     ROOM["viewers"] = {}
+    ROOM["cooldowns"] = {}

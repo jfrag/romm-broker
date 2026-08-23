@@ -855,6 +855,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     let isSidebarVisible = false;
     let messageStore = {};
+    // A long-lived room otherwise grows messageStore and the chat DOM
+    // forever -- both are pruned to this many most-recent entries.
+    const MAX_STORED_MESSAGES = 200;
     let replyingTo = null;
     let notificationAudioCtx;
     let gamepadIcons = {};
@@ -1895,6 +1898,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     break;
                 case 'chat_message':
                     messageStore[data.messageId] = data;
+                    while (Object.keys(messageStore).length > MAX_STORED_MESSAGES) {
+                        delete messageStore[Object.keys(messageStore)[0]];
+                    }
                     appendChatMessage(data, 'chat');
                     break;
                 case 'user_joined':

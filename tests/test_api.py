@@ -49,6 +49,18 @@ def test_status_is_inactive_before_anything_runs(client):
     assert client.get(f"{API}/session/status").json() == {"active": False}
 
 
+def test_status_requires_the_broker_secret_when_one_is_set(secret_client, broker_dirs):
+    """Unlike /health, status returns usernames and ROM details -- it takes
+    X-Broker-Secret like the other RomM-facing routes rather than being
+    open to anyone who can reach the broker's HTTP surface."""
+    response = secret_client.get(f"{API}/session/status")
+
+    assert response.status_code == 403
+
+    secret_client.headers["X-Broker-Secret"] = "s3cret"
+    assert secret_client.get(f"{API}/session/status").json() == {"active": False}
+
+
 def test_a_wrong_secret_is_refused(secret_client, broker_dirs):
     response = _activate(secret_client, broker_dirs)
 

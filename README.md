@@ -556,5 +556,7 @@ each archive once the parent has stored it.
 
 ### Status
 
-`GET /streaming/api/session/status` for a session summary,
-`GET /streaming/api/health` for a bare health check.
+`GET /streaming/api/session/status` for a session summary (takes
+`X-Broker-Secret` like the other RomM-facing routes; it returns usernames and
+ROM details, not just liveness),
+`GET /streaming/api/health` for a bare health check (no secret, no user data).

@@ -3,6 +3,9 @@ state-flag validation on the video/audio/cursor control messages."""
 
 from contextlib import contextmanager
 
+import pytest
+from starlette.websockets import WebSocketDisconnect
+
 from webstation_broker import room
 
 from .conftest import PREFIX
@@ -33,18 +36,16 @@ def _connect(client, token):
         yield conn
 
 
-def test_an_oversized_text_frame_is_dropped_without_breaking_the_connection(
-    client, broker_dirs, fake_emulator
-):
+def test_an_oversized_text_frame_closes_the_connection(client, broker_dirs, fake_emulator):
+    """8 KiB is already comfortably above any legitimate text frame, so the
+    server treats one oversized frame as abuse and closes rather than
+    dropping it and leaving the connection open to a repeat flood."""
     token = _activate(client, broker_dirs)
     with _connect(client, token) as conn:
         conn.send_text("x" * (room.MAX_TEXT_FRAME_BYTES + 1))
-        conn.send_json({"action": "send_chat_message", "message": "still alive"})
 
-        message = conn.receive_json()
-
-        assert message["type"] == "chat_message"
-        assert message["message"] == "still alive"
+        with pytest.raises(WebSocketDisconnect):
+            conn.receive_json()
 
 
 def test_a_chat_message_inside_the_cooldown_window_is_dropped(
@@ -73,6 +74,28 @@ def test_a_chat_message_inside_the_cooldown_window_is_dropped(
         second = conn.receive_json()
 
         assert second["message"] == "after cooldown"
+
+
+def test_the_chat_cooldown_survives_a_reconnect(client, broker_dirs, fake_emulator, monkeypatch):
+    """The cooldown is keyed by token in session.ROOM["cooldowns"], not on
+    the per-connection object -- otherwise disconnecting and reconnecting
+    with the same token would hand out a fresh, unthrottled connection on
+    every reconnect."""
+    token = _activate(client, broker_dirs)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(room.time, "time", lambda: clock["now"])
+
+    with _connect(client, token) as conn:
+        conn.send_json({"action": "send_chat_message", "message": "first"})
+        first = conn.receive_json()
+        assert first["message"] == "first"
+
+    clock["now"] += 0.1
+    with _connect(client, token) as conn:
+        conn.send_json({"action": "send_chat_message", "message": "too soon"})
+        conn.send_json({"action": "video_state", "state": 1})
+        sync = conn.receive_json()
+        assert sync["payload"]["state"] == 1
 
 
 def test_a_video_state_of_zero_or_one_is_forwarded(client, broker_dirs, fake_emulator):
