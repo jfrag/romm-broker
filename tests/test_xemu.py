@@ -538,7 +538,9 @@ def emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> xemu.Xemu:
         An Xemu with its staging directory already created.
     """
     image = tmp_path / "xbox_hdd.qcow2"
-    Fatx.create(str(image))
+    # pyfatx defaults to an 8GB image; each of this file's 24 FATX tests
+    # gets a fresh one, which is enough to exhaust a CI runner's disk.
+    Fatx.create(str(image), size=64 * 1024 * 1024)
     monkeypatch.setattr(xemu, "XEMU_TOML", _toml(tmp_path, str(image)))
     em = xemu.Xemu()
     em.staging_dir.mkdir(parents=True, exist_ok=True)
