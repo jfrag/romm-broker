@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.6.0](https://github.com/romm-streaming/romm-broker/compare/v0.5.0...v0.6.0) (2026-08-24)
+
+
+### Features
+
+* bring DuckStation to standalone parity, add RetroArch PS1 core ([99e68e1](https://github.com/romm-streaming/romm-broker/commit/99e68e1909d64205b6d8fe77422156e8f3224427))
+* gate Dolphin's whole-card memory sync to GameCube, not Wii ([9e1f398](https://github.com/romm-streaming/romm-broker/commit/9e1f398ac4ae7b06c4714e4bedcd9b18db0d1d32))
+* RPCS3 archive (7z/zip/rar) boot support with LRU-evicted cache ([0b58abe](https://github.com/romm-streaming/romm-broker/commit/0b58abe66baa14d479e14e2f0d045e8db3f3cec3))
+
+
+### Bug Fixes
+
+* address marko review findings in RPCS3 archive support ([15828fe](https://github.com/romm-streaming/romm-broker/commit/15828fe3fe819cbffedbca5541b4befbc838750d))
+* address second marko review of emulator modules ([99a94e0](https://github.com/romm-streaming/romm-broker/commit/99a94e02c097443e59c19eace997e765778de69c))
+* cap chat DOM nodes, not just the message store ([00c43d1](https://github.com/romm-streaming/romm-broker/commit/00c43d164ec929a32e1bd71a3d65657915cb1b51))
+* cap FATX test image size to avoid exhausting CI runner disk ([b48c6d6](https://github.com/romm-streaming/romm-broker/commit/b48c6d675459b19858e0963986586c0579252ac8))
+* close gaps found by post-remediation audit ([567b15b](https://github.com/romm-streaming/romm-broker/commit/567b15b891ac7018be30f70c46f1e30f9829c4c2))
+* reconnect the room websocket on abnormal closure ([9396a11](https://github.com/romm-streaming/romm-broker/commit/9396a111738c769ec682a6c3944ed0ed43a83ca4))
+* repo-wide security remediation from full audit ([6f612f1](https://github.com/romm-streaming/romm-broker/commit/6f612f1afdb142f9d8adde3a823fed989f6411f2))
+* saved must not stay true when the state stat fails ([fa572d6](https://github.com/romm-streaming/romm-broker/commit/fa572d6b04098ed162c5d356ae8a241cd6c78106))
+* use constant-time compare for the room websocket's controller token ([b57b319](https://github.com/romm-streaming/romm-broker/commit/b57b3192df9227c46f3c2ce1e8896283941c60f0))
+
+
+### Documentation
+
+* add migration guide from per-emulator brokers to webstation-broker ([4625853](https://github.com/romm-streaming/romm-broker/commit/46258530182a12df26bcb704d48e25a8c9fedef3))
+* add RetroArch core BIOS/firmware manifest ([9bff9be](https://github.com/romm-streaming/romm-broker/commit/9bff9be9ef99bcd365d5bc8c48dd821d24cb55b7))
+
 ## [0.5.0](https://github.com/romm-streaming/romm-broker/compare/v0.4.0...v0.5.0) (2026-08-22)
 
 
