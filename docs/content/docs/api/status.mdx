@@ -1,0 +1,51 @@
+---
+title: "Status and health"
+description: "GET /api/session/status for a session summary and GET /api/health for a bare liveness check."
+---
+
+## Status
+
+```bash
+curl -k https://localhost:3001/streaming/api/session/status
+```
+
+No authentication. With no session it answers `{"active": false}`. With one:
+
+| Field | Meaning |
+| --- | --- |
+| `active` | Whether a session is up. |
+| `session_id`, `emulator`, `rom`, `rom_file` | What was activated and the file the broker resolved to boot. |
+| `multiplayer` | The flag fixed at activate. |
+| `emulator_alive` | Whether the emulator process is still running. |
+| `boot_failed` | Set by an emulator that can tell its process is alive but never reached a running game, the boot-error-dialog case. Passive: the broker surfaces it and takes no action of its own. |
+| `supports_states` | Whether the state routes will work for this emulator, so the parent needs no per-emulator table. |
+| `state_slot` | The one slot this emulator works in; every save and load echoes it. |
+| `started_at` | Unix time the session was created. |
+| `user` | The controller as given to activate. |
+| `viewers` | Everyone who joined: `username`, `permission`, and their input assignment. |
+
+RomM polls this to know whether a session it launched is still up, to decide
+whether to offer save and load, and to surface a boot failure to the player
+instead of leaving them staring at a frozen frame.
+
+## Health
+
+```bash
+curl -k https://localhost:3001/streaming/api/health
+```
+
+Answers `{"status": "ok"}` as soon as the broker is serving. The container's
+`svc-broker` waits for selkies before starting the broker at all, so a healthy
+broker implies a reachable stream control plane.
+
+## Room context
+
+```bash
+curl -k "https://localhost:3001/streaming/api/session/context?token=<personal token>"
+```
+
+What the room UI bootstraps from: who the token belongs to, what it may do,
+the session's rom and emulator, and the current roster. Answers `409` with no
+session and `403` for a token that is not part of it. It is documented here
+because it is useful when debugging a room that shows "Session Ended", but it
+is not part of the parent-facing API.

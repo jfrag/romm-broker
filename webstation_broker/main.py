@@ -1,3 +1,5 @@
+"""Command-line entry point that serves the broker with uvicorn."""
+
 import logging
 
 import uvicorn
@@ -23,6 +25,14 @@ _NO_AUTH_BANNER = (
 
 
 def run() -> None:
+    """Serve the application factory with uvicorn on the configured host and port.
+
+    Refuses to start when `BROKER_SECRET` is unset and dev mode is not
+    explicitly enabled, since every session-lifecycle endpoint would otherwise
+    be reachable with no auth. Uvicorn's own logging configuration is switched
+    off so the format set up in `webstation_broker.app` is the one that
+    applies.
+    """
     if not settings.BROKER_SECRET and not settings.DEV_MODE:
         log.critical(_NO_AUTH_BANNER)
         raise SystemExit(1)

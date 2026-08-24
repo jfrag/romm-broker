@@ -1,5 +1,6 @@
-"""Flycast (Sega Dreamcast) launcher: ROM resolution, save state via a
-graceful close request, and boot-time resume.
+"""Flycast (Sega Dreamcast) launcher.
+
+Handles ROM resolution, save state via a graceful close request, and boot-time resume.
 
 Flycast has no control socket and, unlike DuckStation, installs no
 SIGTERM/SIGINT handler at all: a bare SIGTERM is a hard kill. Its only
@@ -51,6 +52,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -62,8 +64,7 @@ FLYCAST_BIN = os.environ.get("FLYCAST_BIN", "/opt/flycast/AppRun")
 
 
 def _default_data_dir() -> str:
-    """Flycast's own Linux data dir: $XDG_DATA_HOME/flycast when set,
-    otherwise ~/.local/share/flycast."""
+    """Return Flycast's own data dir: $XDG_DATA_HOME/flycast, or ~/.local/share/flycast if unset."""
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "flycast")
@@ -95,7 +96,7 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -125,6 +126,13 @@ def _state_path_for(rom_path: Path) -> Path:
 
 
 class Flycast(Emulator):
+    """Exit-only Flycast (Sega Dreamcast) launcher.
+
+    Save state is triggered by a graceful window-close request (Alt+F4)
+    rather than a control socket, since Flycast has no other clean shutdown
+    path; see the module docstring for the full hardware/protocol rationale.
+    """
+
     name = "flycast"
     display_name = "Flycast"
     save_root = DATA_DIR.parent
@@ -138,11 +146,23 @@ class Flycast(Emulator):
     # has no handler for and which would skip AutoSaveState entirely.
     term_timeout = float(os.environ.get("FLYCAST_STOP_WAIT", "20"))
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize the emulator with no ROM loaded yet."""
         super().__init__()
-        self._rom_path: Path | None = None
+        self._rom_path: Optional[Path] = None
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a ROM path to a single playable disc image or file.
+
+        Args:
+            path: A direct file path, or a folder searched up to one level
+                deep for the best candidate, ranked by disc number,
+                extension preference, and path depth.
+
+        Returns:
+            The resolved file path, or None if no suitable candidate was
+            found.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -155,7 +175,7 @@ class Flycast(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def _xdotool(self, *args: str) -> str | None:
+    def _xdotool(self, *args: str) -> Optional[str]:
         """Run xdotool, returning its stdout, or None if it failed."""
         try:
             result = subprocess.run(
@@ -173,7 +193,7 @@ class Flycast(Emulator):
             return None
         return result.stdout
 
-    def _window(self) -> str | None:
+    def _window(self) -> Optional[str]:
         """The window id belonging to this launch's own process, or None.
 
         Matched by title then confirmed by pid rather than trusting the first
@@ -193,7 +213,14 @@ class Flycast(Emulator):
         log.warning("no flycast window found for pid %s", proc.pid)
         return None
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Stop any running instance and launch Flycast for the given ROM.
+
+        Args:
+            rom_path: The resolved disc image or file to boot.
+            resume_slot: If not None and a resume state exists for this rom,
+                enable auto-load on boot; otherwise boot fresh.
+        """
         self.stop()
         self._rom_path = rom_path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -217,6 +244,13 @@ class Flycast(Emulator):
         )
 
     def stop(self) -> None:
+        """Request a graceful exit via Alt+F4, then escalate if it does not take.
+
+        Activates the emulator's own window and sends Alt+F4 to trigger
+        Flycast's only clean-shutdown path (SDL_QUIT). Falls back to the
+        base class's SIGTERM/SIGKILL escalation if no window can be found or
+        activated, or if the process has not exited within term_timeout.
+        """
         proc = self._proc
         if proc is not None and proc.poll() is None:
             win_id = self._window()
@@ -247,7 +281,8 @@ class Flycast(Emulator):
         incoming archive member and get skipped by extract_save_archive's
         newer-file guard. Anything still here belongs to a session that
         already exited, so dropping it all is the same trade-off
-        DuckStation's clear_working_slot makes."""
+        DuckStation's clear_working_slot makes.
+        """
         if not DATA_DIR.is_dir():
             return
         for stale in DATA_DIR.glob("*.state"):
@@ -257,7 +292,20 @@ class Flycast(Emulator):
             except OSError as exc:
                 log.warning("could not clear stale resume state %s: %s", stale.name, exc)
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: Optional[int]) -> dict:
+        """Stop the emulator and report whether this exit actually saved state.
+
+        Args:
+            slot: The resume slot to report on. If None, the emulator is
+                stopped without inspecting any resume state.
+
+        Returns:
+            A dict with "state_saved" (bool), "state_slot" (the given
+            slot), and "state_file" (a dict of the trusted state file's
+            path, size, and mtime, or None). A state file is only trusted
+            when the process was not force-killed (no SIGTERM/SIGKILL
+            escalation) and its size or mtime changed during this exit.
+        """
         saved = False
         state_file = None
         was_alive = self.alive()

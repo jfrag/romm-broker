@@ -1,36 +1,46 @@
-"""DuckStation launcher (RomM platform "psx"): ROM folder→disc-image
-resolution, settings.ini patching, and save state via graceful shutdown.
+"""DuckStation launcher (RomM platform `psx`): disc resolution, ini patching, and shutdown save states.
 
 DuckStation has no runtime control channel; the whole lifecycle rides its
-CLI and settings:
+CLI and settings.
 
-  resume: `-statefile <sav>` loads a state as part of boot. The broker
-          resolves the state file itself because `-resume`/`-state` abort
-          with an error dialog when the file is missing.
-  save:   SIGTERM triggers a graceful shutdown which, with
-          Main/SaveStateOnExit=true, writes `<serial>_resume.sav` into
-          savestates/ before the process exits. The write is confirmed by
-          diffing the directory across stop(). The resume state is the only
-          state a shutdown produces, so it doubles as the broker's save
-          state; the slot number is carried only for API symmetry.
+Resume: `-statefile <sav>` loads a state as part of boot. The broker
+resolves the state file itself because `-resume` and `-state` abort with an
+error dialog when the file is missing.
+
+Save: SIGTERM triggers a graceful shutdown which, with
+`Main/SaveStateOnExit=true`, writes `<serial>_resume.sav` into `savestates/`
+before the process exits. The write is confirmed by diffing the directory
+across `stop()`. The resume state is the only state a shutdown produces, so
+it doubles as the broker's save state; the slot number is carried only for
+API symmetry.
 """
 
 import logging
 import os
 import re
 import signal
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Root of the RomM library mount (env `ROM_ROOT`, default `/romm`).
+
+A resolved disc image must sit under it; candidates resolving outside are discarded.
+"""
 
 
 def _default_data_dir() -> str:
-    """DuckStation's Linux data root: $XDG_CONFIG_HOME/duckstation when set,
-    otherwise ~/.local/share/duckstation."""
+    """Work out DuckStation's Linux data root.
+
+    Returns:
+        `$XDG_CONFIG_HOME/duckstation` when that variable is set to an absolute path, otherwise
+        `~/.local/share/duckstation` under `$HOME` (default `/config`).
+    """
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "duckstation")
@@ -38,31 +48,62 @@ def _default_data_dir() -> str:
 
 
 DATA_DIR = Path(os.environ.get("DUCKSTATION_DATA_DIR", _default_data_dir()))
+"""DuckStation's data root (env `DUCKSTATION_DATA_DIR`, default from `_default_data_dir`)."""
 INI_PATH = DATA_DIR / "settings.ini"
+"""The settings.ini the broker patches before every launch."""
 SSTATE_DIR = DATA_DIR / "savestates"
+"""Directory DuckStation writes `<serial>_resume.sav` into on shutdown."""
 DUCKSTATION_LOG_PATH = Path(
     os.environ.get("DUCKSTATION_LOG_PATH", "/config/duckstation.log")
 )
+"""Log file the broker tails for this emulator (env `DUCKSTATION_LOG_PATH`).
 
-# Disc formats duckstation-qt can boot, best first; a folder holding several
-# candidates picks by this order so an .m3u playlist or .chd beats the raw
-# .bin beside it.
+Defaults to `/config/duckstation.log`.
+"""
+
 ROM_EXTENSIONS = (
     ".m3u", ".chd", ".cue", ".pbp", ".ccd", ".mds",
     ".iso", ".img", ".ecm", ".bin", ".exe", ".psexe",
 )
+"""Disc formats duckstation-qt can boot, best first.
+
+A folder holding several candidates picks by this order so an `.m3u`
+playlist or `.chd` beats the raw `.bin` beside it.
+"""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
 
 def _disc_number(rel: Path) -> int:
+    """Return the disc number a relative ROM path names, or 1 when it names none.
+
+    Args:
+        rel: Candidate path relative to the ROM folder being searched.
+
+    Returns:
+        The number following a `disc`, `disk` or `cd` marker in the path, never below 1.
+    """
     match = _DISC_RE.search(str(rel))
     if match is None:
         return 1
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
+    """Pick the best bootable disc image out of a set of candidate paths.
+
+    Hidden files, unsupported extensions, non-files and anything resolving
+    outside `ROM_ROOT` are dropped. The rest rank by disc number, then by
+    position in `ROM_EXTENSIONS`, then by depth and name, so disc 1 in the
+    best format wins.
+
+    Args:
+        candidates: Paths found under the ROM folder.
+        base: The ROM folder the candidates are relative to.
+
+    Returns:
+        The resolved path of the winning image, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -92,7 +133,11 @@ def _patch_ini() -> None:
 
     On a fresh container the file does not exist yet; seeding it with
     SetupWizardIncomplete already false keeps duckstation-qt from parking on
-    the setup wizard, so the very first launch boots the disc."""
+    the setup wizard, so the very first launch boots the disc. Existing keys
+    are rewritten in place, missing ones are added under their section
+    (created when absent), and the result is written through a temp file.
+    Any failure is logged rather than raised so the launch still goes ahead.
+    """
     patches: dict[tuple[str, str], str] = {
         ("Main", "SetupWizardIncomplete"): "SetupWizardIncomplete = false",
         # SIGTERM's graceful shutdown must not raise a confirm dialog, and
@@ -156,10 +201,16 @@ def _patch_ini() -> None:
         log.exception("settings.ini patch failed, broker settings NOT applied")
 
 
-def _resume_snapshot() -> dict:
+def _resume_snapshot() -> dict[Path, tuple[int, float]]:
+    """Snapshot every `<serial>_resume.sav` in `SSTATE_DIR`.
+
+    Returns:
+        A dict of state path to `(size, mtime)`, empty when the directory is missing. Files that
+        vanish mid-scan are skipped.
+    """
     if not SSTATE_DIR.is_dir():
         return {}
-    snap = {}
+    snap: dict[Path, tuple[int, float]] = {}
     for p in SSTATE_DIR.glob("*_resume.sav"):
         try:
             st = p.stat()
@@ -169,18 +220,33 @@ def _resume_snapshot() -> dict:
     return snap
 
 
-def _newest_resume_state() -> Path | None:
-    """Newest `<serial>_resume.sav`; after a save restore the directory only
-    holds this game's states, so newest-by-mtime is the session's state."""
-    best: tuple[float, Path] | None = None
+def _newest_resume_state() -> Optional[Path]:
+    """Find the newest `<serial>_resume.sav`.
+
+    After a save restore the directory only holds this game's states, so
+    newest-by-mtime is the session's state.
+
+    Returns:
+        The most recently modified resume state, or None when there is none.
+    """
+    best: Optional[tuple[float, Path]] = None
     for p, (_size, mtime) in _resume_snapshot().items():
         if best is None or mtime > best[0]:
             best = (mtime, p)
     return best[1] if best is not None else None
 
 
-def _changed_resume_state(before: dict) -> Path | None:
-    best: tuple[float, Path] | None = None
+def _changed_resume_state(before: dict[Path, tuple[int, float]]) -> Optional[Path]:
+    """Find the newest resume state that is new or has changed since `before` was taken.
+
+    Args:
+        before: Snapshot from `_resume_snapshot` taken before the shutdown.
+
+    Returns:
+        The most recently modified resume state whose size or mtime differs
+        from the snapshot, or None when nothing was written.
+    """
+    best: Optional[tuple[float, Path]] = None
     for p, cur in _resume_snapshot().items():
         if before.get(p) != cur:
             mtime = cur[1]
@@ -190,15 +256,50 @@ def _changed_resume_state(before: dict) -> Path | None:
 
 
 class Duckstation(Emulator):
+    """PlayStation 1 sessions on duckstation-qt.
+
+    The broker launches `duckstation-qt -batch -fullscreen -- <disc>` after
+    forcing its settings.ini (no setup wizard, no power-off confirm, save a
+    state on exit, no state backups, no update check). There is no runtime
+    control channel, so the lifecycle is entirely command line and shutdown
+    driven. A resume passes the newest `<serial>_resume.sav` with
+    `-statefile`, resolved by the broker because DuckStation's own `-resume`
+    aborts on a missing file. A save is the graceful shutdown itself: stop()
+    sends SIGTERM, DuckStation writes the resume state on the way out, and
+    the write is confirmed by diffing the savestates directory across the
+    stop. `term_timeout` is raised well above the base default so the SIGKILL
+    escalation does not discard that write.
+
+    Because the resume state is the only state a shutdown produces, there is
+    no mid-session save or load, and `supports_states` stays at the base
+    default; the requested slot is echoed back purely for API symmetry. Save
+    data (`memcards`) and states (`savestates`) both ride the save archive.
+    DuckStation writes the resume state whether or not one was asked for, so
+    an exit without a slot simply leaves it unreported, and the emulator
+    resumes from it locally as usual.
+
+    Attributes:
+        name: RomM platform key, `duckstation`.
+        display_name: Human-readable name shown in the UI.
+        save_root: DuckStation's data root, which the save subtrees hang off.
+        save_subtrees: `memcards` and `savestates`, the directories the save archive carries.
+        rom_extensions: Bootable disc formats, best first.
+        log_path: The DuckStation log the broker exposes.
+        term_timeout: Seconds SIGTERM gets before SIGKILL (env `DUCKSTATION_STOP_WAIT`, default 30).
+    """
+
     name = "duckstation"
     display_name = "DuckStation"
     save_root = DATA_DIR
     save_subtrees = ("memcards", "savestates")
     rom_extensions = ROM_EXTENSIONS
     log_path = DUCKSTATION_LOG_PATH
-    # SIGTERM's graceful shutdown serializes the resume state before exiting;
-    # give it room before the SIGKILL escalation discards it.
     term_timeout = float(os.environ.get("DUCKSTATION_STOP_WAIT", "30"))
+    """Seconds to wait on SIGTERM before SIGKILL (env `DUCKSTATION_STOP_WAIT`, default 30).
+
+    SIGTERM's graceful shutdown serializes the resume state before exiting;
+    give it room before the SIGKILL escalation discards it.
+    """
 
     def clear_working_slot(self) -> None:
         """Drop every resume state left in SSTATE_DIR before a restore.
@@ -207,7 +308,8 @@ class Duckstation(Emulator):
         picks whichever file is newest with no serial filter. A leftover
         from an earlier session is otherwise indistinguishable from the
         state a restore is about to write, so clearing everything here is
-        what keeps a stale file from being served as the new game's own."""
+        what keeps a stale file from being served as the new game's own.
+        """
         if not SSTATE_DIR.is_dir():
             return
         for stale in SSTATE_DIR.glob("*_resume.sav"):
@@ -217,7 +319,18 @@ class Duckstation(Emulator):
             except OSError as exc:
                 log.warning("could not clear stale resume state %s: %s", stale.name, exc)
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a RomM path to the disc image to boot.
+
+        A file is taken as is. A directory is searched one level deep for the
+        best candidate by `_pick_rom_file`.
+
+        Args:
+            path: The ROM file or folder RomM handed over.
+
+        Returns:
+            The image to pass to duckstation-qt, or None when there is nothing bootable.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -230,7 +343,19 @@ class Duckstation(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Stop any running instance, patch settings.ini, and start duckstation-qt.
+
+        The binary comes from env `DUCKSTATION_BIN` (default
+        `/opt/duckstation/AppRun`). With `resume_slot` set, the newest resume
+        state is passed with `-statefile`; a resume with no state on disk is
+        logged and boots clean.
+
+        Args:
+            rom_path: The disc image or playlist to boot.
+            resume_slot: Any slot to resume from (the number itself is not used), or None to
+                boot clean.
+        """
         self.stop()
         _patch_ini()
 
@@ -245,9 +370,23 @@ class Duckstation(Emulator):
         log.info("launching duckstation (rom=%s, statefile=%s)", rom_path, state)
         self._spawn(cmd, base_launch_env())
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
+        """Stop the emulator and report the resume state its shutdown wrote.
+
+        The save is the graceful shutdown: the savestates directory is
+        snapshotted, the process is stopped, and a resume state that appeared
+        or changed across the stop is reported as the saved state.
+
+        Args:
+            slot: The slot RomM asked for, echoed back unchanged; None reports no state even
+                though DuckStation still writes one.
+
+        Returns:
+            A dict with `state_saved` (bool), `state_slot` (`slot` as given) and `state_file`
+            (a dict of `path`, `size` and `mtime` for the resume state, or None).
+        """
         saved = False
-        state_file = None
+        state_file: Optional[dict[str, Any]] = None
         was_alive = self.alive()
         before = _resume_snapshot()
         proc = self._proc

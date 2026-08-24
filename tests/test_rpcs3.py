@@ -1,5 +1,8 @@
-"""RPCS3 config/ipc patching, the savestates symlink, save_subtrees, resume
-target selection, save-and-exit, and boot verification."""
+"""Tests for the RPCS3 emulator module.
+
+Covers config/ipc patching, the savestates symlink, save_subtrees, resume
+target selection, save-and-exit, and boot verification.
+"""
 
 import os
 import socket
@@ -9,6 +12,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from typing import Callable, NoReturn, Optional
 
 import pytest
 
@@ -16,7 +20,8 @@ from webstation_broker.emulators import rpcs3
 
 
 @pytest.fixture
-def rpcs3_dirs(monkeypatch, tmp_path):
+def rpcs3_dirs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Path]:
+    """Point the RPCS3 emulator's dev_hdd0 layout at isolated temp directories."""
     data_dir = tmp_path / "data"
     dev_hdd0 = data_dir / "dev_hdd0"
     user_home = dev_hdd0 / "home" / "00000001"
@@ -47,7 +52,7 @@ def rpcs3_dirs(monkeypatch, tmp_path):
     }
 
 
-def _touch(path: Path, mtime=None) -> Path:
+def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"state")
     if mtime is not None:
@@ -58,7 +63,8 @@ def _touch(path: Path, mtime=None) -> Path:
 # ── config.yml / ipc.yml patching ───────────────────────────────────────
 
 
-def test_patch_config_seeds_a_missing_file_with_every_forced_key(rpcs3_dirs):
+def test_patch_config_seeds_a_missing_file_with_every_forced_key(rpcs3_dirs: dict[str, Path]) -> None:
+    """Patch config seeds a missing file with every forced key."""
     rpcs3._patch_config()
 
     text = rpcs3.CONFIG_PATH.read_text()
@@ -68,7 +74,8 @@ def test_patch_config_seeds_a_missing_file_with_every_forced_key(rpcs3_dirs):
     assert "  Pause emulation on RPCS3 focus loss: false" in text
 
 
-def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(rpcs3_dirs):
+def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(rpcs3_dirs: dict[str, Path]) -> None:
+    """Patch config overwrites a conflicting value but keeps the rest."""
     rpcs3.CONFIG_PATH.write_text(
         "Miscellaneous:\n"
         "  Exit RPCS3 when process finishes: false\n"
@@ -82,13 +89,15 @@ def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(rpcs3_di
     assert "  Some Other Setting: 5" in text
 
 
-def test_patch_ipc_seeds_a_missing_file_as_a_flat_key(rpcs3_dirs):
+def test_patch_ipc_seeds_a_missing_file_as_a_flat_key(rpcs3_dirs: dict[str, Path]) -> None:
+    """Patch IPC seeds a missing file as a flat key."""
     rpcs3._patch_ipc()
 
     assert rpcs3.IPC_PATH.read_text().strip() == "IPC Server enabled: true"
 
 
-def test_patch_ipc_overwrites_an_existing_flat_key(rpcs3_dirs):
+def test_patch_ipc_overwrites_an_existing_flat_key(rpcs3_dirs: dict[str, Path]) -> None:
+    """Patch IPC overwrites an existing flat key."""
     rpcs3.IPC_PATH.write_text("IPC Server enabled: false\nIPC Port: 28080\n")
 
     rpcs3._patch_ipc()
@@ -101,7 +110,8 @@ def test_patch_ipc_overwrites_an_existing_flat_key(rpcs3_dirs):
 # ── savestates symlink ──────────────────────────────────────────────────
 
 
-def test_ensure_sstate_link_creates_a_fresh_symlink(rpcs3_dirs):
+def test_ensure_sstate_link_creates_a_fresh_symlink(rpcs3_dirs: dict[str, Path]) -> None:
+    """Ensure sstate link creates a fresh symlink."""
     rpcs3._ensure_sstate_link()
 
     link = rpcs3_dirs["sstate_link"]
@@ -109,14 +119,18 @@ def test_ensure_sstate_link_creates_a_fresh_symlink(rpcs3_dirs):
     assert link.resolve() == rpcs3_dirs["sstate_root"].resolve()
 
 
-def test_ensure_sstate_link_is_idempotent(rpcs3_dirs):
+def test_ensure_sstate_link_is_idempotent(rpcs3_dirs: dict[str, Path]) -> None:
+    """Ensure sstate link is idempotent."""
     rpcs3._ensure_sstate_link()
     rpcs3._ensure_sstate_link()
 
     assert rpcs3_dirs["sstate_link"].resolve() == rpcs3_dirs["sstate_root"].resolve()
 
 
-def test_ensure_sstate_link_repoints_a_symlink_at_the_wrong_target(rpcs3_dirs, tmp_path):
+def test_ensure_sstate_link_repoints_a_symlink_at_the_wrong_target(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """Ensure sstate link repoints a symlink at the wrong target."""
     wrong = tmp_path / "wrong"
     wrong.mkdir()
     rpcs3_dirs["sstate_link"].symlink_to(wrong, target_is_directory=True)
@@ -126,7 +140,8 @@ def test_ensure_sstate_link_repoints_a_symlink_at_the_wrong_target(rpcs3_dirs, t
     assert rpcs3_dirs["sstate_link"].resolve() == rpcs3_dirs["sstate_root"].resolve()
 
 
-def test_ensure_sstate_link_leaves_a_real_directory_alone(rpcs3_dirs):
+def test_ensure_sstate_link_leaves_a_real_directory_alone(rpcs3_dirs: dict[str, Path]) -> None:
+    """Ensure sstate link leaves a real directory alone."""
     real = rpcs3_dirs["sstate_link"]
     real.mkdir()
     (real / "marker").write_text("do not touch")
@@ -137,24 +152,31 @@ def test_ensure_sstate_link_leaves_a_real_directory_alone(rpcs3_dirs):
     assert (real / "marker").exists()
 
 
-def test_clearing_the_working_slot_ensures_the_symlink(rpcs3_dirs):
+def test_clearing_the_working_slot_ensures_the_symlink(rpcs3_dirs: dict[str, Path]) -> None:
+    """clear_working_slot creates the savestates symlink even with no prior state."""
     rpcs3.Rpcs3().clear_working_slot()
 
     assert rpcs3_dirs["sstate_link"].is_symlink()
 
 
-def test_building_every_emulator_does_not_touch_the_symlink(rpcs3_dirs):
-    """clear_working_slot, not __init__/save_subtrees, is what creates the
-    link: a registry sweep constructs every emulator against real paths with
-    no per-emulator redirect, so construction alone must stay read-only."""
+def test_building_every_emulator_does_not_touch_the_symlink(rpcs3_dirs: dict[str, Path]) -> None:
+    """Construction alone must not create the savestates symlink.
+
+    clear_working_slot, not __init__/save_subtrees, is what creates the link:
+    a registry sweep constructs every emulator against real paths with no
+    per-emulator redirect, so construction alone must stay read-only.
+    """
     rpcs3.Rpcs3()
 
     assert not rpcs3_dirs["sstate_link"].exists()
 
 
-def test_clearing_the_working_slot_wipes_every_title_leftover_state(rpcs3_dirs):
-    """A state left behind by a previous session must not outrank (by
-    mtime) whatever this session's own archive restore brings back."""
+def test_clearing_the_working_slot_wipes_every_title_leftover_state(rpcs3_dirs: dict[str, Path]) -> None:
+    """A stale state from a previous session must not outrank a fresh restore.
+
+    A state left behind by a previous session must not outrank (by mtime)
+    whatever this session's own archive restore brings back.
+    """
     stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
     other_title = _touch(rpcs3_dirs["sstate_root"] / "OTHER00000" / "OTHER00000_1.SAVESTAT")
 
@@ -165,9 +187,12 @@ def test_clearing_the_working_slot_wipes_every_title_leftover_state(rpcs3_dirs):
     assert rpcs3_dirs["sstate_root"].is_dir()
 
 
-def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs):
-    """api.py reads save_subtrees for the restore extract before it calls
-    prepare_restore(), so clear_working_slot has to flip _restoring itself."""
+def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs: dict[str, Path]) -> None:
+    """clear_working_slot must flip _restoring itself, not prepare_restore().
+
+    api.py reads save_subtrees for the restore extract before it calls
+    prepare_restore(), so clear_working_slot has to flip _restoring itself.
+    """
     emu = rpcs3.Rpcs3()
 
     emu.clear_working_slot()
@@ -179,14 +204,16 @@ def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs):
 # ── save_subtrees ───────────────────────────────────────────────────────
 
 
-def test_save_subtrees_includes_savestates_when_dumping(rpcs3_dirs):
+def test_save_subtrees_includes_savestates_when_dumping(rpcs3_dirs: dict[str, Path]) -> None:
+    """Save subtrees includes savestates when dumping."""
     emu = rpcs3.Rpcs3()
 
     assert "savestates" in emu.save_subtrees
     assert "home/00000001/savedata" in emu.save_subtrees
 
 
-def test_save_subtrees_includes_savestates_when_restoring(rpcs3_dirs):
+def test_save_subtrees_includes_savestates_when_restoring(rpcs3_dirs: dict[str, Path]) -> None:
+    """Save subtrees includes savestates when restoring."""
     emu = rpcs3.Rpcs3()
     emu._restoring = True
 
@@ -196,7 +223,8 @@ def test_save_subtrees_includes_savestates_when_restoring(rpcs3_dirs):
 # ── state snapshot / diff ───────────────────────────────────────────────
 
 
-def test_newest_state_reads_the_newest_file_for_the_title(rpcs3_dirs):
+def test_newest_state_reads_the_newest_file_for_the_title(rpcs3_dirs: dict[str, Path]) -> None:
+    """Newest state reads the newest file for the title."""
     _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
     newest = _touch(
         rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_2.SAVESTAT", mtime=3000
@@ -206,26 +234,32 @@ def test_newest_state_reads_the_newest_file_for_the_title(rpcs3_dirs):
     assert rpcs3._newest_state("BLUS30443") == newest
 
 
-def test_newest_state_is_none_without_a_title_dir(rpcs3_dirs):
+def test_newest_state_is_none_without_a_title_dir(rpcs3_dirs: dict[str, Path]) -> None:
+    """Newest state is none without a title dir."""
     assert rpcs3._newest_state("BLUS30443") is None
     assert rpcs3._newest_state(None) is None
 
 
 @pytest.mark.parametrize("ext", [".SAVESTAT", ".SAVESTAT.zst", ".SAVESTAT.gz"])
-def test_newest_state_matches_every_extension_rpcs3_actually_writes(rpcs3_dirs, ext):
+def test_newest_state_matches_every_extension_rpcs3_actually_writes(
+    rpcs3_dirs: dict[str, Path], ext: str
+) -> None:
+    """Newest state matches every extension RPCS3 actually writes."""
     state = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / f"BLUS30443_1{ext}")
 
     assert rpcs3._newest_state("BLUS30443") == state
 
 
-def test_changed_state_finds_the_file_that_appeared(rpcs3_dirs):
+def test_changed_state_finds_the_file_that_appeared(rpcs3_dirs: dict[str, Path]) -> None:
+    """Changed state finds the file that appeared."""
     before = rpcs3._state_snapshot("BLUS30443")
     new = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
 
     assert rpcs3._changed_state("BLUS30443", before) == new
 
 
-def test_changed_state_finds_a_rewritten_file_by_size(rpcs3_dirs):
+def test_changed_state_finds_a_rewritten_file_by_size(rpcs3_dirs: dict[str, Path]) -> None:
+    """Changed state finds a rewritten file by size."""
     p = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
     before = rpcs3._state_snapshot("BLUS30443")
     p.write_bytes(b"a longer state than before")
@@ -233,17 +267,21 @@ def test_changed_state_finds_a_rewritten_file_by_size(rpcs3_dirs):
     assert rpcs3._changed_state("BLUS30443", before) == p
 
 
-def test_changed_state_is_none_when_nothing_moved(rpcs3_dirs):
+def test_changed_state_is_none_when_nothing_moved(rpcs3_dirs: dict[str, Path]) -> None:
+    """Changed state is none when nothing moved."""
     _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
     before = rpcs3._state_snapshot("BLUS30443")
 
     assert rpcs3._changed_state("BLUS30443", before) is None
 
 
-def test_changed_state_picks_the_newest_when_several_files_changed(rpcs3_dirs):
-    """Must agree with _newest_state, which resume selection relies on, not
+def test_changed_state_picks_the_newest_when_several_files_changed(rpcs3_dirs: dict[str, Path]) -> None:
+    """_changed_state must pick the newest file, not just any changed file.
+
+    Must agree with _newest_state, which resume selection relies on, not
     just report whichever changed file the directory glob happens to yield
-    first."""
+    first.
+    """
     before = rpcs3._state_snapshot("BLUS30443")
     _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT", mtime=1000)
     newest = _touch(
@@ -256,7 +294,10 @@ def test_changed_state_picks_the_newest_when_several_files_changed(rpcs3_dirs):
 # ── save state write confirmation ───────────────────────────────────────
 
 
-def test_wait_for_state_write_returns_the_file_once_its_size_stops_changing(rpcs3_dirs):
+def test_wait_for_state_write_returns_the_file_once_its_size_stops_changing(
+    rpcs3_dirs: dict[str, Path]
+) -> None:
+    """Wait for state write returns the file once its size stops changing."""
     serial = "BLUS30443"
     before = rpcs3._state_snapshot(serial)
     target = _touch(rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT")
@@ -266,15 +307,20 @@ def test_wait_for_state_write_returns_the_file_once_its_size_stops_changing(rpcs
     assert result == target
 
 
-def test_wait_for_state_write_returns_none_when_the_file_never_stabilizes(rpcs3_dirs, monkeypatch):
-    """A file that keeps growing past the deadline must be reported as
-    unsaved, not handed back as if the write had finished."""
+def test_wait_for_state_write_returns_none_when_the_file_never_stabilizes(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file still growing past the deadline must be reported as unsaved.
+
+    A file that keeps growing past the deadline must be reported as
+    unsaved, not handed back as if the write had finished.
+    """
     monkeypatch.setattr(rpcs3.time, "sleep", lambda _seconds: None)
     serial = "BLUS30443"
     target = _touch(rpcs3_dirs["sstate_root"] / serial / f"{serial}_1.SAVESTAT")
     counter = {"n": 0}
 
-    def growing_changed_state(_serial, _before):
+    def growing_changed_state(_serial: Optional[str], _before: dict) -> Path:
         counter["n"] += 1
         target.write_bytes(b"x" * counter["n"])
         return target
@@ -287,7 +333,10 @@ def test_wait_for_state_write_returns_none_when_the_file_never_stabilizes(rpcs3_
     assert counter["n"] > 1
 
 
-def test_wait_for_state_write_returns_none_when_nothing_ever_appears(rpcs3_dirs, monkeypatch):
+def test_wait_for_state_write_returns_none_when_nothing_ever_appears(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wait for state write returns none when nothing ever appears."""
     monkeypatch.setattr(rpcs3.time, "sleep", lambda _seconds: None)
 
     result = rpcs3._wait_for_state_write("BLUS30443", {}, time.monotonic() + 0.1)
@@ -299,10 +348,11 @@ def test_wait_for_state_write_returns_none_when_nothing_ever_appears(rpcs3_dirs,
 
 
 @pytest.fixture
-def no_boot_watchdog(monkeypatch):
+def no_boot_watchdog(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, tuple]]:
+    """Stub out the boot watchdog thread and record what it would have started."""
     started = []
 
-    def mock_thread(target, args, daemon):
+    def mock_thread(target: Callable[..., object], args: tuple, daemon: bool) -> object:
         started.append((target.__name__, args))
         return type("MockThread", (), {"start": lambda s: None})()
 
@@ -311,8 +361,12 @@ def no_boot_watchdog(monkeypatch):
 
 
 def test_launch_boots_the_state_file_when_a_resume_is_found(
-    rpcs3_dirs, no_boot_watchdog, monkeypatch, tmp_path
-):
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Launch boots the state file when a resume is found."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     spawned = {}
@@ -329,8 +383,9 @@ def test_launch_boots_the_state_file_when_a_resume_is_found(
 
 
 def test_launch_falls_back_to_a_fresh_boot_with_no_resume_state(
-    rpcs3_dirs, no_boot_watchdog, monkeypatch
-):
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch falls back to a fresh boot with no resume state."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     spawned = {}
@@ -346,8 +401,12 @@ def test_launch_falls_back_to_a_fresh_boot_with_no_resume_state(
 
 
 def test_launch_falls_back_to_a_fresh_boot_with_no_known_serial(
-    rpcs3_dirs, no_boot_watchdog, monkeypatch, tmp_path
-):
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Launch falls back to a fresh boot with no known serial."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     spawned = {}
@@ -362,7 +421,10 @@ def test_launch_falls_back_to_a_fresh_boot_with_no_known_serial(
     assert spawned["cmd"][-1] == str(iso)
 
 
-def test_launch_boots_normally_without_a_resume_slot(rpcs3_dirs, no_boot_watchdog, monkeypatch):
+def test_launch_boots_normally_without_a_resume_slot(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch boots normally without a resume slot."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     spawned = {}
@@ -378,7 +440,10 @@ def test_launch_boots_normally_without_a_resume_slot(rpcs3_dirs, no_boot_watchdo
     assert spawned["cmd"][-1] == str(eboot)
 
 
-def test_launch_always_spawns_the_boot_watchdog(rpcs3_dirs, no_boot_watchdog, monkeypatch):
+def test_launch_always_spawns_the_boot_watchdog(
+    rpcs3_dirs: dict[str, Path], no_boot_watchdog: list[tuple[str, tuple]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch always spawns the boot watchdog."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
@@ -396,7 +461,10 @@ def test_launch_always_spawns_the_boot_watchdog(rpcs3_dirs, no_boot_watchdog, mo
 # ── save_and_exit ───────────────────────────────────────────────────────
 
 
-def test_exit_without_a_slot_saves_nothing(rpcs3_dirs, monkeypatch):
+def test_exit_without_a_slot_saves_nothing(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit without a slot saves nothing."""
     emu = rpcs3.Rpcs3()
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
     emu._send_key = lambda key: pytest.fail("hotkey sent with no slot requested")
@@ -406,7 +474,10 @@ def test_exit_without_a_slot_saves_nothing(rpcs3_dirs, monkeypatch):
     assert report == {"state_saved": False, "state_slot": None, "state_file": None}
 
 
-def test_exit_with_a_slot_but_no_known_serial_saves_nothing(rpcs3_dirs, monkeypatch):
+def test_exit_with_a_slot_but_no_known_serial_saves_nothing(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit with a slot but no known serial saves nothing."""
     emu = rpcs3.Rpcs3()
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
     emu._session_serial = None
@@ -417,14 +488,17 @@ def test_exit_with_a_slot_but_no_known_serial_saves_nothing(rpcs3_dirs, monkeypa
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
 
 
-def test_exit_reports_the_state_the_hotkey_wrote(rpcs3_dirs, monkeypatch):
+def test_exit_reports_the_state_the_hotkey_wrote(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit reports the state the hotkey wrote."""
     emu = rpcs3.Rpcs3()
     emu._session_serial = "BLUS30443"
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
 
     written = rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT"
 
-    def fake_send_key(key):
+    def fake_send_key(key: str) -> bool:
         _touch(written)
         return True
 
@@ -437,7 +511,10 @@ def test_exit_reports_the_state_the_hotkey_wrote(rpcs3_dirs, monkeypatch):
     assert report["state_file"]["path"] == str(written)
 
 
-def test_exit_reports_no_save_when_the_hotkey_fails_to_send(rpcs3_dirs, monkeypatch):
+def test_exit_reports_no_save_when_the_hotkey_fails_to_send(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit reports no save when the hotkey fails to send."""
     emu = rpcs3.Rpcs3()
     emu._session_serial = "BLUS30443"
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
@@ -448,7 +525,10 @@ def test_exit_reports_no_save_when_the_hotkey_fails_to_send(rpcs3_dirs, monkeypa
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
 
 
-def test_exit_reports_no_save_when_no_new_state_appears(rpcs3_dirs, monkeypatch):
+def test_exit_reports_no_save_when_no_new_state_appears(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit reports no save when no new state appears."""
     emu = rpcs3.Rpcs3()
     emu._session_serial = "BLUS30443"
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
@@ -461,11 +541,14 @@ def test_exit_reports_no_save_when_no_new_state_appears(rpcs3_dirs, monkeypatch)
 
 
 def test_exit_does_not_abort_the_save_dump_when_the_state_file_disappears_before_stat(
-    rpcs3_dirs, monkeypatch
-):
-    """_wait_for_state_write can hand back a path that's gone by the time we
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state file vanishing before stat() must not abort save_and_exit.
+
+    _wait_for_state_write can hand back a path that's gone by the time we
     stat it (e.g. RPCS3 renames it during compression); that must not raise
-    out of save_and_exit and skip the stop()/dump that follows."""
+    out of save_and_exit and skip the stop()/dump that follows.
+    """
     emu = rpcs3.Rpcs3()
     emu._session_serial = "BLUS30443"
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
@@ -485,20 +568,24 @@ def test_exit_does_not_abort_the_save_dump_when_the_state_file_disappears_before
 
 
 @pytest.fixture
-def pine_socket(monkeypatch, tmp_path):
+def pine_socket(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the PINE unix socket path at an isolated temp file."""
     sock_path = tmp_path / "rpcs3.sock"
     monkeypatch.setattr(rpcs3, "PINE_SOCKET", sock_path)
     return sock_path
 
 
-def _serve_pine_reply(sock_path: Path, reply: bytes | None):
-    """Accepts one connection, reads and discards the request, then writes
-    back `reply` (or nothing, to simulate a closed/no-reply connection)."""
+def _serve_pine_reply(sock_path: Path, reply: Optional[bytes]) -> threading.Thread:
+    """Serve a single PINE reply over a Unix socket for one test connection.
+
+    Accepts one connection, reads and discards the request, then writes
+    back `reply` (or nothing, to simulate a closed/no-reply connection).
+    """
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(sock_path))
     server.listen(1)
 
-    def run():
+    def run() -> None:
         conn, _ = server.accept()
         with conn:
             conn.settimeout(5)
@@ -520,7 +607,8 @@ def _serve_pine_reply(sock_path: Path, reply: bytes | None):
     return thread
 
 
-def test_pine_request_returns_the_reply_body_on_success(pine_socket):
+def test_pine_request_returns_the_reply_body_on_success(pine_socket: Path) -> None:
+    """PINE request returns the reply body on success."""
     body = b"status-body"
     reply = struct.pack("<IB", 5 + len(body), 0) + body
     thread = _serve_pine_reply(pine_socket, reply)
@@ -531,7 +619,8 @@ def test_pine_request_returns_the_reply_body_on_success(pine_socket):
     assert result == body
 
 
-def test_pine_request_returns_none_on_a_nonzero_result_byte(pine_socket):
+def test_pine_request_returns_none_on_a_nonzero_result_byte(pine_socket: Path) -> None:
+    """PINE request returns none on a nonzero result byte."""
     reply = struct.pack("<IB", 5, 1)
     thread = _serve_pine_reply(pine_socket, reply)
 
@@ -541,7 +630,8 @@ def test_pine_request_returns_none_on_a_nonzero_result_byte(pine_socket):
     assert result is None
 
 
-def test_pine_request_returns_none_on_a_truncated_header(pine_socket):
+def test_pine_request_returns_none_on_a_truncated_header(pine_socket: Path) -> None:
+    """PINE request returns none on a truncated header."""
     thread = _serve_pine_reply(pine_socket, b"\x05\x00")
 
     result = rpcs3._pine_request(rpcs3._PINE_MSG_STATUS, timeout=2.0)
@@ -550,12 +640,15 @@ def test_pine_request_returns_none_on_a_truncated_header(pine_socket):
     assert result is None
 
 
-def test_pine_request_coerces_a_truncated_body_to_empty(pine_socket):
-    """The declared size promises 5 payload bytes but the connection closes
+def test_pine_request_coerces_a_truncated_body_to_empty(pine_socket: Path) -> None:
+    """A truncated PINE body is coerced to empty bytes, not treated as failure.
+
+    The declared size promises 5 payload bytes but the connection closes
     after 2; _pine_recv_exact's None gets folded into b"" rather than
     propagated. Both current callers (_pine_status, _pine_title_id) treat an
     empty body the same as None, so this documents the actual coercion
-    rather than asserting a failure path that doesn't exist."""
+    rather than asserting a failure path that doesn't exist.
+    """
     reply = struct.pack("<IB", 10, 0) + b"ab"
     thread = _serve_pine_reply(pine_socket, reply)
 
@@ -566,20 +659,22 @@ def test_pine_request_coerces_a_truncated_body_to_empty(pine_socket):
 
 
 class _StubSocket:
-    def __init__(self, chunks):
+    def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = list(chunks)
 
-    def recv(self, _n):
+    def recv(self, _n: int) -> bytes:
         return self._chunks.pop(0) if self._chunks else b""
 
 
-def test_pine_recv_exact_accumulates_across_several_recv_calls():
+def test_pine_recv_exact_accumulates_across_several_recv_calls() -> None:
+    """PINE recv exact accumulates across several recv calls."""
     sock = _StubSocket([b"ab", b"cde", b"f"])
 
     assert rpcs3._pine_recv_exact(sock, 6) == b"abcdef"
 
 
-def test_pine_recv_exact_returns_none_when_the_socket_closes_early():
+def test_pine_recv_exact_returns_none_when_the_socket_closes_early() -> None:
+    """PINE recv exact returns none when the socket closes early."""
     sock = _StubSocket([b"ab", b""])
 
     assert rpcs3._pine_recv_exact(sock, 6) is None
@@ -589,7 +684,7 @@ def test_pine_recv_exact_returns_none_when_the_socket_closes_early():
 
 
 class _FakeClock:
-    def __init__(self, step: float = 30.0):
+    def __init__(self, step: float = 30.0) -> None:
         self.now = 0.0
         self.step = step
 
@@ -599,7 +694,8 @@ class _FakeClock:
 
 
 @pytest.fixture
-def watchdog_env(monkeypatch):
+def watchdog_env(monkeypatch: pytest.MonkeyPatch) -> _FakeClock:
+    """Patch time.sleep and time.monotonic with a fast, deterministic fake clock."""
     monkeypatch.setattr(rpcs3.time, "sleep", lambda _seconds: None)
     clock = _FakeClock()
     monkeypatch.setattr(rpcs3.time, "monotonic", clock)
@@ -607,8 +703,9 @@ def watchdog_env(monkeypatch):
 
 
 def test_boot_watchdog_clears_the_flag_when_the_game_reports_running(
-    rpcs3_dirs, monkeypatch, watchdog_env
-):
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """Boot watchdog clears the flag when the game reports running."""
     monkeypatch.setattr(rpcs3, "_pine_status", lambda: 0)
     # alive() forced True: the deadline path would also leave boot_failed
     # False on a real (unpatched) instance, so without this the test would
@@ -623,8 +720,9 @@ def test_boot_watchdog_clears_the_flag_when_the_game_reports_running(
 
 
 def test_boot_watchdog_resolves_an_unknown_serial_once_running(
-    rpcs3_dirs, monkeypatch, watchdog_env
-):
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """Boot watchdog resolves an unknown serial once running."""
     monkeypatch.setattr(rpcs3, "_pine_status", lambda: 0)
     monkeypatch.setattr(rpcs3, "_pine_title_id", lambda: "BLUS30443")
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
@@ -638,16 +736,19 @@ def test_boot_watchdog_resolves_an_unknown_serial_once_running(
 
 
 def test_boot_watchdog_discards_a_title_lookup_that_lands_after_a_supersede(
-    rpcs3_dirs, monkeypatch, watchdog_env
-):
-    """_pine_title_id() can block past a relaunch/stop; the resolved title
-    must not be stamped onto a session that has already moved on."""
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """A stale title lookup must not stamp a session that has moved on.
+
+    _pine_title_id() can block past a relaunch/stop; the resolved title
+    must not be stamped onto a session that has already moved on.
+    """
     monkeypatch.setattr(rpcs3, "_pine_status", lambda: 0)
     emu = rpcs3.Rpcs3()
     seq = emu._launch_seq
     emu._session_serial = None
 
-    def title_id():
+    def title_id() -> str:
         emu._launch_seq += 1  # a relaunch/stop landed during the PINE round trip
         return "BLUS30443"
 
@@ -659,8 +760,9 @@ def test_boot_watchdog_discards_a_title_lookup_that_lands_after_a_supersede(
 
 
 def test_boot_watchdog_flags_a_hang_when_the_process_is_still_alive(
-    rpcs3_dirs, monkeypatch, watchdog_env
-):
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """Boot watchdog flags a hang when the process is still alive."""
     monkeypatch.setattr(rpcs3, "_pine_status", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: True)
     emu = rpcs3.Rpcs3()
@@ -671,8 +773,9 @@ def test_boot_watchdog_flags_a_hang_when_the_process_is_still_alive(
 
 
 def test_boot_watchdog_does_not_flag_a_process_that_already_exited(
-    rpcs3_dirs, monkeypatch, watchdog_env
-):
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """Boot watchdog does not flag a process that already exited."""
     monkeypatch.setattr(rpcs3, "_pine_status", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "alive", lambda self: False)
     emu = rpcs3.Rpcs3()
@@ -682,18 +785,21 @@ def test_boot_watchdog_does_not_flag_a_process_that_already_exited(
     assert emu.boot_failed is False
 
 
-def test_boot_watchdog_abandons_a_superseded_launch(rpcs3_dirs, monkeypatch):
+def test_boot_watchdog_abandons_a_superseded_launch(
+    rpcs3_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
     # A step of 1.0 (vs watchdog_env's 30.0) keeps the loop under the 90s
     # deadline long enough to re-enter the body after the seq bump below,
     # which is what actually exercises the in-loop supersede check rather
     # than just falling through to the post-loop one.
+    """Boot watchdog abandons a superseded launch."""
     monkeypatch.setattr(rpcs3.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(rpcs3.time, "monotonic", _FakeClock(step=1.0))
     emu = rpcs3.Rpcs3()
     seq = emu._launch_seq
     calls = {"n": 0}
 
-    def status():
+    def status() -> None:
         calls["n"] += 1
         if calls["n"] == 2:
             emu._launch_seq += 1
@@ -710,7 +816,8 @@ def test_boot_watchdog_abandons_a_superseded_launch(rpcs3_dirs, monkeypatch):
     assert calls["n"] == 2
 
 
-def test_stop_invalidates_an_in_flight_boot_watchdog(rpcs3_dirs):
+def test_stop_invalidates_an_in_flight_boot_watchdog(rpcs3_dirs: dict[str, Path]) -> None:
+    """Stop invalidates an in flight boot watchdog."""
     emu = rpcs3.Rpcs3()
     seq_before = emu._launch_seq
 
@@ -722,7 +829,8 @@ def test_stop_invalidates_an_in_flight_boot_watchdog(rpcs3_dirs):
 # ── xdotool window targeting ────────────────────────────────────────────
 
 
-def test_send_key_activates_then_sends_the_key(rpcs3_dirs):
+def test_send_key_activates_then_sends_the_key(rpcs3_dirs: dict[str, Path]) -> None:
+    """Send key activates then sends the key."""
     emu = rpcs3.Rpcs3()
     calls = []
     emu._xdotool = lambda *args: (calls.append(args), "111\n")[1] if args[0] == "search" else (
@@ -735,7 +843,8 @@ def test_send_key_activates_then_sends_the_key(rpcs3_dirs):
     assert calls[2] == ("key", "--clearmodifiers", "ctrl+alt+1")
 
 
-def test_send_key_fails_with_no_window(rpcs3_dirs):
+def test_send_key_fails_with_no_window(rpcs3_dirs: dict[str, Path]) -> None:
+    """Send key fails with no window."""
     emu = rpcs3.Rpcs3()
     emu._xdotool = lambda *args: None
 
@@ -749,19 +858,22 @@ def test_send_key_fails_with_no_window(rpcs3_dirs):
     ("1", True), ("true", True), ("YES", True), (" on ", True),
     ("0", False), ("false", False), ("", False),
 ])
-def test_the_cache_enabled_switch_reads_the_usual_spellings(setting, expected):
+def test_the_cache_enabled_switch_reads_the_usual_spellings(setting: str, expected: bool) -> None:
+    """_truthy recognizes the usual truthy and falsy string spellings."""
     assert rpcs3._truthy(setting) is expected
 
 
 @pytest.fixture
-def cache_dir(monkeypatch, tmp_path):
+def cache_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the archive extraction cache at an isolated temp directory with caching disabled."""
     cache = tmp_path / "cache"
     monkeypatch.setattr(rpcs3, "CACHE_DIR", cache)
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
     return cache
 
 
-def test_archive_dir_size_sums_files_and_skips_the_marker(cache_dir):
+def test_archive_dir_size_sums_files_and_skips_the_marker(cache_dir: Path) -> None:
+    """Archive dir size sums files and skips the marker."""
     game_dir = cache_dir / "Game"
     _touch(game_dir / "EBOOT.BIN")
     _touch(game_dir / "PARAM.SFO")
@@ -770,18 +882,21 @@ def test_archive_dir_size_sums_files_and_skips_the_marker(cache_dir):
     assert rpcs3._archive_dir_size(game_dir) == 10
 
 
-def test_cache_size_bytes_sums_across_every_game_dir(cache_dir):
+def test_cache_size_bytes_sums_across_every_game_dir(cache_dir: Path) -> None:
+    """Cache size bytes sums across every game dir."""
     _touch(cache_dir / "GameA" / "EBOOT.BIN")
     _touch(cache_dir / "GameB" / "EBOOT.BIN")
 
     assert rpcs3._cache_size_bytes() == 10
 
 
-def test_cache_size_bytes_is_zero_without_a_cache_dir(cache_dir):
+def test_cache_size_bytes_is_zero_without_a_cache_dir(cache_dir: Path) -> None:
+    """Cache size bytes is zero without a cache dir."""
     assert rpcs3._cache_size_bytes() == 0
 
 
-def test_touch_last_accessed_writes_a_marker_file(cache_dir):
+def test_touch_last_accessed_writes_a_marker_file(cache_dir: Path) -> None:
+    """Touch last accessed writes a marker file."""
     game_dir = cache_dir / "Game"
     _touch(game_dir / "EBOOT.BIN")
 
@@ -790,7 +905,8 @@ def test_touch_last_accessed_writes_a_marker_file(cache_dir):
     assert (game_dir / rpcs3._LAST_ACCESSED_MARKER).exists()
 
 
-def test_evict_lru_is_a_noop_when_disabled(cache_dir):
+def test_evict_lru_is_a_noop_when_disabled(cache_dir: Path) -> None:
+    """Evict LRU is a no-op when disabled."""
     game_dir = cache_dir / "GameA"
     _touch(game_dir / "EBOOT.BIN")
 
@@ -799,7 +915,10 @@ def test_evict_lru_is_a_noop_when_disabled(cache_dir):
     assert game_dir.exists()
 
 
-def test_evict_lru_removes_the_least_recently_used_entry_first(cache_dir, monkeypatch):
+def test_evict_lru_removes_the_least_recently_used_entry_first(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evict LRU removes the least recently used entry first."""
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 8 / 1024**3)
     old = cache_dir / "Old"
@@ -815,7 +934,10 @@ def test_evict_lru_removes_the_least_recently_used_entry_first(cache_dir, monkey
     assert new.exists()
 
 
-def test_evict_lru_never_removes_the_entry_being_extracted(cache_dir, monkeypatch):
+def test_evict_lru_never_removes_the_entry_being_extracted(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evict LRU never removes the entry being extracted."""
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 1 / 1024**3)
     keep = cache_dir / "Incoming"
@@ -827,7 +949,10 @@ def test_evict_lru_never_removes_the_entry_being_extracted(cache_dir, monkeypatc
     assert keep.exists()
 
 
-def test_evict_lru_gives_up_and_proceeds_when_nothing_is_left_to_evict(cache_dir, monkeypatch):
+def test_evict_lru_gives_up_and_proceeds_when_nothing_is_left_to_evict(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Evict LRU gives up and proceeds when nothing is left to evict."""
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 1 / 1024**3)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -835,7 +960,8 @@ def test_evict_lru_gives_up_and_proceeds_when_nothing_is_left_to_evict(cache_dir
     rpcs3._evict_lru(10**9, "Incoming")  # must not raise
 
 
-def test_archive_boot_target_prefers_eboot_over_iso(cache_dir):
+def test_archive_boot_target_prefers_eboot_over_iso(cache_dir: Path) -> None:
+    """Archive boot target prefers eboot over ISO."""
     root = cache_dir / "Game"
     _touch(root / "disc.iso")
     _touch(root / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
@@ -843,21 +969,26 @@ def test_archive_boot_target_prefers_eboot_over_iso(cache_dir):
     assert rpcs3._archive_boot_target(root).name == "EBOOT.BIN"
 
 
-def test_archive_boot_target_falls_back_to_iso(cache_dir):
+def test_archive_boot_target_falls_back_to_iso(cache_dir: Path) -> None:
+    """Archive boot target falls back to ISO."""
     root = cache_dir / "Game"
     iso = _touch(root / "disc.iso")
 
     assert rpcs3._archive_boot_target(root) == iso
 
 
-def test_archive_boot_target_is_none_when_nothing_bootable_is_present(cache_dir):
+def test_archive_boot_target_is_none_when_nothing_bootable_is_present(cache_dir: Path) -> None:
+    """Archive boot target is none when nothing bootable is present."""
     root = cache_dir / "Game"
     _touch(root / "readme.txt")
 
     assert rpcs3._archive_boot_target(root) is None
 
 
-def test_archive_boot_target_refuses_an_eboot_that_symlinks_outside_root(cache_dir, tmp_path):
+def test_archive_boot_target_refuses_an_eboot_that_symlinks_outside_root(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    """Archive boot target refuses an eboot that symlinks outside root."""
     root = cache_dir / "Game"
     root.mkdir(parents=True)
     outside = _touch(tmp_path / "outside" / "secret.bin")
@@ -866,7 +997,10 @@ def test_archive_boot_target_refuses_an_eboot_that_symlinks_outside_root(cache_d
     assert rpcs3._archive_boot_target(root) is None
 
 
-def test_archive_boot_target_refuses_an_iso_that_symlinks_outside_root(cache_dir, tmp_path):
+def test_archive_boot_target_refuses_an_iso_that_symlinks_outside_root(
+    cache_dir: Path, tmp_path: Path
+) -> None:
+    """Archive boot target refuses an ISO that symlinks outside root."""
     root = cache_dir / "Game"
     root.mkdir(parents=True)
     outside = _touch(tmp_path / "outside" / "disc.iso")
@@ -875,7 +1009,8 @@ def test_archive_boot_target_refuses_an_iso_that_symlinks_outside_root(cache_dir
     assert rpcs3._archive_boot_target(root) is None
 
 
-def test_archive_boot_target_accepts_an_eboot_that_symlinks_inside_root(cache_dir):
+def test_archive_boot_target_accepts_an_eboot_that_symlinks_inside_root(cache_dir: Path) -> None:
+    """Archive boot target accepts an eboot that symlinks inside root."""
     root = cache_dir / "Game"
     real_eboot = _touch(root / "real" / "actual_eboot.bin")
     linked = root / "PS3_GAME" / "USRDIR" / "EBOOT.BIN"
@@ -885,7 +1020,8 @@ def test_archive_boot_target_accepts_an_eboot_that_symlinks_inside_root(cache_di
     assert rpcs3._archive_boot_target(root) == linked
 
 
-def test_archive_boot_target_skips_a_dangling_eboot_symlink(cache_dir):
+def test_archive_boot_target_skips_a_dangling_eboot_symlink(cache_dir: Path) -> None:
+    """Archive boot target skips a dangling eboot symlink."""
     root = cache_dir / "Game"
     root.mkdir(parents=True)
     (root / "EBOOT.BIN").symlink_to(root / "does-not-exist")
@@ -901,7 +1037,8 @@ def _make_zip(path: Path, members: dict[str, bytes]) -> Path:
     return path
 
 
-def test_safe_extract_zip_extracts_normal_members(cache_dir, tmp_path):
+def test_safe_extract_zip_extracts_normal_members(cache_dir: Path, tmp_path: Path) -> None:
+    """Safe extract zip extracts normal members."""
     archive = _make_zip(tmp_path / "Game.zip", {"PS3_GAME/USRDIR/EBOOT.BIN": b"boot"})
     dest = cache_dir / "Game"
     dest.mkdir(parents=True)
@@ -912,7 +1049,8 @@ def test_safe_extract_zip_extracts_normal_members(cache_dir, tmp_path):
     assert (dest / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").read_bytes() == b"boot"
 
 
-def test_safe_extract_zip_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_path):
+def test_safe_extract_zip_rejects_a_member_that_escapes_the_dest(cache_dir: Path, tmp_path: Path) -> None:
+    """Safe extract zip rejects a member that escapes the dest."""
     archive = _make_zip(tmp_path / "Evil.zip", {"../../etc/passwd": b"pwned"})
     dest = cache_dir / "Evil"
     dest.mkdir(parents=True)
@@ -922,7 +1060,8 @@ def test_safe_extract_zip_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_
             rpcs3._safe_extract_zip(zf, dest)
 
 
-def test_extract_archive_zip_raises_on_a_corrupt_file(cache_dir, tmp_path):
+def test_extract_archive_zip_raises_on_a_corrupt_file(cache_dir: Path, tmp_path: Path) -> None:
+    """Extract archive zip raises on a corrupt file."""
     archive = tmp_path / "Corrupt.zip"
     archive.write_bytes(b"not a zip")
     dest = cache_dir / "Corrupt"
@@ -932,7 +1071,10 @@ def test_extract_archive_zip_raises_on_a_corrupt_file(cache_dir, tmp_path):
         rpcs3._extract_archive(archive, dest)
 
 
-def test_extract_archive_dispatches_rar_to_unrar(cache_dir, tmp_path, monkeypatch):
+def test_extract_archive_dispatches_rar_to_unrar(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract archive dispatches rar to unrar."""
     calls = []
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
     archive = tmp_path / "Game.rar"
@@ -945,7 +1087,10 @@ def test_extract_archive_dispatches_rar_to_unrar(cache_dir, tmp_path, monkeypatc
     assert str(archive) in calls[1]
 
 
-def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(cache_dir, tmp_path, monkeypatch):
+def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract archive dispatches .7z and unknown extensions to the 7z tool."""
     calls = []
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: calls.append(cmd) or "")
     archive = tmp_path / "Game.7z"
@@ -957,10 +1102,13 @@ def test_extract_archive_dispatches_7z_and_unknown_exts_to_7z(cache_dir, tmp_pat
     assert calls[1][0] == "7z" and calls[1][1] == "x"
 
 
-def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_path, monkeypatch):
+def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract archive rar rejects a member that escapes the dest."""
     calls = []
 
-    def fake_run(cmd, what):
+    def fake_run(cmd: list[str], what: str) -> str:
         calls.append(cmd)
         return "../../etc/passwd\n" if cmd[1] == "lb" else ""
 
@@ -974,11 +1122,14 @@ def test_extract_archive_rar_rejects_a_member_that_escapes_the_dest(cache_dir, t
     assert calls == [["unrar", "lb", "-y", str(archive)]]
 
 
-def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(cache_dir, tmp_path, monkeypatch):
+def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract archive 7z rejects a member that escapes the dest."""
     calls = []
     slt_output = "Path = Evil.7z\n\n----------\nPath = ../../etc/passwd\nSize = 4\n"
 
-    def fake_run(cmd, what):
+    def fake_run(cmd: list[str], what: str) -> str:
         calls.append(cmd)
         return slt_output if cmd[1] == "l" else ""
 
@@ -992,7 +1143,8 @@ def test_extract_archive_7z_rejects_a_member_that_escapes_the_dest(cache_dir, tm
     assert calls == [["7z", "l", "-slt", str(archive)]]
 
 
-def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path):
+def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path: Path) -> None:
+    """Reject unsafe members rejects a traversal path."""
     dest = tmp_path / "dest"
     dest.mkdir()
 
@@ -1000,14 +1152,16 @@ def test_reject_unsafe_members_rejects_a_traversal_path(tmp_path):
         rpcs3._reject_unsafe_members(dest, ["../outside.txt"])
 
 
-def test_reject_unsafe_members_allows_normal_paths(tmp_path):
+def test_reject_unsafe_members_allows_normal_paths(tmp_path: Path) -> None:
+    """Reject unsafe members allows normal paths."""
     dest = tmp_path / "dest"
     dest.mkdir()
 
     rpcs3._reject_unsafe_members(dest, ["a/b/c.txt", "top.txt"])
 
 
-def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path):
+def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path: Path) -> None:
+    """Reject escaped tree allows a normal extraction."""
     dest = tmp_path / "dest"
     (dest / "sub").mkdir(parents=True)
     (dest / "sub" / "file.txt").write_bytes(b"x")
@@ -1015,12 +1169,15 @@ def test_reject_escaped_tree_allows_a_normal_extraction(tmp_path):
     rpcs3._reject_escaped_tree(dest)
 
 
-def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_path):
-    """The pre-extraction listing check can be fooled by a control character
-    that renders differently in unrar/7z's text listing than in the archive's
-    real central directory, so this walks what actually landed on disk -- a
-    symlink is exactly the kind of real filesystem object that check could
-    never catch before extraction ran."""
+def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_path: Path) -> None:
+    """A symlink resolving outside dest must be caught, not just literal paths.
+
+    The pre-extraction listing check can be fooled by a control character
+    that renders differently in unrar/7z's text listing than in the
+    archive's real central directory, so this walks what actually landed on
+    disk -- a symlink is exactly the kind of real filesystem object that
+    check could never catch before extraction ran.
+    """
     outside = tmp_path / "outside"
     outside.mkdir()
     dest = tmp_path / "dest"
@@ -1032,12 +1189,15 @@ def test_reject_escaped_tree_rejects_a_symlink_that_resolves_outside_dest(tmp_pa
 
 
 def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
-    cache_dir, tmp_path, monkeypatch
-):
-    """A second launch racing in while the first is mid-extraction must wait
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A racing second call must wait for _CACHE_LOCK, not extract concurrently.
+
+    A second launch racing in while the first is mid-extraction must wait
     for _CACHE_LOCK rather than run its own extraction concurrently, which
-    could interleave writes into the same not-yet-populated game_dir or have
-    one call evict the directory the other is about to boot from."""
+    could interleave writes into the same not-yet-populated game_dir or
+    have one call evict the directory the other is about to boot from.
+    """
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
     archive = tmp_path / "Game.zip"
     archive.write_bytes(b"zip")
@@ -1071,13 +1231,17 @@ def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
     second.join(timeout=5)
 
 
-def test_rar_member_paths_parses_bare_listing(monkeypatch, tmp_path):
+def test_rar_member_paths_parses_bare_listing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """_rar_member_paths parses a bare listing with no archive header."""
     monkeypatch.setattr(rpcs3, "_run_extractor", lambda cmd, what: "sub\nsub/file.txt\ntop.txt\n")
 
     assert rpcs3._rar_member_paths(tmp_path / "Game.rar") == ["sub", "sub/file.txt", "top.txt"]
 
 
-def test_7z_member_paths_parses_slt_listing_and_skips_the_archive_header(monkeypatch, tmp_path):
+def test_7z_member_paths_parses_slt_listing_and_skips_the_archive_header(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """_7z_member_paths parses an slt listing and skips the archive header line."""
     slt_output = (
         "Path = Game.7z\nType = 7z\n\n"
         "----------\n"
@@ -1089,7 +1253,8 @@ def test_7z_member_paths_parses_slt_listing_and_skips_the_archive_header(monkeyp
     assert rpcs3._7z_member_paths(tmp_path / "Game.7z") == ["sub", "sub/file.txt"]
 
 
-def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch):
+def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run extractor raises on a nonzero exit."""
     monkeypatch.setattr(
         subprocess,
         "run",
@@ -1100,8 +1265,9 @@ def test_run_extractor_raises_on_a_nonzero_exit(monkeypatch):
         rpcs3._run_extractor(["7z", "x"], "7z (Game.7z)")
 
 
-def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch):
-    def raise_oserror(*a, **k):
+def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run extractor raises when the binary is missing."""
+    def raise_oserror(*a: object, **k: object) -> NoReturn:
         raise OSError("not found")
 
     monkeypatch.setattr(subprocess, "run", raise_oserror)
@@ -1110,7 +1276,8 @@ def test_run_extractor_raises_when_the_binary_is_missing(monkeypatch):
         rpcs3._run_extractor(["unrar", "x"], "unrar (Game.rar)")
 
 
-def test_cache_key_differs_for_archives_sharing_a_stem_but_not_an_extension(tmp_path):
+def test_cache_key_differs_for_archives_sharing_a_stem_but_not_an_extension(tmp_path: Path) -> None:
+    """Cache key differs for archives sharing a stem but not an extension."""
     zip_archive = tmp_path / "Game.zip"
     zip_archive.write_bytes(b"zip")
     rar_archive = tmp_path / "Game.rar"
@@ -1119,7 +1286,8 @@ def test_cache_key_differs_for_archives_sharing_a_stem_but_not_an_extension(tmp_
     assert rpcs3._cache_key(zip_archive) != rpcs3._cache_key(rar_archive)
 
 
-def test_cache_key_changes_when_a_same_named_archive_is_replaced(tmp_path):
+def test_cache_key_changes_when_a_same_named_archive_is_replaced(tmp_path: Path) -> None:
+    """Cache key changes when a same named archive is replaced."""
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"original")
     original_key = rpcs3._cache_key(archive)
@@ -1131,8 +1299,9 @@ def test_cache_key_changes_when_a_same_named_archive_is_replaced(tmp_path):
 
 
 def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(
-    cache_dir, tmp_path, monkeypatch
-):
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache does not reuse a stale entry from a replaced archive."""
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"original dump")
     stale_eboot = _touch(cache_dir / rpcs3._cache_key(archive) / "EBOOT.BIN")
@@ -1140,7 +1309,7 @@ def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(
     archive.write_bytes(b"a completely different, much longer replacement dump")
     os.utime(archive, (archive.stat().st_mtime + 5, archive.stat().st_mtime + 5))
 
-    def fake_extract(archive_, dest):
+    def fake_extract(archive_: Path, dest: Path) -> None:
         _touch(dest / "EBOOT.BIN")
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
@@ -1151,7 +1320,10 @@ def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(
     assert boot.parent != stale_eboot.parent
 
 
-def test_extract_and_cache_reuses_an_existing_bootable_extraction(cache_dir, tmp_path, monkeypatch):
+def test_extract_and_cache_reuses_an_existing_bootable_extraction(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache reuses an existing bootable extraction."""
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
     key = rpcs3._cache_key(archive)
@@ -1167,14 +1339,15 @@ def test_extract_and_cache_reuses_an_existing_bootable_extraction(cache_dir, tmp
 
 
 def test_extract_and_cache_re_extracts_a_stale_cache_dir_with_no_boot_target(
-    cache_dir, tmp_path, monkeypatch
-):
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache re extracts a stale cache dir with no boot target."""
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
     stale = cache_dir / rpcs3._cache_key(archive)
     _touch(stale / "readme.txt")
 
-    def fake_extract(archive_, dest):
+    def fake_extract(archive_: Path, dest: Path) -> None:
         _touch(dest / "EBOOT.BIN")
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
@@ -1186,12 +1359,13 @@ def test_extract_and_cache_re_extracts_a_stale_cache_dir_with_no_boot_target(
 
 
 def test_extract_and_cache_extracts_and_returns_the_boot_target_on_a_miss(
-    cache_dir, tmp_path, monkeypatch
-):
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache extracts and returns the boot target on a miss."""
     archive = tmp_path / "Game.zip"
     archive.write_bytes(b"zip")
 
-    def fake_extract(archive_, dest):
+    def fake_extract(archive_: Path, dest: Path) -> None:
         _touch(dest / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
@@ -1203,12 +1377,13 @@ def test_extract_and_cache_extracts_and_returns_the_boot_target_on_a_miss(
 
 
 def test_extract_and_cache_cleans_up_and_raises_when_extraction_fails(
-    cache_dir, tmp_path, monkeypatch
-):
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache cleans up and raises when extraction fails."""
     archive = tmp_path / "Game.zip"
     archive.write_bytes(b"zip")
 
-    def fake_extract(archive_, dest):
+    def fake_extract(archive_: Path, dest: Path) -> NoReturn:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
@@ -1220,8 +1395,9 @@ def test_extract_and_cache_cleans_up_and_raises_when_extraction_fails(
 
 
 def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extracted(
-    cache_dir, tmp_path, monkeypatch
-):
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extract and cache cleans up and raises when nothing bootable was extracted."""
     archive = tmp_path / "Game.zip"
     archive.write_bytes(b"zip")
     monkeypatch.setattr(rpcs3, "_extract_archive", lambda a, d: None)
@@ -1233,8 +1409,12 @@ def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extrac
 
 
 def test_launch_extracts_and_boots_from_an_archive_rom(
-    rpcs3_dirs, no_boot_watchdog, monkeypatch, tmp_path
-):
+    rpcs3_dirs: dict[str, Path],
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Launch extracts and boots from an archive ROM."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     spawned = {}
@@ -1252,8 +1432,13 @@ def test_launch_extracts_and_boots_from_an_archive_rom(
 
 
 def test_stop_removes_the_extraction_when_the_cache_is_disabled(
-    rpcs3_dirs, cache_dir, no_boot_watchdog, monkeypatch, tmp_path
-):
+    rpcs3_dirs: dict[str, Path],
+    cache_dir: Path,
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Stop removes the extraction when the cache is disabled."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
@@ -1272,8 +1457,13 @@ def test_stop_removes_the_extraction_when_the_cache_is_disabled(
 
 
 def test_stop_keeps_the_extraction_when_the_cache_is_enabled(
-    rpcs3_dirs, cache_dir, no_boot_watchdog, monkeypatch, tmp_path
-):
+    rpcs3_dirs: dict[str, Path],
+    cache_dir: Path,
+    no_boot_watchdog: list[tuple[str, tuple]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Stop keeps the extraction when the cache is enabled."""
     monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
@@ -1290,6 +1480,7 @@ def test_stop_keeps_the_extraction_when_the_cache_is_enabled(
     assert game_dir.exists()
 
 
-def test_the_cache_is_disabled_by_default(monkeypatch):
+def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cache is disabled by default when RPCS3_CACHE_ENABLED is unset."""
     monkeypatch.delenv("RPCS3_CACHE_ENABLED", raising=False)
     assert rpcs3._truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false")) is False

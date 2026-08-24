@@ -1,19 +1,23 @@
-"""Room websocket: oversized-frame rejection, chat rate limiting, and
-state-flag validation on the video/audio/cursor control messages."""
+"""Room websocket: oversized-frame rejection, chat rate limiting, and video/audio/cursor state validation."""
 
+from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
+from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
 from webstation_broker import room
 
-from .conftest import PREFIX
+from .conftest import PREFIX, FakeEmulator
 
 API = f"{PREFIX}/api"
 
 
-def _activate(client, broker_dirs, **overrides):
+def _activate(client: TestClient, broker_dirs: dict[str, Path], **overrides: object) -> str:
+    """Activate a session for the fake emulator and return the controller token."""
     rom = broker_dirs["roms"] / "Game.iso"
     rom.write_bytes(b"iso")
     body = {
@@ -28,7 +32,7 @@ def _activate(client, broker_dirs, **overrides):
 
 
 @contextmanager
-def _connect(client, token):
+def _connect(client: TestClient, token: str) -> Iterator[WebSocketTestSession]:
     """Open the room socket and drain the join broadcasts every connect sends."""
     with client.websocket_connect(f"{PREFIX}/ws/room?token={token}") as conn:
         conn.receive_json()  # user_joined
@@ -36,10 +40,15 @@ def _connect(client, token):
         yield conn
 
 
-def test_an_oversized_text_frame_closes_the_connection(client, broker_dirs, fake_emulator):
-    """8 KiB is already comfortably above any legitimate text frame, so the
-    server treats one oversized frame as abuse and closes rather than
-    dropping it and leaving the connection open to a repeat flood."""
+def test_an_oversized_text_frame_closes_the_connection(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An oversized text frame closes the connection.
+
+    8 KiB is already comfortably above any legitimate text frame, so the server treats one oversized
+    frame as abuse and closes rather than dropping it and leaving the connection open to a repeat
+    flood.
+    """
     token = _activate(client, broker_dirs)
     with _connect(client, token) as conn:
         conn.send_text("x" * (room.MAX_TEXT_FRAME_BYTES + 1))
@@ -49,8 +58,12 @@ def test_an_oversized_text_frame_closes_the_connection(client, broker_dirs, fake
 
 
 def test_a_chat_message_inside_the_cooldown_window_is_dropped(
-    client, broker_dirs, fake_emulator, monkeypatch
-):
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chat message inside the cooldown window is dropped."""
     token = _activate(client, broker_dirs)
     clock = {"now": 1000.0}
     monkeypatch.setattr(room.time, "time", lambda: clock["now"])
@@ -76,11 +89,18 @@ def test_a_chat_message_inside_the_cooldown_window_is_dropped(
         assert second["message"] == "after cooldown"
 
 
-def test_the_chat_cooldown_survives_a_reconnect(client, broker_dirs, fake_emulator, monkeypatch):
-    """The cooldown is keyed by token in session.ROOM["cooldowns"], not on
-    the per-connection object -- otherwise disconnecting and reconnecting
-    with the same token would hand out a fresh, unthrottled connection on
-    every reconnect."""
+def test_the_chat_cooldown_survives_a_reconnect(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The chat cooldown survives a reconnect.
+
+    The cooldown is keyed by token in session.ROOM["cooldowns"], not on the per-connection object,
+    since otherwise disconnecting and reconnecting with the same token would hand out a fresh,
+    unthrottled connection on every reconnect.
+    """
     token = _activate(client, broker_dirs)
     clock = {"now": 1000.0}
     monkeypatch.setattr(room.time, "time", lambda: clock["now"])
@@ -98,7 +118,10 @@ def test_the_chat_cooldown_survives_a_reconnect(client, broker_dirs, fake_emulat
         assert sync["payload"]["state"] == 1
 
 
-def test_a_video_state_of_zero_or_one_is_forwarded(client, broker_dirs, fake_emulator):
+def test_a_video_state_of_zero_or_one_is_forwarded(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A video state of zero or one is forwarded."""
     token = _activate(client, broker_dirs)
     with _connect(client, token) as conn:
         conn.send_json({"action": "video_state", "state": 1})
@@ -108,10 +131,14 @@ def test_a_video_state_of_zero_or_one_is_forwarded(client, broker_dirs, fake_emu
         assert message["payload"]["state"] == 1
 
 
-def test_a_json_boolean_state_is_forwarded(client, broker_dirs, fake_emulator):
-    """JS booleans serialize as JSON true/false, which Python decodes as
-    True/False -- these have to keep working since the room.js webcam/mic
-    toggles send exactly this shape."""
+def test_a_json_boolean_state_is_forwarded(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A JSON boolean state is forwarded.
+
+    JS booleans serialize as JSON true/false, which Python decodes as True/False -- these have to keep
+    working since the room.js webcam/mic toggles send exactly this shape.
+    """
     token = _activate(client, broker_dirs)
     with _connect(client, token) as conn:
         conn.send_json({"action": "audio_state", "state": True})
@@ -120,7 +147,10 @@ def test_a_json_boolean_state_is_forwarded(client, broker_dirs, fake_emulator):
         assert message["payload"]["state"] is True
 
 
-def test_an_out_of_range_state_value_is_dropped(client, broker_dirs, fake_emulator):
+def test_an_out_of_range_state_value_is_dropped(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An out-of-range state value is dropped."""
     token = _activate(client, broker_dirs)
     with _connect(client, token) as conn:
         conn.send_json({"action": "video_state", "state": 2})

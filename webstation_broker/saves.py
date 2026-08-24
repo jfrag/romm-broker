@@ -1,5 +1,8 @@
-"""Save data in and out: activate restores a zip archive into the emulator's
-save directories, exit zips every save file modified since launch."""
+"""Save data in and out of the emulator's save directories.
+
+Activate restores a zip archive into the emulator's save directories; exit
+zips every save file modified since launch.
+"""
 
 import calendar
 import io
@@ -8,22 +11,36 @@ import os
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import Any, Optional
 
 from . import settings
 
 log = logging.getLogger(__name__)
 
-# Env-tunable guard against runaway dumps.
 SAVE_FILE_MAX_BYTES = int(os.environ.get("SAVE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
-# Zip stores mtimes at 2 s DOS resolution; slack keeps the newer-file guard
-# from skipping files over rounding alone.
+"""Env-tunable guard against runaway dumps, from `SAVE_FILE_MAX_BYTES` (default 256 MiB)."""
 _SAVE_MTIME_SLACK = 2.0
+"""Seconds of slack on the newer-file guard.
+
+Zip stores mtimes at 2 s DOS resolution; the slack keeps the guard from
+skipping files over rounding alone.
+"""
 
 
 def _iter_save_files(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
-    """Every regular file under the allowed subtrees, sorted so identical
-    content zips to identical bytes. Dot-prefixed components are staging or
-    tmp entries and never ship."""
+    """List every regular file under the allowed subtrees.
+
+    Sorted so identical content zips to identical bytes. Dot-prefixed
+    components are staging or tmp entries and never ship, and symlinks are
+    skipped.
+
+    Args:
+        root: The emulator's save data root.
+        subtrees: Subdirectory names under `root` that hold save data.
+
+    Returns:
+        The files found, in sorted order.
+    """
     files: list[Path] = []
     for sub in subtrees:
         base = root / sub
@@ -44,9 +61,21 @@ def _iter_save_files(root: Path, subtrees: tuple[str, ...]) -> list[Path]:
     return files
 
 
-def _read_file_stable(p: Path, retries: int = 4, settle: float = 0.5):
-    """Read `p` only when size/mtime match before and after the read, so a
-    file the emulator is mid-writing is never shipped torn."""
+def _read_file_stable(p: Path, retries: int = 4, settle: float = 0.5) -> Optional[tuple[bytes, float]]:
+    """Read `p` only when size and mtime match before and after the read.
+
+    This is what keeps a file the emulator is mid-writing from ever being
+    shipped torn.
+
+    Args:
+        p: The file to read.
+        retries: How many reads to attempt before giving up.
+        settle: Seconds to wait between attempts.
+
+    Returns:
+        The file contents and its mtime, or None when the file could not be
+        read or was still changing after every attempt (both are logged).
+    """
     for attempt in range(retries):
         try:
             st_before = p.stat()
@@ -68,12 +97,24 @@ def _read_file_stable(p: Path, retries: int = 4, settle: float = 0.5):
 
 def build_save_archive(
     root: Path, subtrees: tuple[str, ...], baseline: float
-) -> dict:
+) -> dict[str, Any]:
     """Zip every save file modified since `baseline` (the launch timestamp).
 
-    Returns a report dict:
-      {"files": [{"path", "size", "mtime"}...], "skipped": n,
-       "total_bytes": n, "zip_bytes": bytes|None, "error": str|None}
+    Member paths are relative to `root` and mtimes are stored in UTC on both
+    sides, so a timezone difference between the dump and a later restore never
+    shifts them past the newer-file guard.
+
+    Args:
+        root: The emulator's save data root.
+        subtrees: Subdirectory names under `root` that hold save data.
+        baseline: Unix timestamp; files with an mtime at or after it are included.
+
+    Returns:
+        A report dict of the shape
+        `{"files": [{"path", "size", "mtime"}...], "skipped": n, "total_bytes": n,
+        "zip_bytes": bytes | None, "error": str | None}`. `zip_bytes` is None when
+        nothing changed or on error; `error` is set when the root is missing or
+        the changed files exceed `SAVE_FILE_MAX_BYTES`.
     """
     report: dict = {"files": [], "skipped": 0, "total_bytes": 0, "zip_bytes": None, "error": None}
     if not root.is_dir():
@@ -121,6 +162,15 @@ def build_save_archive(
 
 
 def _under(member: PurePosixPath, subtrees: tuple[str, ...]) -> bool:
+    """Whether an archive member path lies inside one of the given subtrees.
+
+    Args:
+        member: The member path, relative to the save data root.
+        subtrees: Subdirectory names to test against.
+
+    Returns:
+        True when `member` starts with one of the subtrees followed by a slash.
+    """
     return any(member.as_posix().startswith(sub + "/") for sub in subtrees)
 
 
@@ -129,7 +179,7 @@ def extract_save_archive(
     root: Path,
     subtrees: tuple[str, ...],
     excluded: tuple[str, ...] = (),
-) -> dict:
+) -> dict[str, Any]:
     """Restore an archive into the emulator's data dir.
 
     `excluded` names subtrees the emulator owns but this session syncs some
@@ -140,8 +190,20 @@ def extract_save_archive(
     save area.
 
     Existing files newer than their archive member are skipped so a restore
-    can never roll back saves made since the archive was taken. Returns
-    {"written", "skipped", "excluded", "failed", "error"}.
+    can never roll back saves made since the archive was taken. Each file is
+    written through a temp file and renamed into place.
+
+    Args:
+        content: The zip archive body.
+        root: The emulator's save data root.
+        subtrees: Subdirectory names under `root` that members may be restored into.
+        excluded: Subdirectory names whose members are counted and dropped.
+
+    Returns:
+        A dict of the shape `{"written", "skipped", "excluded", "failed", "error"}`
+        with counts for the first four and `error` set (and nothing written) when
+        the body is not a zip, the archive is too large, or a member escapes the
+        save dir or lies outside the subtrees.
     """
     result = {"written": 0, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
     try:
@@ -200,7 +262,15 @@ def extract_save_archive(
 
 
 def write_export(zip_bytes: bytes, name: str) -> str:
-    """Persist a dump archive for inspection; returns the path written."""
+    """Persist a dump archive under `settings.EXPORT_DIR` for inspection.
+
+    Args:
+        zip_bytes: The archive body.
+        name: The filename to write it as.
+
+    Returns:
+        The path written, as a string.
+    """
     settings.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = settings.EXPORT_DIR / name
     path.write_bytes(zip_bytes)
@@ -208,10 +278,17 @@ def write_export(zip_bytes: bytes, name: str) -> str:
 
 
 def write_import(zip_bytes: bytes, name: str) -> str:
-    """Persist an archive the parent uploaded for restore; returns the path.
+    """Persist an archive the parent uploaded for restore under `settings.IMPORT_DIR`.
 
     Written through a temp file and renamed so a half-received upload can
     never be handed to activate as a restore source.
+
+    Args:
+        zip_bytes: The archive body.
+        name: The filename to write it as.
+
+    Returns:
+        The path written, as a string.
     """
     settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = settings.IMPORT_DIR / name

@@ -1,4 +1,7 @@
-# Standalone emulator setup
+---
+title: "Emulator setup"
+description: "The one-time desktop session each emulator needs before single game launches work: BIOS, firmware, keys and controllers."
+---
 
 Single game launches reuse whatever configuration the emulators already have, so
 the workflow is: launch the container into desktop mode from the RomM web
@@ -31,9 +34,11 @@ container environment on first launch. The only settings you should need to
 touch are graphical preferences such as internal resolution and rendering
 options.
 
-> **Special note:** Dolphin may need to be opened and closed once before its
-> titlebar decorations appear, so if the window looks undecorated on first
-> launch, close it and reopen it to continue configuration.
+<Callout type="info">
+Dolphin may need to be opened and closed once before its titlebar decorations
+appear, so if the window looks undecorated on first launch, close it and
+reopen it to continue configuration.
+</Callout>
 
 ## Eden
 
@@ -59,8 +64,10 @@ extraction and injection, so leave both files where they are.
 Controller profiles are set up automatically on first init. Adjust graphics
 and audio to your liking and test a game.
 
-> **Special note:** Xemu must be relaunched after its default files are set up
-> before it will boot anything.
+<Callout type="info">
+Xemu must be relaunched after its default files are set up before it will boot
+anything.
+</Callout>
 
 ## Xenia
 
@@ -85,11 +92,13 @@ without a profile would sit behind it with no way to dismiss it.
 Set your graphics options and test a real game from the desktop before
 launching through RomM.
 
-> **Special note:** Xenia must be launched once from the desktop to create a
-> default Live profile for signing into games. Without it, single game launches
-> stall on the profile prompt and games cannot save. Single game launches keep
-> all Xenia data, the profile included, under `/config/xenia`; the profile has
-> to be created against that same storage root to be the one games boot with.
+<Callout type="warn">
+Xenia must be launched once from the desktop to create a default Live profile
+for signing into games. Without it, single game launches stall on the profile
+prompt and games cannot save. Single game launches keep all Xenia data, the
+profile included, under `/config/xenia`; the profile has to be created against
+that same storage root to be the one games boot with.
+</Callout>
 
 ## DuckStation
 
@@ -124,9 +133,11 @@ container; this depends entirely on how you have that folder organized.
 As with the others, set graphics options to taste and confirm with a real
 game.
 
-> **Special note:** shadps4qt is only the desktop manager for shadPS4's core
-> settings. You configure through it, but the binaries that single game
-> launches actually use are the shadPS4 cores it downloads.
+<Callout type="info">
+shadps4qt is only the desktop manager for shadPS4's core settings. You
+configure through it, but the binaries that single game launches actually use
+are the shadPS4 cores it downloads.
+</Callout>
 
 ## PCSX2
 
@@ -144,9 +155,9 @@ RetroArch main GUI on the desktop. The same menu is reachable during a single
 game launch by pressing **F1**.
 
 BIOS files and other RetroArch assets are too varied to cover in full here.
-[retroarch_cores.md](retroarch_cores.md) summarizes what each core this repo
-maps a platform to actually needs; for the authoritative per-core detail,
-defer to libretro's own
+[retroarch_cores.md](https://github.com/romm-streaming/romm-broker/blob/master/docs/retroarch_cores.md)
+summarizes what each core this repo maps a platform to actually needs; for the
+authoritative per-core detail, defer to libretro's own
 [core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information).
 
 ## RPCS3
@@ -195,10 +206,11 @@ decryption keys.
 
 Finish with your preferred graphics settings and test a game.
 
-> **Special note:** Cemu is finicky. Expect to launch it multiple times before
-> all settings stick, and the controller profile menus are half broken: click
-> the down arrows, click into the dropdowns, and navigate them with the
-> keyboard to get them to behave.
+<Callout type="warn">
+Cemu is finicky. Expect to launch it multiple times before all settings stick,
+and the controller profile menus are half broken: click the down arrows, click
+into the dropdowns, and navigate them with the keyboard to get them to behave.
+</Callout>
 
 ## Azahar
 
@@ -212,13 +224,15 @@ on the desktop as well: if you put Azahar into fullscreen yourself and then
 resize the browser, the picture freezes and you have to leave fullscreen to get
 it back.
 
-> **Special note:** For 3DS, the RetroArch core is the better option and is
-> what a `3ds` launch uses by default. Azahar exposes no way for the broker to
-> reach it from outside the process, so a standalone session has no save states
-> and shuts down with a kill rather than a clean exit, meaning only what the
-> game already wrote to its own save survives. The RetroArch core supports both
-> save states and a proper exit. Use standalone Azahar when you want its own
-> interface, and pick `retroarch` otherwise.
+<Callout type="info">
+For 3DS, the RetroArch core is the better option and is what a `3ds` launch
+uses by default. Azahar exposes no way for the broker to reach it from outside
+the process, so a standalone session has no save states and shuts down with a
+kill rather than a clean exit, meaning only what the game already wrote to its
+own save survives. The RetroArch core supports both save states and a proper
+exit. Use standalone Azahar when you want its own interface, and pick
+`retroarch` otherwise.
+</Callout>
 
 ## Flycast
 
@@ -229,14 +243,15 @@ directory VMU saves and save states live in.
 Controllers are pre-configured. Set your graphics and audio preferences from
 the desktop and test a game.
 
-> **Special note:** A RetroArch core also covers Dreamcast (`dc`
-> defaults to it), for anyone who prefers RetroArch's shared save-state UI and
-> hotkeys. Standalone Flycast has neither a control socket nor a SIGTERM
-> handler, so the only way the broker asks it to shut down cleanly is an
-> Alt+F4 keypress into its window, which is also the only moment it will
-> write a save state. That means, like DuckStation, there is no mid-session
-> save/load: a launch resumes
-> from whatever state was written on the previous clean exit, and the current
-> session's state is written once, on exit. Use standalone Flycast for its own
-> interface and settings, and pick `retroarch` if you'd rather manage
-> Dreamcast alongside your other RetroArch cores.
+<Callout type="info">
+A RetroArch core also covers Dreamcast (`dc` defaults to it), for anyone who
+prefers RetroArch's shared save-state UI and hotkeys. Standalone Flycast has
+neither a control socket nor a SIGTERM handler, so the only way the broker
+asks it to shut down cleanly is an Alt+F4 keypress into its window, which is
+also the only moment it will write a save state. That means, like DuckStation,
+there is no mid-session save/load: a launch resumes from whatever state was
+written on the previous clean exit, and the current session's state is
+written once, on exit. Use standalone Flycast for its own interface and
+settings, and pick `retroarch` if you'd rather manage Dreamcast alongside your
+other RetroArch cores.
+</Callout>

@@ -1,10 +1,10 @@
-"""Azahar (3DS) ROM resolution, qt-config.ini patching, launch, and save-dump
-mtime restamping."""
+"""Azahar (3DS) ROM resolution, qt-config.ini patching, launch, and save-dump mtime restamping."""
 
 import configparser
 import os
 import time
 from pathlib import Path
+from typing import NoReturn, Tuple
 
 import pytest
 
@@ -12,14 +12,16 @@ from webstation_broker.emulators import azahar
 
 
 @pytest.fixture
-def rom_root(monkeypatch, tmp_path):
+def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Provide an isolated ROM library root patched onto azahar.ROM_ROOT."""
     root = tmp_path / "romm"
     root.mkdir()
     monkeypatch.setattr(azahar, "ROM_ROOT", root)
     return root
 
 
-def test_class_declares_no_save_state_or_disc_swap_support():
+def test_class_declares_no_save_state_or_disc_swap_support() -> None:
+    """Azahar declares neither save-state nor disc-swap support."""
     assert azahar.Azahar.supports_states is False
     assert azahar.Azahar.supports_disc_swap is False
 
@@ -27,12 +29,14 @@ def test_class_declares_no_save_state_or_disc_swap_support():
 # ---- _xdg_dir ----
 
 
-def test_xdg_dir_uses_the_absolute_env_var_when_set(monkeypatch):
+def test_xdg_dir_uses_the_absolute_env_var_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absolute XDG env var is used as-is for the azahar-emu subdirectory."""
     monkeypatch.setenv("XDG_DATA_HOME", "/custom/data")
     assert azahar._xdg_dir("XDG_DATA_HOME", ".local/share") == "/custom/data/azahar-emu"
 
 
-def test_xdg_dir_falls_back_to_home_relative_path_when_unset(monkeypatch):
+def test_xdg_dir_falls_back_to_home_relative_path_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unset XDG env var falls back to the home-relative default path."""
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     monkeypatch.setenv("HOME", "/home/testuser")
     assert (
@@ -41,7 +45,8 @@ def test_xdg_dir_falls_back_to_home_relative_path_when_unset(monkeypatch):
     )
 
 
-def test_xdg_dir_ignores_a_relative_env_var(monkeypatch):
+def test_xdg_dir_ignores_a_relative_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A relative XDG env var is ignored in favor of the home-relative default."""
     monkeypatch.setenv("XDG_DATA_HOME", "relative/path")
     monkeypatch.setenv("HOME", "/home/testuser")
     assert (
@@ -53,27 +58,31 @@ def test_xdg_dir_ignores_a_relative_env_var(monkeypatch):
 # ---- resolve_rom_file / _pick_rom_file ----
 
 
-def test_resolve_takes_a_direct_file_as_given(rom_root):
+def test_resolve_takes_a_direct_file_as_given(rom_root: Path) -> None:
+    """A direct file path is returned unchanged."""
     rom = rom_root / "game.3ds"
     rom.write_bytes(b"")
 
     assert azahar.Azahar().resolve_rom_file(rom) == rom
 
 
-def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(rom_root):
+def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(rom_root: Path) -> None:
+    """A path that is neither a file nor a folder resolves to nothing."""
     missing = rom_root / "nope"
 
     assert azahar.Azahar().resolve_rom_file(missing) is None
 
 
-def test_resolve_returns_none_when_the_folder_has_no_candidates(rom_root):
+def test_resolve_returns_none_when_the_folder_has_no_candidates(rom_root: Path) -> None:
+    """An empty folder resolves to no ROM."""
     folder = rom_root / "Empty"
     folder.mkdir()
 
     assert azahar.Azahar().resolve_rom_file(folder) is None
 
 
-def test_resolve_finds_a_rom_directly_inside_a_folder(rom_root):
+def test_resolve_finds_a_rom_directly_inside_a_folder(rom_root: Path) -> None:
+    """A ROM sitting directly inside a folder is found."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     rom = folder / "game.3ds"
@@ -82,7 +91,8 @@ def test_resolve_finds_a_rom_directly_inside_a_folder(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) == rom
 
 
-def test_resolve_finds_a_rom_one_level_deeper_in_a_wrapper_folder(rom_root):
+def test_resolve_finds_a_rom_one_level_deeper_in_a_wrapper_folder(rom_root: Path) -> None:
+    """A ROM nested one level deeper in a wrapper folder is found."""
     folder = rom_root / "MyGame"
     inner = folder / "disc"
     inner.mkdir(parents=True)
@@ -92,7 +102,8 @@ def test_resolve_finds_a_rom_one_level_deeper_in_a_wrapper_folder(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) == rom
 
 
-def test_resolve_ignores_hidden_files(rom_root):
+def test_resolve_ignores_hidden_files(rom_root: Path) -> None:
+    """Hidden files are not considered ROM candidates."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / ".game.3ds").write_bytes(b"")
@@ -100,7 +111,8 @@ def test_resolve_ignores_hidden_files(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) is None
 
 
-def test_resolve_ignores_non_rom_extensions(rom_root):
+def test_resolve_ignores_non_rom_extensions(rom_root: Path) -> None:
+    """Files with a non-ROM extension are not considered candidates."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "readme.txt").write_bytes(b"")
@@ -108,7 +120,8 @@ def test_resolve_ignores_non_rom_extensions(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) is None
 
 
-def test_resolve_prefers_the_earlier_extension_in_priority_order(rom_root):
+def test_resolve_prefers_the_earlier_extension_in_priority_order(rom_root: Path) -> None:
+    """A ROM with a higher-priority extension is preferred over a lower one."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "game.cci").write_bytes(b"")
@@ -118,7 +131,8 @@ def test_resolve_prefers_the_earlier_extension_in_priority_order(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) == threeds
 
 
-def test_resolve_deprioritizes_update_and_dlc_files(rom_root):
+def test_resolve_deprioritizes_update_and_dlc_files(rom_root: Path) -> None:
+    """An update or DLC file is ranked below the base game ROM."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "update.3ds").write_bytes(b"")
@@ -128,7 +142,8 @@ def test_resolve_deprioritizes_update_and_dlc_files(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) == base_rom
 
 
-def test_resolve_refuses_a_rom_that_symlinks_outside_rom_root(rom_root, tmp_path):
+def test_resolve_refuses_a_rom_that_symlinks_outside_rom_root(rom_root: Path, tmp_path: Path) -> None:
+    """A ROM symlink that escapes ROM_ROOT is refused."""
     outside = tmp_path / "outside"
     outside.mkdir()
     secret = outside / "secret.3ds"
@@ -140,7 +155,8 @@ def test_resolve_refuses_a_rom_that_symlinks_outside_rom_root(rom_root, tmp_path
     assert azahar.Azahar().resolve_rom_file(folder) is None
 
 
-def test_resolve_accepts_a_rom_that_symlinks_inside_rom_root(rom_root):
+def test_resolve_accepts_a_rom_that_symlinks_inside_rom_root(rom_root: Path) -> None:
+    """A ROM symlink that stays inside ROM_ROOT resolves to its real target."""
     shared = rom_root / "Shared"
     shared.mkdir()
     real = shared / "actual.3ds"
@@ -154,7 +170,8 @@ def test_resolve_accepts_a_rom_that_symlinks_inside_rom_root(rom_root):
     assert azahar.Azahar().resolve_rom_file(folder) == real
 
 
-def test_resolve_ignores_a_dangling_symlink(rom_root):
+def test_resolve_ignores_a_dangling_symlink(rom_root: Path) -> None:
+    """A symlink pointing at a nonexistent target is not a candidate."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "game.3ds").symlink_to(rom_root / "does-not-exist")
@@ -166,7 +183,8 @@ def test_resolve_ignores_a_dangling_symlink(rom_root):
 
 
 @pytest.fixture
-def config_path(monkeypatch, tmp_path):
+def config_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Provide an isolated qt-config.ini path patched onto azahar.CONFIG_PATH."""
     path = tmp_path / "azahar-config" / "qt-config.ini"
     monkeypatch.setattr(azahar, "CONFIG_PATH", path)
     return path
@@ -179,7 +197,8 @@ def _read_ini(path: Path) -> configparser.RawConfigParser:
     return parser
 
 
-def test_patch_config_creates_missing_parent_directories(config_path):
+def test_patch_config_creates_missing_parent_directories(config_path: Path) -> None:
+    """Patching creates the config file's missing parent directories."""
     assert not config_path.parent.exists()
 
     azahar._patch_config()
@@ -187,7 +206,8 @@ def test_patch_config_creates_missing_parent_directories(config_path):
     assert config_path.exists()
 
 
-def test_patch_config_seeds_a_missing_file_with_every_forced_key(config_path):
+def test_patch_config_seeds_a_missing_file_with_every_forced_key(config_path: Path) -> None:
+    """A missing config file is seeded with every forced key."""
     azahar._patch_config()
 
     parser = _read_ini(config_path)
@@ -196,7 +216,8 @@ def test_patch_config_seeds_a_missing_file_with_every_forced_key(config_path):
     assert parser["UI"]["enable_discord_presence"] == "false"
 
 
-def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(config_path):
+def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(config_path: Path) -> None:
+    """A conflicting forced value is overwritten while other settings survive."""
     config_path.parent.mkdir(parents=True)
     config_path.write_text(
         "[UI]\nconfirmClose=true\ncustomSetting=keepme\n\n[Other]\nfoo=bar\n"
@@ -210,7 +231,8 @@ def test_patch_config_overwrites_a_conflicting_value_but_keeps_the_rest(config_p
     assert parser["Other"]["foo"] == "bar"
 
 
-def test_patch_config_preserves_key_case(config_path):
+def test_patch_config_preserves_key_case(config_path: Path) -> None:
+    """Patching preserves the case of existing keys."""
     config_path.parent.mkdir(parents=True)
     config_path.write_text("[UI]\nMixedCaseKey=Value\n")
 
@@ -219,7 +241,8 @@ def test_patch_config_preserves_key_case(config_path):
     assert "MixedCaseKey" in config_path.read_text()
 
 
-def test_patch_config_reseeds_a_file_that_fails_to_decode(config_path):
+def test_patch_config_reseeds_a_file_that_fails_to_decode(config_path: Path) -> None:
+    """A config file that fails to decode is reseeded from scratch."""
     config_path.parent.mkdir(parents=True)
     config_path.write_bytes(b"\x80\x81\x82 not valid utf-8")
 
@@ -230,9 +253,11 @@ def test_patch_config_reseeds_a_file_that_fails_to_decode(config_path):
 
 
 def test_patch_config_does_not_raise_when_the_directory_cannot_be_created(
-    monkeypatch, config_path
-):
-    def fail_mkdir(*a, **k):
+    monkeypatch: pytest.MonkeyPatch, config_path: Path
+) -> None:
+    """A failure to create the config directory is swallowed, not raised."""
+
+    def fail_mkdir(*a: object, **k: object) -> NoReturn:
         raise OSError("no space left on device")
 
     monkeypatch.setattr(Path, "mkdir", fail_mkdir)
@@ -243,20 +268,23 @@ def test_patch_config_does_not_raise_when_the_directory_cannot_be_created(
 # ---- launch ----
 
 
-def test_launch_stops_first_patches_config_and_spawns(monkeypatch, rom_root, config_path):
+def test_launch_stops_first_patches_config_and_spawns(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, config_path: Path
+) -> None:
+    """Launch stops any running instance, patches the config, then spawns."""
     order = []
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: order.append("stop"))
     patched = []
     real_patch = azahar._patch_config
 
-    def tracking_patch():
+    def tracking_patch() -> None:
         patched.append(True)
         real_patch()
 
     monkeypatch.setattr(azahar, "_patch_config", tracking_patch)
     spawned = {}
 
-    def fake_spawn(self, cmd, env):
+    def fake_spawn(self: azahar.Azahar, cmd: list[str], env: dict[str, str]) -> None:
         order.append("spawn")
         spawned["cmd"] = cmd
         spawned["env"] = env
@@ -274,7 +302,10 @@ def test_launch_stops_first_patches_config_and_spawns(monkeypatch, rom_root, con
     assert spawned["cmd"] == ["/opt/azahar/AppRun", "-w", str(rom)]
 
 
-def test_launch_uses_the_default_binary_path_when_unset(monkeypatch, rom_root, config_path):
+def test_launch_uses_the_default_binary_path_when_unset(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, config_path: Path
+) -> None:
+    """Launch falls back to the default binary path when AZAHAR_BIN is unset."""
     monkeypatch.delenv("AZAHAR_BIN", raising=False)
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     monkeypatch.setattr(azahar, "_patch_config", lambda: None)
@@ -291,7 +322,13 @@ def test_launch_uses_the_default_binary_path_when_unset(monkeypatch, rom_root, c
     assert spawned["cmd"][0] == "/opt/azahar/AppRun"
 
 
-def test_launch_logs_and_ignores_a_resume_slot(monkeypatch, rom_root, config_path, caplog):
+def test_launch_logs_and_ignores_a_resume_slot(
+    monkeypatch: pytest.MonkeyPatch,
+    rom_root: Path,
+    config_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A requested resume slot is logged and otherwise ignored."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     monkeypatch.setattr(azahar, "_patch_config", lambda: None)
     monkeypatch.setattr(azahar.Azahar, "_spawn", lambda self, cmd, env: None)
@@ -305,7 +342,10 @@ def test_launch_logs_and_ignores_a_resume_slot(monkeypatch, rom_root, config_pat
     assert "resume_slot 4 ignored" in caplog.text
 
 
-def test_launch_records_the_session_start_time(monkeypatch, rom_root, config_path):
+def test_launch_records_the_session_start_time(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, config_path: Path
+) -> None:
+    """Launch records the session start time around the call."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     monkeypatch.setattr(azahar, "_patch_config", lambda: None)
     monkeypatch.setattr(azahar.Azahar, "_spawn", lambda self, cmd, env: None)
@@ -319,7 +359,10 @@ def test_launch_records_the_session_start_time(monkeypatch, rom_root, config_pat
     assert before <= emu._session_start <= time.time()
 
 
-def test_launch_uses_windowed_not_fullscreen(monkeypatch, rom_root, config_path):
+def test_launch_uses_windowed_not_fullscreen(
+    monkeypatch: pytest.MonkeyPatch, rom_root: Path, config_path: Path
+) -> None:
+    """Launch spawns Azahar windowed, never with a fullscreen flag."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     monkeypatch.setattr(azahar, "_patch_config", lambda: None)
     spawned = {}
@@ -339,7 +382,8 @@ def test_launch_uses_windowed_not_fullscreen(monkeypatch, rom_root, config_path)
 # ---- prepare_restore ----
 
 
-def test_prepare_restore_stops_the_emulator(monkeypatch):
+def test_prepare_restore_stops_the_emulator(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preparing a restore stops the running emulator."""
     stopped = []
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: stopped.append(True))
 
@@ -352,7 +396,10 @@ def test_prepare_restore_stops_the_emulator(monkeypatch):
 
 
 @pytest.fixture
-def save_roots(monkeypatch, tmp_path):
+def save_roots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> Tuple[Path, Path, Path, Path]:
+    """Provide isolated save-group roots patched onto azahar._SAVE_GROUP_ROOTS."""
     sdmc_title = tmp_path / "sdmc_title"
     sdmc_extdata = tmp_path / "sdmc_extdata"
     nand_extdata = tmp_path / "nand_extdata"
@@ -364,7 +411,10 @@ def save_roots(monkeypatch, tmp_path):
     return roots
 
 
-def test_modified_title_saves_includes_a_title_touched_this_session(save_roots):
+def test_modified_title_saves_includes_a_title_touched_this_session(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """A title touched during the current session is included."""
     root = save_roots[0]
     title = root / "00010032" / "00040000"
     title.mkdir(parents=True)
@@ -375,7 +425,10 @@ def test_modified_title_saves_includes_a_title_touched_this_session(save_roots):
     assert emu._modified_title_saves() == [title]
 
 
-def test_modified_title_saves_excludes_a_title_not_touched_this_session(save_roots):
+def test_modified_title_saves_excludes_a_title_not_touched_this_session(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """A title not touched during the current session is excluded."""
     root = save_roots[0]
     title = root / "00010032" / "00040000"
     title.mkdir(parents=True)
@@ -386,7 +439,10 @@ def test_modified_title_saves_excludes_a_title_not_touched_this_session(save_roo
     assert emu._modified_title_saves() == []
 
 
-def test_modified_title_saves_skips_a_non_hex_title_high_dir(save_roots):
+def test_modified_title_saves_skips_a_non_hex_title_high_dir(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """A title-high directory that is not hex is skipped."""
     root = save_roots[0]
     title = root / "not-hex-8" / "00040000"
     title.mkdir(parents=True)
@@ -397,7 +453,10 @@ def test_modified_title_saves_skips_a_non_hex_title_high_dir(save_roots):
     assert emu._modified_title_saves() == []
 
 
-def test_modified_title_saves_skips_a_non_hex_title_low_dir(save_roots):
+def test_modified_title_saves_skips_a_non_hex_title_low_dir(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """A title-low directory that is not hex is skipped."""
     root = save_roots[0]
     title = root / "00010032" / "not-hex-8"
     title.mkdir(parents=True)
@@ -408,7 +467,10 @@ def test_modified_title_saves_skips_a_non_hex_title_low_dir(save_roots):
     assert emu._modified_title_saves() == []
 
 
-def test_modified_title_saves_ignores_a_missing_root(save_roots):
+def test_modified_title_saves_ignores_a_missing_root(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """A missing save-group root is ignored rather than raising."""
     for root in save_roots:
         root.rmdir()
     emu = azahar.Azahar()
@@ -417,7 +479,10 @@ def test_modified_title_saves_ignores_a_missing_root(save_roots):
     assert emu._modified_title_saves() == []
 
 
-def test_modified_title_saves_covers_every_save_group_root(save_roots):
+def test_modified_title_saves_covers_every_save_group_root(
+    save_roots: Tuple[Path, Path, Path, Path],
+) -> None:
+    """Touched titles are found across every save-group root."""
     titles = []
     for root in save_roots:
         title = root / "00010032" / "00040000"
@@ -430,7 +495,10 @@ def test_modified_title_saves_covers_every_save_group_root(save_roots):
     assert sorted(emu._modified_title_saves()) == sorted(titles)
 
 
-def test_save_and_exit_stops_the_emulator(monkeypatch, save_roots):
+def test_save_and_exit_stops_the_emulator(
+    monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
+) -> None:
+    """Saving and exiting stops the running emulator."""
     stopped = []
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: stopped.append(True))
     emu = azahar.Azahar()
@@ -441,7 +509,10 @@ def test_save_and_exit_stops_the_emulator(monkeypatch, save_roots):
     assert stopped == [True]
 
 
-def test_save_and_exit_returns_no_state_shape(monkeypatch, save_roots):
+def test_save_and_exit_returns_no_state_shape(
+    monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
+) -> None:
+    """Saving and exiting reports no save-state shape, since Azahar has none."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     emu = azahar.Azahar()
     emu._session_start = 0.0
@@ -451,7 +522,10 @@ def test_save_and_exit_returns_no_state_shape(monkeypatch, save_roots):
     assert result == {"state_saved": None, "state_slot": None, "state_file": None}
 
 
-def test_save_and_exit_restamps_every_file_in_a_touched_title_dir(monkeypatch, save_roots):
+def test_save_and_exit_restamps_every_file_in_a_touched_title_dir(
+    monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
+) -> None:
+    """Every file in a touched title dir is restamped, not just the touched one."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     root = save_roots[0]
     title = root / "00010032" / "00040000"
@@ -470,7 +544,10 @@ def test_save_and_exit_restamps_every_file_in_a_touched_title_dir(monkeypatch, s
     assert os.stat(untouched_sibling).st_mtime > old
 
 
-def test_save_and_exit_leaves_untouched_title_dirs_alone(monkeypatch, save_roots):
+def test_save_and_exit_leaves_untouched_title_dirs_alone(
+    monkeypatch: pytest.MonkeyPatch, save_roots: Tuple[Path, Path, Path, Path]
+) -> None:
+    """A title dir untouched this session is left with its original mtime."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     root = save_roots[0]
     title = root / "00010032" / "00040000"
@@ -488,15 +565,18 @@ def test_save_and_exit_leaves_untouched_title_dirs_alone(monkeypatch, save_roots
 
 
 def test_save_and_exit_logs_and_continues_when_a_restamp_fails(
-    monkeypatch, save_roots, caplog
-):
+    monkeypatch: pytest.MonkeyPatch,
+    save_roots: Tuple[Path, Path, Path, Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A restamp failure is logged and does not stop the exit route."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     root = save_roots[0]
     title = root / "00010032" / "00040000"
     title.mkdir(parents=True)
     (title / "save.bin").write_bytes(b"data")
 
-    def fail_utime(path, times):
+    def fail_utime(path: Path, times: Tuple[float, float]) -> NoReturn:
         raise OSError("boom")
 
     monkeypatch.setattr(azahar.os, "utime", fail_utime)
@@ -511,10 +591,11 @@ def test_save_and_exit_logs_and_continues_when_a_restamp_fails(
 
 
 def test_save_and_exit_logs_and_continues_when_the_walk_itself_raises(
-    monkeypatch, save_roots, caplog
-):
-    """A title dir vanishing mid-walk must not crash the exit route: the
-    caller already committed to stopping the emulator by this point."""
+    monkeypatch: pytest.MonkeyPatch,
+    save_roots: Tuple[Path, Path, Path, Path],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A title dir vanishing mid-walk must not crash the exit route, since stop is already committed."""
     monkeypatch.setattr(azahar.Azahar, "stop", lambda self: None)
     root = save_roots[0]
     title = root / "00010032" / "00040000"
@@ -522,7 +603,7 @@ def test_save_and_exit_logs_and_continues_when_the_walk_itself_raises(
     (title / "save.bin").write_bytes(b"data")
     monkeypatch.setattr(azahar.Azahar, "_modified_title_saves", lambda self: [title])
 
-    def fail_rglob(self, pattern):
+    def fail_rglob(self: Path, pattern: str) -> NoReturn:
         raise OSError("directory vanished mid-walk")
 
     monkeypatch.setattr(Path, "rglob", fail_rglob)

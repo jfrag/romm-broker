@@ -47,6 +47,7 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -90,7 +91,7 @@ _STFS_MAGICS = (b"CON ", b"LIVE", b"PIRS")
 _DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -130,13 +131,14 @@ def _is_stfs_package(path: Path) -> bool:
         return False
 
 
-def _find_container(base: Path) -> Path | None:
+def _find_container(base: Path) -> Optional[Path]:
     """The STFS header package under a title folder, or None.
 
     The magic check is what separates the package from its .data payload
     directory and from anything else a dump might have dropped next to it.
     Shallowest match wins, then the arcade type over the installed-game type,
-    so a folder holding both lands on one answer every time."""
+    so a folder holding both lands on one answer every time.
+    """
     ranked = []
     for pattern in _CONTAINER_GLOBS:
         try:
@@ -164,6 +166,8 @@ def _find_container(base: Path) -> Path | None:
 
 
 class Xenia(Emulator):
+    """Emulator adapter for Xenia Edge (Xbox 360)."""
+
     name = "xenia"
     display_name = "Xenia"
     save_root = DATA_DIR
@@ -177,7 +181,21 @@ class Xenia(Emulator):
     # SIGTERM is already a hard kill (no handler installed) and save writes
     # are write-through, so the base 5 s before SIGKILL is only a formality.
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a library entry to the file Xenia should boot.
+
+        A file is returned as given. A directory is resolved in order: an
+        extracted dump's default.xex, then the best disc image or bare
+        executable candidate, then an XBLA/Games on Demand content package.
+
+        Args:
+            path: The ROM library entry, either a bootable file or a
+                directory to search.
+
+        Returns:
+            The path to boot, or None if nothing bootable was found or a
+            default.xex symlink escapes ROM_ROOT.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -210,7 +228,17 @@ class Xenia(Emulator):
         # holds one.
         return _find_container(path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Stop any running instance and launch Xenia against a ROM.
+
+        Xenia has no save states, so resume_slot is accepted for interface
+        parity with other emulators but only logged, never acted on; the
+        game always resumes from its own save data.
+
+        Args:
+            rom_path: The resolved ROM file to boot.
+            resume_slot: Ignored save-state slot, kept for interface parity.
+        """
         self.stop()
         if resume_slot is not None:
             log.info(

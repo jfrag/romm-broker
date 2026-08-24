@@ -1,0 +1,82 @@
+---
+title: "Working on the docs"
+description: "How this site is built: Fumadocs, the generated Python reference, local preview and the GitHub Pages deployment."
+---
+
+The site lives in `docs/` and is a [Fumadocs](https://fumadocs.dev) app on
+Next.js, exported statically and published to GitHub Pages by
+`.github/workflows/docs.yml`.
+
+```
+docs/
+  content/docs/            the hand-written pages (MDX) and meta.json ordering
+  content/docs/developer/reference/   generated from the Python package, gitignored
+  scripts/generate-docs.mjs  turns fumapy's JSON into the reference pages
+  app/, components/, lib/  the Next.js app
+```
+
+## Local preview
+
+Node 22 and the Python environment from the [developer guide](/docs/developer).
+
+```bash
+cd docs && npm ci && cd ..
+
+# the Python reference: extract docstrings to JSON, then render MDX
+uv pip install ./docs/node_modules/fumadocs-python
+PYTHONPATH=. .venv/bin/fumapy-generate webstation_broker --dir docs
+(cd docs && npm run generate)
+
+# live preview on http://localhost:3000
+(cd docs && npm run dev)
+
+# or the exact static export the workflow publishes
+(cd docs && NEXT_PUBLIC_BASE_PATH=/romm-broker npm run build && npm run start)
+```
+
+`fumapy-generate` needs the package importable and its distribution metadata
+present, hence `PYTHONPATH=.` after a `pip install` of the project. Regenerate
+whenever docstrings change; the reference folder is ignored by git and rebuilt
+on every deploy, so nothing generated is ever committed.
+
+## The Python reference
+
+[`fumadocs-python`](https://www.fumadocs.dev/docs/integrations/python) ships a
+Python package, `fumapy`, that loads the package with griffe, parses the
+Google-style docstrings, and writes one JSON document. `scripts/generate-docs.mjs`
+converts that into MDX under `content/docs/developer/reference/`, one folder
+per module and one page per class, with every function rendered as a card
+carrying its signature, parameters, return value and collapsible source.
+
+The script does three things the stock converter does not:
+
+- Rewrites `Raises:`, `Yields:`, `Warns:` and `Examples:` sections into text,
+  since the converter only renders the description and admonitions.
+- Drops `self` and `cls` from signatures and parameter lists.
+- Unescapes `<` and `{` inside inline code, which the converter escapes
+  everywhere and CommonMark would otherwise show literally.
+
+It also strips the package name from paths and links so a module lands at
+`reference/emulators/base` rather than `reference/webstation_broker/emulators/base`.
+
+## Writing pages
+
+Pages are MDX with a `title` and `description` in the frontmatter (quote them;
+a bare colon breaks the YAML). `meta.json` in each folder fixes the order and
+the sidebar label. Available components beyond Markdown: `Callout`, `Cards`
+and `Card`, `Tabs` and `Tab`, `Steps` and `Step`. Fenced code blocks take a
+language and an optional `title="..."`; use `txt` for anything Shiki has no
+grammar for.
+
+Link between pages with site-absolute paths (`/docs/api/exit`); the base path
+is added at build time.
+
+## Deployment
+
+`docs.yml` runs on pushes to `master` that touch `docs/`, the package, or the
+workflow itself, and on manual dispatch. It installs the package and
+`fumadocs-python`, generates the reference, builds the static export with
+`NEXT_PUBLIC_BASE_PATH` set from `actions/configure-pages`, and deploys with
+`actions/deploy-pages`. The repository's Pages source must be set to
+"GitHub Actions"; no `gh-pages` branch is involved. A fork with Pages enabled
+the same way gets its own copy at `https://<owner>.github.io/<repo>/`.

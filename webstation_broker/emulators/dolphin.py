@@ -1,5 +1,4 @@
-"""Dolphin (GameCube/Wii) launcher: ROM resolution, save states over the
-emulator's own hotkeys, and resume by boot-time state load.
+"""Dolphin (GameCube/Wii) launcher: ROM resolution, hotkey save states, and boot-time resume.
 
 Dolphin has no control socket, but it takes every setting it needs on the
 command line: `-C` writes into the layered config, so nothing here has to
@@ -17,67 +16,120 @@ import os
 import re
 import subprocess
 import time
+from collections.abc import Iterable
 from pathlib import Path
 from threading import Thread
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Root of the RomM library mount (env `ROM_ROOT`, default `/romm`).
+
+A resolved disc image must sit under it; candidates resolving outside are discarded.
+"""
 
 USER_DIR = Path(os.environ.get("DOLPHIN_USER_DIR", "/config/.local/share/dolphin-emu"))
+"""Dolphin's user directory, passed with `-u` (env `DOLPHIN_USER_DIR`)."""
 STATE_DIR = USER_DIR / "StateSaves"
+"""Directory Dolphin writes its `.sNN` save states into."""
 CONFIG_DIR = USER_DIR / "Config"
+"""Directory holding Dolphin's INI files, where the pad bindings are seeded."""
 DOLPHIN_LOG_PATH = Path(os.environ.get("DOLPHIN_LOG_PATH", "/config/dolphin.log"))
+"""Log file the broker tails for this emulator (env `DOLPHIN_LOG_PATH`, default `/config/dolphin.log`)."""
 
-# The one slot the broker works in. RomM holds the library of states, so a
-# requested slot resolves to this one and the routes echo the effective slot.
 STATE_SLOT = int(os.environ.get("DOLPHIN_STATE_SLOT", "1"))
+"""The one slot the broker works in (env `DOLPHIN_STATE_SLOT`, default 1).
 
-# EXIDeviceType::MemoryCardFolder, the GC slot A device that keeps saves as
-# loose .gci files under GC/<region>/Card A rather than one .raw card image.
+RomM holds the library of states, so a requested slot resolves to this one
+and the routes echo the effective slot.
+"""
+
 GC_SLOT_A_DEVICE = 8
+"""`EXIDeviceType::MemoryCardFolder`, the GC slot A device pinned at launch.
 
-# Dolphin's own defaults: Shift+F<n> saves slot n, F<n> loads it.
+It keeps saves as loose `.gci` files under `GC/<region>/Card A` rather than
+one `.raw` card image.
+"""
+
 SAVE_KEY = f"shift+F{STATE_SLOT}"
+"""xdotool key for saving the working slot; Dolphin's own default is `Shift+F<n>` for slot n."""
 LOAD_KEY = f"F{STATE_SLOT}"
+"""xdotool key for loading the working slot; Dolphin's own default is `F<n>` for slot n."""
 
 STATE_WAIT = float(os.environ.get("DOLPHIN_STATE_WAIT", "20.0"))
+"""Seconds a save state has to land on disk after the save hotkey (env `DOLPHIN_STATE_WAIT`, default 20)."""
 RESUME_LOAD_WAIT = float(os.environ.get("DOLPHIN_RESUME_LOAD_WAIT", "90.0"))
-# How long the window has to be up before a hotkey is worth sending. Dolphin
-# maps its window before the core is running, and a load that early is dropped.
+"""Seconds a deferred resume waits for a state file to arrive (env `DOLPHIN_RESUME_LOAD_WAIT`, default 90)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("DOLPHIN_RESUME_LOAD_SETTLE", "5.0"))
+"""How long the window has to be up before a hotkey is worth sending (env `DOLPHIN_RESUME_LOAD_SETTLE`).
 
-# OGL over Vulkan by default: RADV on the integrated AMD parts these containers
-# run on has been the less reliable of the two.
+Dolphin maps its window before the core is running, and a load that early is
+dropped. Defaults to 5 seconds.
+"""
+
 VIDEO_BACKEND = os.environ.get("DOLPHIN_VIDEO_BACKEND", "OGL")
+"""Video backend passed with `-v` (env `DOLPHIN_VIDEO_BACKEND`, default `OGL`).
 
-# Discs Dolphin boots, best first, so a folder holding several candidates picks
-# the compressed image over the raw one beside it.
+OGL over Vulkan by default: RADV on the integrated AMD parts these containers
+run on has been the less reliable of the two.
+"""
+
 ROM_EXTENSIONS = (".rvz", ".wia", ".gcz", ".iso", ".gcm", ".ciso", ".wbfs", ".wad", ".dol", ".elf")
+"""Discs Dolphin boots, best first.
+
+A folder holding several candidates picks the compressed image over the raw
+one beside it.
+"""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
 _DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
 
-# "<game id>.s01", the name Dolphin builds for a save state.
 _STATE_NAME_RE = re.compile(r"^(?P<game>[^/]+)\.s\d{2}$")
+"""Matches `<game id>.s01`, the name Dolphin builds for a save state."""
 
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
-# Dolphin's render window, its main window and its dialogs all share this WM
-# class. Only the render window titles itself with the running game, in a
-# "Dolphin <ver> | JIT64 | OpenGL | <game>" line, and only it takes hotkeys.
 _WINDOW_CLASS = "dolphin-emu"
+"""WM class shared by Dolphin's render window, its main window and its dialogs.
+
+Only the render window titles itself with the running game, in a
+`Dolphin <ver> | JIT64 | OpenGL | <game>` line, and only it takes hotkeys.
+"""
 _RENDER_TITLE_MARK = " | "
+"""Substring that singles the render window's title out from the main window and dialogs."""
 
 
 def _disc_number(rel: Path) -> int:
+    """Return the disc number a relative ROM path names, or 1 when it names none.
+
+    Args:
+        rel: Candidate path relative to the ROM folder being searched.
+
+    Returns:
+        The number following a `disc`, `disk` or `cd` marker in the path, never below 1.
+    """
     match = _DISC_RE.search(str(rel))
     if match is None:
         return 1
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
+    """Pick the best bootable disc image out of a set of candidate paths.
+
+    Hidden files, unsupported extensions, non-files and anything resolving
+    outside `ROM_ROOT` are dropped. The rest rank by disc number, then by
+    position in `ROM_EXTENSIONS`, then by depth and name, so disc 1 in the
+    best format wins.
+
+    Args:
+        candidates: Paths found under the ROM folder.
+        base: The ROM folder the candidates are relative to.
+
+    Returns:
+        The resolved path of the winning image, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -102,8 +154,6 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
     return min(ranked)[4]
 
 
-# Selkies presents the browser gamepad as an SDL device, and Dolphin ships no
-# default binding for one, so an unconfigured container has no usable pad.
 _GCPAD_TEMPLATE = """[GCPad{n}]
 Device = SDL/{i}/Microsoft X-Box 360 pad
 Buttons/A = `Button E`
@@ -131,13 +181,19 @@ D-Pad/Right = `Pad E`
 Triggers/L-Analog = `Thumb L`
 Triggers/R-Analog = `Thumb R`
 """
+"""GCPadNew.ini section template, formatted per pad with `n` (1-based) and `i` (0-based SDL index).
+
+Selkies presents the browser gamepad as an SDL device, and Dolphin ships no
+default binding for one, so an unconfigured container has no usable pad.
+"""
 
 
 def _seed_gcpad() -> None:
-    """Write the pad bindings once, if the file is not already there.
+    """Write the pad bindings for four pads once, if the file is not already there.
 
     Seeded rather than patched so a player's own remapping, which Dolphin
-    writes back to this same file, survives every later launch.
+    writes back to this same file, survives every later launch. A write
+    failure is logged, not raised.
     """
     path = CONFIG_DIR / "GCPadNew.ini"
     if path.exists():
@@ -152,11 +208,18 @@ def _seed_gcpad() -> None:
         log.warning("could not seed the pad bindings at %s: %s", path, exc)
 
 
-def _state_for_slot(slot: int) -> Path | None:
-    """The newest state in `slot`, or None if it holds nothing."""
+def _state_for_slot(slot: int) -> Optional[Path]:
+    """Find the most recently written state in `slot`.
+
+    Args:
+        slot: The slot number, matched as a two-digit `.sNN` suffix.
+
+    Returns:
+        The newest state in `slot` by mtime, or None if it holds nothing.
+    """
     if not STATE_DIR.is_dir():
         return None
-    candidates = []
+    candidates: list[tuple[float, Path]] = []
     for p in STATE_DIR.glob(f"*.s{slot:02d}"):
         try:
             candidates.append((p.stat().st_mtime, p))
@@ -167,10 +230,16 @@ def _state_for_slot(slot: int) -> Path | None:
     return max(candidates)[1]
 
 
-def _snapshot() -> dict:
+def _snapshot() -> dict[Path, tuple[int, float]]:
+    """Snapshot every state in the broker's working slot.
+
+    Returns:
+        A dict of state path to `(size, mtime)`, empty when the directory is missing. Files that
+        vanish mid-scan are skipped.
+    """
     if not STATE_DIR.is_dir():
         return {}
-    snap = {}
+    snap: dict[Path, tuple[int, float]] = {}
     for p in STATE_DIR.glob(f"*.s{STATE_SLOT:02d}"):
         try:
             st = p.stat()
@@ -180,15 +249,26 @@ def _snapshot() -> dict:
     return snap
 
 
-def _wait_for_state_write(before: dict, deadline: float) -> bool:
-    """Poll the slot until a write completes (size stable for 0.5 s) or the
-    deadline passes. The hotkey is fire-and-forget, so the file appearing and
-    settling is the only confirmation there is."""
+def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float) -> bool:
+    """Poll the working slot until a write completes or the deadline passes.
+
+    A write counts as complete once the file's size has been stable for 0.5 s.
+    The hotkey is fire-and-forget, so the file appearing and settling is the
+    only confirmation there is. A target that disappears mid-write is dropped
+    and the scan starts over.
+
+    Args:
+        before: Snapshot from `_snapshot` taken before the hotkey was sent.
+        deadline: `time.monotonic` value to give up at.
+
+    Returns:
+        True once a new or modified state has settled, False on timeout.
+    """
     STABLE_SECS = 0.5
     POLL_SECS = 0.1
-    target: Path | None = None
-    last_size: int | None = None
-    stable_since: float | None = None
+    target: Optional[Path] = None
+    last_size: Optional[int] = None
+    stable_since: Optional[float] = None
     while time.monotonic() < deadline:
         after = _snapshot()
         if target is None:
@@ -214,12 +294,20 @@ def _wait_for_state_write(before: dict, deadline: float) -> bool:
     return False
 
 
-def _restamp_slot(filename: str, slot: int) -> str | None:
-    """The same state named for `slot`, or None if it is not a state name.
+def _restamp_slot(filename: str, slot: int) -> Optional[str]:
+    """Rename a state for `slot`, keeping the game id that ties it to its disc.
 
     Dolphin resolves a state by the game id in the name, so that is what has to
     survive the trip; the slot a stored capture happens to carry is rewritten
-    into this broker's one working slot."""
+    into this broker's one working slot.
+
+    Args:
+        filename: The basename a stored state arrived with.
+        slot: The slot to stamp into the name.
+
+    Returns:
+        The same state named for `slot`, or None if `filename` is not a state name.
+    """
     match = _STATE_NAME_RE.match(filename)
     if match is None:
         return None
@@ -227,35 +315,85 @@ def _restamp_slot(filename: str, slot: int) -> str | None:
 
 
 class Dolphin(Emulator):
+    """GameCube and Wii sessions on dolphin-emu.
+
+    The broker launches `dolphin-emu -b` with every setting on the command
+    line: `-u` for the user directory, `-v` for the video backend, and a run
+    of `-C` overrides for fullscreen, no stop confirmation, no panic dialogs,
+    analytics consent already answered, and slot A pinned to a GCI folder
+    card. Qt is forced onto xcb so the window lives on Xwayland, where
+    xdotool can reach it. A resume whose state is already on disk loads at
+    boot with `-s`, which is both more reliable than the hotkey and invisible
+    to the player; a resume whose state RomM pushes after activate returns is
+    delivered by a deferred thread over the load hotkey instead. Saving is
+    hotkey only: the render window is activated, `SAVE_KEY` is sent through
+    XTEST, and the state directory is polled until the file settles, since
+    the hotkey gives no acknowledgement.
+
+    Save data rides the save archive: `GC` holds the memory cards as loose
+    `.gci` files, `Wii` the NAND, so nothing here needs the whole-card
+    routes. A state is named for the game id, so pushed names are restamped
+    into the broker's slot, the working slot is cleared before a boot, and
+    Dolphin's undo-load buffer is dropped on exit so the archive does not
+    carry a second full-size copy of a state RomM already stores.
+
+    Attributes:
+        name: RomM platform key, `dolphin`.
+        display_name: Human-readable name shown in the UI.
+        save_root: Dolphin's user directory, which the save subtrees hang off.
+        save_subtrees: `StateSaves`, `GC` and `Wii`, the directories the save archive carries.
+        rom_extensions: Bootable disc formats, best first.
+        supports_states: True, states are saved over the hotkey and loaded at boot or by hotkey.
+        state_slot: The one slot the broker works in, echoed back as the effective slot.
+        state_dir: Where Dolphin writes `.sNN` files.
+        log_path: The Dolphin log the broker exposes.
+    """
+
     name = "dolphin"
     display_name = "Dolphin"
     save_root = USER_DIR
-    # GC holds the memory cards, Wii the NAND. GC's card also rides the
-    # whole-card routes when a container opts in (memory_card_subtree below);
-    # Wii has no physical card, so its NAND only ever moves through the save
-    # archive.
     save_subtrees = ("StateSaves", "GC", "Wii")
-    memory_card_subtree = "GC"
+    """Directories the save archive carries.
+
+    GC holds the memory cards, Wii the NAND. GC's card also rides the
+    whole-card routes when a container opts in (`memory_card_subtree` below);
+    Wii has no physical card, so its NAND only ever moves through the save
+    archive.
+    """
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
     state_dir = STATE_DIR
     log_path = DOLPHIN_LOG_PATH
+    memory_card_subtree = "GC"
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Set up the process state and the launch sequence counter that fences deferred loads."""
         super().__init__()
         self._launch_seq = 0
 
-    def memory_card_path(self, platform: str | None = None) -> Path | None:
+    def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
         """The whole GC/ tree, or None for Wii (NAND, no physical card).
 
         Returns the tree rather than one region's Card A folder: Dolphin
         buckets a GCI folder card by the disc's region (GC/<region>/Card A),
         and a library can mix regions, so syncing has to carry all of them
-        rather than guessing one."""
+        rather than guessing one.
+        """
         return USER_DIR / "GC" if platform == "ngc" else None
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a RomM path to the disc image to boot.
+
+        A file is taken as is. A directory is searched one level deep for the
+        best candidate by `_pick_rom_file`.
+
+        Args:
+            path: The ROM file or folder RomM handed over.
+
+        Returns:
+            The image to pass to dolphin-emu, or None when there is nothing bootable.
+        """
         if path.is_file():
             # Defense in depth: api.py already validates path is under
             # ROM_ROOT before calling in, but this checks it independently
@@ -276,8 +414,15 @@ class Dolphin(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def _xdotool(self, *args: str) -> str | None:
-        """Run xdotool, returning its stdout, or None if it failed."""
+    def _xdotool(self, *args: str) -> Optional[str]:
+        """Run one xdotool command against the session display.
+
+        Args:
+            *args: Arguments passed to the xdotool binary.
+
+        Returns:
+            Its stdout, or None if it could not be run, timed out, or exited non-zero.
+        """
         try:
             result = subprocess.run(
                 [_XDOTOOL, *args],
@@ -294,12 +439,15 @@ class Dolphin(Emulator):
             return None
         return result.stdout
 
-    def _render_window(self) -> str | None:
-        """The window id Dolphin renders the game into, or None.
+    def _render_window(self) -> Optional[str]:
+        """Find the window Dolphin renders the game into.
 
         Picked by title rather than by taking the first match, because the main
         window and any dialog carry the same class, and a hotkey sent at either
         of those does nothing.
+
+        Returns:
+            The X window id as xdotool prints it, or None when no render window is up.
         """
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if out is None:
@@ -317,6 +465,12 @@ class Dolphin(Emulator):
         Activating first is what makes this survive the player clicking back
         into the page: XTEST delivers to whatever holds focus, so a key sent at
         an unfocused Dolphin goes to the desktop instead.
+
+        Args:
+            key: The key name in xdotool's syntax, for example `shift+F1`.
+
+        Returns:
+            True when the window was found, activated and the key sent, False otherwise.
         """
         win_id = self._render_window()
         if win_id is None:
@@ -325,7 +479,18 @@ class Dolphin(Emulator):
             return False
         return self._xdotool("key", "--clearmodifiers", key) is not None
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Stop any running instance, seed the pad bindings, and start dolphin-emu.
+
+        The binary comes from env `DOLPHIN_BIN` (default `dolphin-emu`). With
+        `resume_slot` set and a state already in the working slot, the state
+        is loaded at boot with `-s`; with the slot still empty, a deferred
+        thread waits for RomM's push and loads it over the hotkey.
+
+        Args:
+            rom_path: The disc image to boot.
+            resume_slot: Slot to resume from, or None to boot clean.
+        """
         self.stop()
         _seed_gcpad()
         self._launch_seq += 1
@@ -371,6 +536,16 @@ class Dolphin(Emulator):
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _deferred_load_state(self, seq: int) -> None:
+        """Wait for a pushed state to arrive, then load it over the hotkey.
+
+        Gives the file `RESUME_LOAD_WAIT` to appear, then `RESUME_LOAD_SETTLE`
+        for the window to be ready. Abandons itself whenever `seq` no longer
+        matches the current launch, so a superseded launch never gets a stray
+        load.
+
+        Args:
+            seq: The launch sequence number this load belongs to.
+        """
         deadline = time.monotonic() + RESUME_LOAD_WAIT
         if not self.wait_for_state(deadline):
             log.warning("resume: no state file ever arrived")
@@ -385,30 +560,53 @@ class Dolphin(Emulator):
         log.info("resume: deferred load %s", "delivered" if ok else "failed")
 
     def save_state(self, slot: int) -> bool:
-        """`slot` is what RomM asked for and is ignored: this saves into
-        STATE_SLOT and the caller reads the effective slot back off
-        state_slot."""
+        """Save a state into the broker's slot over the hotkey and wait for it to land.
+
+        `slot` is what RomM asked for and is ignored: this saves into
+        `STATE_SLOT` and the caller reads the effective slot back off
+        `state_slot`.
+
+        Args:
+            slot: The slot RomM requested; not used.
+
+        Returns:
+            True once the state file has been written and settled within `STATE_WAIT`, False if
+            the hotkey could not be sent or the write never completed.
+        """
         before = _snapshot()
         if not self._send_key(SAVE_KEY):
             return False
         return _wait_for_state_write(before, time.monotonic() + STATE_WAIT)
 
     def load_state(self, slot: int) -> bool:
-        # The hotkey is silent on an empty slot, so an absent file has to be
-        # caught here or the caller reads a no-op as success.
+        """Load the broker's slot over the hotkey.
+
+        The hotkey is silent on an empty slot, so an absent file has to be
+        caught here or the caller reads a no-op as success.
+
+        Args:
+            slot: The slot RomM requested; the broker's `STATE_SLOT` is what gets loaded.
+
+        Returns:
+            True when a state file exists and the hotkey was sent, False otherwise.
+        """
         if self.state_path() is None:
             log.warning("load state: slot %d holds no state file", STATE_SLOT)
             return False
         return self._send_key(LOAD_KEY)
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
+        """Return the newest state file in the broker's slot, or None when it holds nothing."""
         return _state_for_slot(STATE_SLOT)
 
     def clear_working_slot(self) -> None:
-        """A state is named for the game it was taken from, and the game id only
+        """Delete every state in the broker's slot before a new session boots.
+
+        A state is named for the game it was taken from, and the game id only
         comes off the running disc, so a leftover cannot be told apart from the
         state of the game about to boot. Anything still here belongs to a
-        session that has already exited and whose states RomM holds."""
+        session that has already exited and whose states RomM holds.
+        """
         if not STATE_DIR.is_dir():
             return
         for stale in STATE_DIR.glob(f"*.s{STATE_SLOT:02d}"):
@@ -418,10 +616,20 @@ class Dolphin(Emulator):
             except OSError as exc:
                 log.warning("could not clear stale state %s: %s", stale.name, exc)
 
-    def state_target(self, filename: str) -> Path | None:
-        """With the slot already holding a state, a pushed name has to match it;
+    def state_target(self, filename: str) -> Optional[Path]:
+        """Map a pushed state's filename to where it may be written.
+
+        With the slot already holding a state, a pushed name has to match it;
         otherwise the game id is taken on trust, bounded to a `<game>.s<slot>`
-        basename in the state dir."""
+        basename in the state dir.
+
+        Args:
+            filename: The basename RomM is pushing.
+
+        Returns:
+            The path to write to, or None when the name is not a state name, carries a path
+            component, or does not match the state already in the slot.
+        """
         if "/" in filename or filename in ("", ".", ".."):
             return None
         restamped = _restamp_slot(filename, STATE_SLOT)
@@ -437,7 +645,8 @@ class Dolphin(Emulator):
 
         Dolphin rewrites this on every state load, so it lands in the dump as a
         second full-size copy of a state RomM is already storing, for the sake
-        of an undo hotkey a streaming session has no way to press.
+        of an undo hotkey a streaming session has no way to press. A failure
+        to remove it is logged, not raised.
         """
         undo = STATE_DIR / "lastState.sav"
         try:
@@ -445,9 +654,20 @@ class Dolphin(Emulator):
         except OSError as exc:
             log.warning("could not drop the undo state buffer: %s", exc)
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
+        """Save a state if asked, stop the emulator, and drop the undo buffer.
+
+        Args:
+            slot: Slot RomM asked to save into (resolved to `STATE_SLOT`), or None to exit
+                without saving a state.
+
+        Returns:
+            A dict with `state_saved` (bool), `state_slot` (the effective slot, or None when no
+            save was requested) and `state_file` (a dict of `path`, `size` and `mtime` for the
+            saved state, or None).
+        """
         saved = False
-        state_file = None
+        state_file: Optional[dict[str, Any]] = None
         if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
@@ -469,6 +689,6 @@ class Dolphin(Emulator):
         }
 
     def stop(self) -> None:
-        # Invalidate any in-flight deferred state load before the kill.
+        """Invalidate any in-flight deferred state load before the kill."""
         self._launch_seq += 1
         super().stop()

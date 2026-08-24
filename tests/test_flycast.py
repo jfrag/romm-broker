@@ -1,8 +1,8 @@
-"""Flycast ROM resolution, transient -config composition, launch, and exit
-via a graceful close request."""
+"""Flycast ROM resolution, transient -config composition, launch, and exit via a graceful close request."""
 
 import subprocess
 from pathlib import Path
+from typing import NoReturn, Optional
 
 import pytest
 
@@ -10,7 +10,8 @@ from webstation_broker.emulators import base, flycast
 
 
 @pytest.fixture
-def rom_root(monkeypatch, tmp_path):
+def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Provide an isolated ROM library root patched onto flycast.ROM_ROOT."""
     root = tmp_path / "romm"
     root.mkdir()
     monkeypatch.setattr(flycast, "ROM_ROOT", root)
@@ -18,7 +19,8 @@ def rom_root(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def data_dir(monkeypatch, tmp_path):
+def data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Provide an isolated Flycast data dir patched onto flycast.DATA_DIR and the class's save layout."""
     d = tmp_path / "data" / "flycast"
     d.mkdir(parents=True)
     monkeypatch.setattr(flycast, "DATA_DIR", d)
@@ -30,20 +32,23 @@ def data_dir(monkeypatch, tmp_path):
 # ── resolve_rom_file / _pick_rom_file ───────────────────────────────────
 
 
-def test_resolve_takes_a_direct_file_as_given(rom_root):
+def test_resolve_takes_a_direct_file_as_given(rom_root: Path) -> None:
+    """A direct file path is returned as-is without a directory search."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
 
     assert flycast.Flycast().resolve_rom_file(rom) == rom
 
 
-def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(rom_root):
+def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(rom_root: Path) -> None:
+    """A path that is neither a file nor a directory resolves to nothing."""
     missing = rom_root / "nope"
 
     assert flycast.Flycast().resolve_rom_file(missing) is None
 
 
-def test_resolve_prefers_chd_over_a_raw_gdi_beside_it(rom_root):
+def test_resolve_prefers_chd_over_a_raw_gdi_beside_it(rom_root: Path) -> None:
+    """A compressed .chd outranks a raw .gdi beside it."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "MyGame.gdi").write_bytes(b"")
@@ -53,7 +58,8 @@ def test_resolve_prefers_chd_over_a_raw_gdi_beside_it(rom_root):
     assert flycast.Flycast().resolve_rom_file(folder) == chd
 
 
-def test_resolve_prefers_disc_1_over_disc_2_at_the_same_extension_rank(rom_root):
+def test_resolve_prefers_disc_1_over_disc_2_at_the_same_extension_rank(rom_root: Path) -> None:
+    """Disc 1 outranks disc 2 when both candidates share an extension."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     disc1 = folder / "MyGame (Disc 1).cdi"
@@ -63,7 +69,8 @@ def test_resolve_prefers_disc_1_over_disc_2_at_the_same_extension_rank(rom_root)
     assert flycast.Flycast().resolve_rom_file(folder) == disc1
 
 
-def test_resolve_ignores_dotfiles(rom_root):
+def test_resolve_ignores_dotfiles(rom_root: Path) -> None:
+    """Dotfiles are never considered candidate ROMs."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / ".hidden.chd").write_bytes(b"")
@@ -71,7 +78,8 @@ def test_resolve_ignores_dotfiles(rom_root):
     assert flycast.Flycast().resolve_rom_file(folder) is None
 
 
-def test_resolve_ignores_extensions_it_does_not_recognize(rom_root):
+def test_resolve_ignores_extensions_it_does_not_recognize(rom_root: Path) -> None:
+    """Files with an unrecognized extension are never considered candidate ROMs."""
     folder = rom_root / "MyGame"
     folder.mkdir()
     (folder / "readme.txt").write_bytes(b"")
@@ -79,7 +87,8 @@ def test_resolve_ignores_extensions_it_does_not_recognize(rom_root):
     assert flycast.Flycast().resolve_rom_file(folder) is None
 
 
-def test_resolve_accepts_a_homebrew_elf(rom_root):
+def test_resolve_accepts_a_homebrew_elf(rom_root: Path) -> None:
+    """A homebrew .elf is accepted as a candidate ROM."""
     folder = rom_root / "MyHomebrew"
     folder.mkdir()
     elf = folder / "MyHomebrew.elf"
@@ -88,7 +97,10 @@ def test_resolve_accepts_a_homebrew_elf(rom_root):
     assert flycast.Flycast().resolve_rom_file(folder) == elf
 
 
-def test_resolve_refuses_a_disc_image_that_symlinks_outside_the_rom_root(rom_root, tmp_path):
+def test_resolve_refuses_a_disc_image_that_symlinks_outside_the_rom_root(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A disc image symlinking outside ROM_ROOT is refused."""
     outside = tmp_path / "outside"
     outside.mkdir()
     secret = outside / "secret.chd"
@@ -100,7 +112,8 @@ def test_resolve_refuses_a_disc_image_that_symlinks_outside_the_rom_root(rom_roo
     assert flycast.Flycast().resolve_rom_file(folder) is None
 
 
-def test_resolve_accepts_a_disc_image_that_symlinks_inside_the_rom_root(rom_root):
+def test_resolve_accepts_a_disc_image_that_symlinks_inside_the_rom_root(rom_root: Path) -> None:
+    """A disc image symlinking to another location inside ROM_ROOT is accepted."""
     shared = rom_root / "SharedAssets"
     shared.mkdir()
     real = shared / "actual.chd"
@@ -113,7 +126,8 @@ def test_resolve_accepts_a_disc_image_that_symlinks_inside_the_rom_root(rom_root
     assert flycast.Flycast().resolve_rom_file(folder) == real
 
 
-def test_resolve_searches_one_level_of_subfolders(rom_root):
+def test_resolve_searches_one_level_of_subfolders(rom_root: Path) -> None:
+    """A candidate one subfolder deep is found by the search."""
     folder = rom_root / "MyGame"
     sub = folder / "disc"
     sub.mkdir(parents=True)
@@ -126,11 +140,14 @@ def test_resolve_searches_one_level_of_subfolders(rom_root):
 # ── launch ───────────────────────────────────────────────────────────────
 
 
-def test_launch_stops_then_spawns(data_dir, rom_root, monkeypatch):
+def test_launch_stops_then_spawns(data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Launch stops any running instance before spawning the new one."""
     order = []
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: order.append("stop"))
 
-    def fake_spawn(self, cmd, env, stdin_pipe=False):
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
         order.append("spawn")
 
     monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
@@ -142,11 +159,16 @@ def test_launch_stops_then_spawns(data_dir, rom_root, monkeypatch):
     assert order == ["stop", "spawn"]
 
 
-def test_launch_with_no_resume_slot_omits_autoloadstate(data_dir, rom_root, monkeypatch):
+def test_launch_with_no_resume_slot_omits_autoloadstate(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launching with no resume slot omits Dreamcast.AutoLoadState entirely."""
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
     spawned = {}
 
-    def fake_spawn(self, cmd, env, stdin_pipe=False):
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
         spawned["cmd"] = cmd
 
     monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
@@ -165,12 +187,15 @@ def test_launch_with_no_resume_slot_omits_autoloadstate(data_dir, rom_root, monk
 
 
 def test_launch_with_a_resume_slot_and_a_state_file_enables_autoloadstate(
-    data_dir, rom_root, monkeypatch
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A resume slot with an existing state file enables Dreamcast.AutoLoadState."""
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
     spawned = {}
 
-    def fake_spawn(self, cmd, env, stdin_pipe=False):
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
         spawned["cmd"] = cmd
 
     monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
@@ -185,12 +210,15 @@ def test_launch_with_a_resume_slot_and_a_state_file_enables_autoloadstate(
 
 
 def test_launch_with_a_resume_slot_but_no_state_boots_fresh(
-    data_dir, rom_root, monkeypatch, caplog
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A resume slot with no existing state file boots fresh and logs a warning."""
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
     spawned = {}
 
-    def fake_spawn(self, cmd, env, stdin_pipe=False):
+    def fake_spawn(
+        self: flycast.Flycast, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
         spawned["cmd"] = cmd
 
     monkeypatch.setattr(flycast.Flycast, "_spawn", fake_spawn)
@@ -208,17 +236,17 @@ def test_launch_with_a_resume_slot_but_no_state_boots_fresh(
 
 
 class _FakeProc:
-    def __init__(self, pid: int = 4242):
+    def __init__(self, pid: int = 4242) -> None:
         self.pid = pid
         self.returncode = None
-        self.wait_calls: list[float | None] = []
-        self.wait_exc: Exception | None = None
-        self.exit_code: int | None = None
+        self.wait_calls: list[Optional[float]] = []
+        self.wait_exc: Optional[Exception] = None
+        self.exit_code: Optional[int] = None
 
-    def poll(self):
+    def poll(self) -> Optional[int]:
         return self.exit_code
 
-    def wait(self, timeout=None):
+    def wait(self, timeout: Optional[float] = None) -> int:
         self.wait_calls.append(timeout)
         if self.wait_exc is not None:
             raise self.wait_exc
@@ -227,14 +255,16 @@ class _FakeProc:
         return self.exit_code
 
 
-def test_window_is_none_when_nothing_is_running():
+def test_window_is_none_when_nothing_is_running() -> None:
+    """No window is looked up when no process is running."""
     emu = flycast.Flycast()
     emu._proc = None
 
     assert emu._window() is None
 
 
-def test_window_is_none_when_the_title_search_fails(monkeypatch):
+def test_window_is_none_when_the_title_search_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed title search yields no window."""
     emu = flycast.Flycast()
     emu._proc = _FakeProc()
     monkeypatch.setattr(flycast.Flycast, "_xdotool", lambda self, *a: None)
@@ -242,12 +272,15 @@ def test_window_is_none_when_the_title_search_fails(monkeypatch):
     assert emu._window() is None
 
 
-def test_window_returns_the_id_whose_pid_matches_the_launched_process(monkeypatch):
+def test_window_returns_the_id_whose_pid_matches_the_launched_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window id confirmed to belong to the launched process's pid is returned."""
     emu = flycast.Flycast()
     emu._proc = _FakeProc(pid=4242)
     calls = []
 
-    def fake_xdotool(self, *args):
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
         calls.append(args)
         if args[0] == "search":
             return "111\n222\n"
@@ -262,11 +295,14 @@ def test_window_returns_the_id_whose_pid_matches_the_launched_process(monkeypatc
     assert emu._window() == "222"
 
 
-def test_window_ignores_a_title_match_owned_by_a_different_pid(monkeypatch, caplog):
+def test_window_ignores_a_title_match_owned_by_a_different_pid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A title match owned by a different pid is skipped, not returned."""
     emu = flycast.Flycast()
     emu._proc = _FakeProc(pid=4242)
 
-    def fake_xdotool(self, *args):
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
         if args[0] == "search":
             return "111\n"
         if args == ("getwindowpid", "111"):
@@ -284,7 +320,10 @@ def test_window_ignores_a_title_match_owned_by_a_different_pid(monkeypatch, capl
 # ── stop (Alt+F4 close request, then SIGTERM escalation) ───────────────────
 
 
-def test_stop_activates_the_window_and_sends_alt_f4_then_waits_for_exit(monkeypatch, pid_record):
+def test_stop_activates_the_window_and_sends_alt_f4_then_waits_for_exit(
+    monkeypatch: pytest.MonkeyPatch, pid_record: Path
+) -> None:
+    """A successful Alt+F4 close request waits for exit without escalating."""
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = flycast.Flycast()
@@ -293,7 +332,7 @@ def test_stop_activates_the_window_and_sends_alt_f4_then_waits_for_exit(monkeypa
     monkeypatch.setattr(emu, "_window", lambda: "12345")
     calls = []
 
-    def fake_xdotool(self, *args):
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
         calls.append(args)
         return ""
 
@@ -311,7 +350,8 @@ def test_stop_activates_the_window_and_sends_alt_f4_then_waits_for_exit(monkeypa
     assert not pid_record.exists()
 
 
-def test_stop_falls_back_to_sigterm_when_no_window_is_found(monkeypatch):
+def test_stop_falls_back_to_sigterm_when_no_window_is_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop escalates to SIGTERM when no window can be found."""
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = flycast.Flycast()
@@ -323,7 +363,8 @@ def test_stop_falls_back_to_sigterm_when_no_window_is_found(monkeypatch):
     assert escalated == [True]
 
 
-def test_stop_falls_back_to_sigterm_when_the_activate_fails(monkeypatch):
+def test_stop_falls_back_to_sigterm_when_the_activate_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop escalates to SIGTERM when window activation fails."""
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = flycast.Flycast()
@@ -331,7 +372,7 @@ def test_stop_falls_back_to_sigterm_when_the_activate_fails(monkeypatch):
     monkeypatch.setattr(emu, "_window", lambda: "12345")
     calls = []
 
-    def fake_xdotool(self, *args):
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
         calls.append(args)
         return None if args[0] == "windowactivate" else ""
 
@@ -343,7 +384,8 @@ def test_stop_falls_back_to_sigterm_when_the_activate_fails(monkeypatch):
     assert escalated == [True]
 
 
-def test_stop_falls_back_to_sigterm_when_the_process_never_exits(monkeypatch):
+def test_stop_falls_back_to_sigterm_when_the_process_never_exits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop escalates to SIGTERM when the process never exits after the close request."""
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = flycast.Flycast()
@@ -358,7 +400,8 @@ def test_stop_falls_back_to_sigterm_when_the_process_never_exits(monkeypatch):
     assert escalated == [True]
 
 
-def test_stop_is_a_no_op_when_nothing_is_running():
+def test_stop_is_a_no_op_when_nothing_is_running() -> None:
+    """Stop does nothing when no process is running."""
     emu = flycast.Flycast()
     emu._proc = None
 
@@ -367,7 +410,10 @@ def test_stop_is_a_no_op_when_nothing_is_running():
     assert emu._proc is None
 
 
-def test_stop_skips_the_close_request_and_escalates_when_the_process_already_exited(monkeypatch):
+def test_stop_skips_the_close_request_and_escalates_when_the_process_already_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Stop skips the window close request and escalates when the process already exited."""
     escalated = []
     monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
     emu = flycast.Flycast()
@@ -392,7 +438,10 @@ def _touch(path: Path, content: bytes = b"state") -> Path:
     return path
 
 
-def test_exit_without_a_slot_reports_nothing_but_still_stops(data_dir, monkeypatch):
+def test_exit_without_a_slot_reports_nothing_but_still_stops(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exiting without a slot reports no save but still stops the emulator."""
     stopped = []
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: stopped.append(True))
     emu = flycast.Flycast()
@@ -404,12 +453,15 @@ def test_exit_without_a_slot_reports_nothing_but_still_stops(data_dir, monkeypat
     assert stopped == [True]
 
 
-def test_exit_with_a_slot_reports_the_state_the_shutdown_wrote(data_dir, rom_root, monkeypatch):
+def test_exit_with_a_slot_reports_the_state_the_shutdown_wrote(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state file written during a graceful shutdown is reported as saved."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
 
-    def fake_stop(self):
+    def fake_stop(self: flycast.Flycast) -> None:
         _touch(state, b"a fresh state")
 
     monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
@@ -427,8 +479,9 @@ def test_exit_with_a_slot_reports_the_state_the_shutdown_wrote(data_dir, rom_roo
 
 
 def test_exit_with_a_slot_reports_no_save_when_the_state_is_unchanged(
-    data_dir, rom_root, monkeypatch, caplog
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unchanged state file after a graceful exit is reported as not saved."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = _touch(data_dir / "game.state", b"stale, never rewritten")
@@ -449,17 +502,19 @@ def test_exit_with_a_slot_reports_no_save_when_the_state_is_unchanged(
 
 
 def test_exit_with_a_slot_discards_a_changed_state_killed_by_bare_sigterm(
-    data_dir, rom_root, monkeypatch, caplog
-):
-    """Flycast has no SIGTERM handler, so the base class's SIGTERM
-    escalation already ends it before dc_exit() runs, same as SIGKILL
-    would; a state file that changed during that kill must not be
-    reported as this exit's save."""
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Flycast has no SIGTERM handler, so the base class's SIGTERM escalation is already a hard kill.
+
+    Same as SIGKILL, it ends the process before dc_exit() can run, so a
+    state file that changed during the kill must not be reported as this
+    exit's save.
+    """
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
 
-    def fake_stop(self):
+    def fake_stop(self: flycast.Flycast) -> None:
         _touch(state)
 
     monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
@@ -479,13 +534,14 @@ def test_exit_with_a_slot_discards_a_changed_state_killed_by_bare_sigterm(
 
 
 def test_exit_with_a_slot_discards_a_changed_state_killed_by_sigkill(
-    data_dir, rom_root, monkeypatch, caplog
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A state file that changed during a SIGKILL is discarded, not reported as saved."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
 
-    def fake_stop(self):
+    def fake_stop(self: flycast.Flycast) -> None:
         # A close-request escalation to SIGKILL could still land after
         # dc_exit() wrote a complete state, or mid-write; either way the
         # broker cannot tell torn from complete, so a file that changed
@@ -509,8 +565,9 @@ def test_exit_with_a_slot_discards_a_changed_state_killed_by_sigkill(
 
 
 def test_exit_with_a_slot_leaves_an_unchanged_state_alone_when_force_killed(
-    data_dir, rom_root, monkeypatch, caplog
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An unchanged state file from a force-killed exit is left alone, not discarded."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = _touch(data_dir / "game.state", b"from an earlier session")
@@ -531,13 +588,14 @@ def test_exit_with_a_slot_leaves_an_unchanged_state_alone_when_force_killed(
 
 
 def test_exit_with_a_slot_discards_a_changed_state_when_stop_never_confirms_the_exit(
-    data_dir, rom_root, monkeypatch
-):
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A changed state file is discarded when stop cannot confirm a clean exit."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
 
-    def fake_stop(self):
+    def fake_stop(self: flycast.Flycast) -> None:
         _touch(state)
 
     monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
@@ -554,8 +612,9 @@ def test_exit_with_a_slot_discards_a_changed_state_when_stop_never_confirms_the_
 
 
 def test_exit_with_a_slot_but_no_rom_loaded_warns_and_reports_nothing(
-    data_dir, monkeypatch, caplog
-):
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exiting with a slot but no rom loaded warns and reports nothing saved."""
     monkeypatch.setattr(flycast.Flycast, "stop", lambda self: None)
     emu = flycast.Flycast()
     emu._rom_path = None
@@ -568,7 +627,10 @@ def test_exit_with_a_slot_but_no_rom_loaded_warns_and_reports_nothing(
     assert "no rom is currently loaded" in caplog.text
 
 
-def test_exit_with_a_slot_but_not_alive_reports_nothing(data_dir, rom_root, monkeypatch):
+def test_exit_with_a_slot_but_not_alive_reports_nothing(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exiting with a slot while not alive reports nothing saved."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     _touch(data_dir / "game.state")
@@ -585,7 +647,10 @@ def test_exit_with_a_slot_but_not_alive_reports_nothing(data_dir, rom_root, monk
 # ── clear_working_slot ──────────────────────────────────────────────────
 
 
-def test_clear_working_slot_is_a_noop_without_a_data_dir(tmp_path, monkeypatch):
+def test_clear_working_slot_is_a_noop_without_a_data_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clearing the working slot without a data dir does nothing and does not raise."""
     missing = tmp_path / "data" / "flycast"
     monkeypatch.setattr(flycast, "DATA_DIR", missing)
 
@@ -594,11 +659,12 @@ def test_clear_working_slot_is_a_noop_without_a_data_dir(tmp_path, monkeypatch):
     assert not missing.exists()
 
 
-def test_clear_working_slot_wipes_every_leftover_resume_state(data_dir):
-    """A resume state left behind by an earlier local session must not
-    outrank (by mtime) whatever this session's own archive restore brings
-    back, since the filename is only unambiguous once the rom is known,
-    and clear_working_slot runs before that."""
+def test_clear_working_slot_wipes_every_leftover_resume_state(data_dir: Path) -> None:
+    """A leftover resume state from an earlier session must not outrank an incoming archive restore by mtime.
+
+    The filename is only unambiguous once the rom is known, and
+    clear_working_slot runs before that determination.
+    """
     stale_a = _touch(data_dir / "game.state")
     stale_b = _touch(data_dir / "other.state")
 
@@ -609,7 +675,8 @@ def test_clear_working_slot_wipes_every_leftover_resume_state(data_dir):
     assert data_dir.is_dir()
 
 
-def test_clear_working_slot_leaves_unrelated_files_alone(data_dir):
+def test_clear_working_slot_leaves_unrelated_files_alone(data_dir: Path) -> None:
+    """Files that are not resume states are left untouched."""
     vmu = _touch(data_dir / "vmu_save_A1.bin")
 
     flycast.Flycast().clear_working_slot()
@@ -617,10 +684,13 @@ def test_clear_working_slot_leaves_unrelated_files_alone(data_dir):
     assert vmu.exists()
 
 
-def test_clear_working_slot_tolerates_a_file_it_cannot_delete(data_dir, monkeypatch, caplog):
+def test_clear_working_slot_tolerates_a_file_it_cannot_delete(
+    data_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A resume state that cannot be deleted is logged and does not raise."""
     stuck = _touch(data_dir / "game.state")
 
-    def boom(self):
+    def boom(self: Path) -> NoReturn:
         raise OSError("busy")
 
     monkeypatch.setattr(Path, "unlink", boom)
@@ -635,7 +705,8 @@ def test_clear_working_slot_tolerates_a_file_it_cannot_delete(data_dir, monkeypa
 # ── class attributes (API surface parity with the other exit-only emulators) ──
 
 
-def test_class_attributes_match_the_exit_only_api_surface(data_dir):
+def test_class_attributes_match_the_exit_only_api_surface(data_dir: Path) -> None:
+    """The class attributes match the exit-only API surface shared with other emulators."""
     emu = flycast.Flycast()
 
     assert emu.rom_extensions == (".chd", ".gdi", ".cdi", ".cue", ".elf")

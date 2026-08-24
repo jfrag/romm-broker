@@ -1,24 +1,35 @@
-"""RetroArch's platform table: the map that decides which core a claim loads."""
+"""RetroArch's platform table: the map that decides which core a claim loads.
+
+Also covers the core asset links, the per-launch config overlay, the resume
+gate, and playlist-driven disc swapping.
+"""
 
 import json
 import logging
 import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Optional, Union
 
 import pytest
 
 from webstation_broker.emulators import retroarch
 
 
-def test_the_table_is_the_one_on_disk():
-    """The map used to be duplicated inline, and the copy silently shadowed the
-    file, so every platform added to the file did nothing."""
+def test_the_table_is_the_one_on_disk() -> None:
+    """PLATFORMS holds exactly the platforms listed in the JSON file on disk.
+
+    The map used to be duplicated inline, and the copy silently shadowed the
+    file, so every platform added to the file did nothing.
+    """
     on_disk = json.loads(retroarch._PLATFORMS_FILE.read_text())
 
     assert set(retroarch.PLATFORMS) == set(on_disk)
 
 
 @pytest.mark.parametrize("slug", ["psp", "nes", "gba", "n64", "snes", "genesis", "dc"])
-def test_the_common_platforms_are_mapped(slug):
+def test_the_common_platforms_are_mapped(slug: str) -> None:
+    """Each everyday platform maps to a core with a non-empty extension list."""
     info = retroarch._platform_info(slug)
 
     assert info is not None
@@ -26,40 +37,54 @@ def test_the_common_platforms_are_mapped(slug):
     assert info["extensions"]
 
 
-def test_psp_boots_on_the_ppsspp_core():
+def test_psp_boots_on_the_ppsspp_core() -> None:
+    """The psp platform maps to the ppsspp core and accepts .iso and .cso."""
     info = retroarch._platform_info("psp")
 
     assert info["core"] == "ppsspp"
     assert ".iso" in info["extensions"] and ".cso" in info["extensions"]
 
 
-def test_a_platform_slug_is_matched_case_insensitively():
+def test_a_platform_slug_is_matched_case_insensitively() -> None:
+    """A slug in any case resolves to the same platform info."""
     assert retroarch._platform_info("PSP") == retroarch._platform_info("psp")
 
 
-def test_an_unmapped_platform_has_no_core():
+def test_an_unmapped_platform_has_no_core() -> None:
+    """An unmapped slug, or no slug at all, yields no platform info."""
     assert retroarch._platform_info("ps2") is None
     assert retroarch._platform_info(None) is None
 
 
 @pytest.mark.parametrize("slug", ["ngc", "wii"])
-def test_the_dolphin_core_keeps_state_thumbnails_off(slug):
-    """It renders on the GPU, and the framebuffer grab after a save deadlocks
-    RetroArch's runloop, taking the command channel down with it."""
+def test_the_dolphin_core_keeps_state_thumbnails_off(slug: str) -> None:
+    """The Dolphin core's platforms turn state thumbnails off.
+
+    It renders on the GPU, and the framebuffer grab after a save deadlocks
+    RetroArch's runloop, taking the command channel down with it.
+    """
     assert retroarch._platform_info(slug)["thumbnail"] is False
 
 
-def test_psp_declares_where_the_core_finds_its_assets():
-    """The ppsspp core will not boot without PPSSPP's own asset tree, which the
+def test_psp_declares_where_the_core_finds_its_assets() -> None:
+    """The psp platform points the PPSSPP asset link straight at the assets tree.
+
+    The ppsspp core will not boot without PPSSPP's own asset tree, which the
     buildbot .so does not carry. It reads the files straight out of PPSSPP/, so
-    linking the tree one level deeper hides them from it."""
+    linking the tree one level deeper hides them from it.
+    """
     assets = retroarch._platform_info("psp")["assets"]
 
     assert assets["PPSSPP"].endswith("/assets")
 
 
 class TestCoreAssets:
-    def test_a_declared_source_is_linked_into_the_system_dir(self, tmp_path, monkeypatch):
+    """Linking a core's asset tree into RetroArch's system directory."""
+
+    def test_a_declared_source_is_linked_into_the_system_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A declared asset source is symlinked at its path under the system dir."""
         source = tmp_path / "share" / "ppsspp" / "assets"
         source.mkdir(parents=True)
         (source / "ppge_atlas.zim").write_bytes(b"atlas")
@@ -72,7 +97,8 @@ class TestCoreAssets:
         assert linked.is_symlink()
         assert (linked / "ppge_atlas.zim").read_bytes() == b"atlas"
 
-    def test_linking_twice_is_a_no_op(self, tmp_path, monkeypatch):
+    def test_linking_twice_is_a_no_op(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Linking the same source twice leaves one link pointing at it."""
         source = tmp_path / "assets"
         source.mkdir()
         system = tmp_path / "system"
@@ -84,7 +110,8 @@ class TestCoreAssets:
 
         assert (system / "PPSSPP" / "assets").readlink() == source
 
-    def test_a_stale_link_is_repointed(self, tmp_path, monkeypatch):
+    def test_a_stale_link_is_repointed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A link left over from another source is repointed at the new one."""
         old = tmp_path / "old"
         old.mkdir()
         new = tmp_path / "new"
@@ -97,8 +124,13 @@ class TestCoreAssets:
 
         assert (system / "PPSSPP" / "assets").readlink() == new
 
-    def test_a_real_directory_already_there_is_left_alone(self, tmp_path, monkeypatch):
-        """A user who installed the assets by hand keeps them."""
+    def test_a_real_directory_already_there_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real directory already at the link path is not replaced.
+
+        A user who installed the assets by hand keeps them.
+        """
         source = tmp_path / "assets"
         source.mkdir()
         system = tmp_path / "system"
@@ -112,8 +144,11 @@ class TestCoreAssets:
         assert not theirs.is_symlink()
         assert (theirs / "theirs.zim").exists()
 
-    def test_a_missing_source_does_not_raise(self, tmp_path, monkeypatch):
-        """The core's own complaint about the missing asset is the better error."""
+    def test_a_missing_source_does_not_raise(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A source that does not exist is skipped without raising.
+
+        The core's own complaint about the missing asset is the better error.
+        """
         system = tmp_path / "system"
         monkeypatch.setattr(retroarch, "SYSTEM_DIR", system)
 
@@ -121,7 +156,10 @@ class TestCoreAssets:
 
         assert not (system / "PPSSPP" / "assets").exists()
 
-    def test_a_platform_with_no_assets_touches_nothing(self, tmp_path, monkeypatch):
+    def test_a_platform_with_no_assets_touches_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty asset map does not even create the system directory."""
         system = tmp_path / "system"
         monkeypatch.setattr(retroarch, "SYSTEM_DIR", system)
 
@@ -134,31 +172,45 @@ class TestBrokerConfig:
     """The per-launch overlay written on top of the user's own retroarch.cfg."""
 
     @pytest.fixture(autouse=True)
-    def _dirs(self, tmp_path, monkeypatch):
+    def _dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Point the RetroArch data, state, and save directories and the overlay at tmp_path.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+        """
         monkeypatch.setattr(retroarch, "RA_DATA_DIR", tmp_path)
         monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "states")
         monkeypatch.setattr(retroarch, "SAVE_DIR", tmp_path / "saves")
         monkeypatch.setattr(retroarch, "BROKER_CFG", tmp_path / "broker.cfg")
 
-    def test_the_joypad_driver_is_pinned_off_udev(self):
-        """The Selkies pads all look like one device to udev, so it registers
-        none of them; linuxraw opens the js nodes the interposer hooks."""
+    def test_the_joypad_driver_is_pinned_off_udev(self) -> None:
+        """The overlay pins the joypad driver to linuxraw by default.
+
+        The Selkies pads all look like one device to udev, so it registers
+        none of them; linuxraw opens the js nodes the interposer hooks.
+        """
         cfg = retroarch._write_broker_cfg().read_text()
 
         assert 'input_joypad_driver = "linuxraw"' in cfg
 
-    def test_an_empty_driver_leaves_the_user_config_alone(self, monkeypatch):
+    def test_an_empty_driver_leaves_the_user_config_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty JOYPAD_DRIVER writes no joypad driver key into the overlay."""
         monkeypatch.setattr(retroarch, "JOYPAD_DRIVER", "")
 
         assert "input_joypad_driver" not in retroarch._write_broker_cfg().read_text()
 
-    def test_the_driver_is_overridable(self, monkeypatch):
+    def test_the_driver_is_overridable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A configured JOYPAD_DRIVER is written into the overlay verbatim."""
         monkeypatch.setattr(retroarch, "JOYPAD_DRIVER", "sdl2")
 
         assert 'input_joypad_driver = "sdl2"' in retroarch._write_broker_cfg().read_text()
 
-    def test_the_stdin_channel_and_save_dirs_are_still_there(self):
-        """The overlay is what makes the session controllable at all."""
+    def test_the_stdin_channel_and_save_dirs_are_still_there(self) -> None:
+        """The overlay enables the stdin command channel and names the state and save dirs.
+
+        The overlay is what makes the session controllable at all.
+        """
         cfg = retroarch._write_broker_cfg().read_text()
 
         assert 'stdin_cmd_enable = "true"' in cfg
@@ -166,15 +218,19 @@ class TestBrokerConfig:
         assert f'savefile_directory = "{retroarch.SAVE_DIR}"' in cfg
 
     @pytest.mark.parametrize("thumbnail,expected", [(True, "true"), (False, "false")])
-    def test_thumbnails_follow_the_platform(self, thumbnail, expected):
+    def test_thumbnails_follow_the_platform(self, thumbnail: bool, expected: str) -> None:
+        """The thumbnail flag passed in is what the overlay writes."""
         cfg = retroarch._write_broker_cfg(thumbnail).read_text()
 
         assert f'savestate_thumbnail_enable = "{expected}"' in cfg
 
 
-def test_extensions_and_save_subtrees_survive_the_load_as_tuples():
-    """The launcher treats extensions as an ordered preference list and the
-    save logic iterates the subtrees, so neither may come back as a raw list."""
+def test_extensions_and_save_subtrees_survive_the_load_as_tuples() -> None:
+    """Every platform's extensions and save_subtrees load as tuples.
+
+    The launcher treats extensions as an ordered preference list and the
+    save logic iterates the subtrees, so neither may come back as a raw list.
+    """
     for slug, info in retroarch.PLATFORMS.items():
         assert isinstance(info["extensions"], tuple), slug
         if "save_subtrees" in info:
@@ -182,11 +238,23 @@ def test_extensions_and_save_subtrees_survive_the_load_as_tuples():
 
 
 class TestResumeGate:
-    """Slot 0 is this broker's only working slot, so a launch asking to resume
-    it must still start the deferred load."""
+    """The gate deciding whether a launch schedules a deferred state load.
+
+    Slot 0 is this broker's only working slot, so a launch asking to resume
+    it must still start the deferred load.
+    """
 
     @pytest.fixture(autouse=True)
-    def _stub_launch(self, tmp_path, monkeypatch):
+    def _stub_launch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+        """Stub everything launch() touches and capture the threads it starts.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The args tuple of every thread launch() started, in order.
+        """
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
         monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
@@ -197,37 +265,71 @@ class TestResumeGate:
         started = []
 
         class FakeThread:
-            def __init__(self, target=None, args=(), daemon=False):
+            """A threading.Thread stand-in that records its args instead of running.
+
+            Attributes:
+                args: The positional arguments the thread was built with.
+            """
+
+            def __init__(
+                self,
+                target: Optional[Callable[..., object]] = None,
+                args: tuple[object, ...] = (),
+                daemon: bool = False,
+            ) -> None:
+                """Remember the args; the target is never run.
+
+                Args:
+                    target: The callable the real thread would run.
+                    args: Positional arguments for the target.
+                    daemon: Whether the real thread would be a daemon.
+                """
                 self.args = args
 
-            def start(self):
+            def start(self) -> None:
+                """Record the args in place of starting a thread."""
                 started.append(self.args)
 
         monkeypatch.setattr(retroarch.threading, "Thread", FakeThread)
         return started
 
-    def _launch(self, tmp_path, resume_slot):
+    def _launch(self, tmp_path: Path, resume_slot: Optional[int]) -> retroarch.Retroarch:
+        """Launch a snes session against a throwaway ROM path.
+
+        Args:
+            tmp_path: Directory the ROM path is made under.
+            resume_slot: The slot to ask launch() to resume, if any.
+
+        Returns:
+            The launched Retroarch.
+        """
         emu = retroarch.Retroarch()
         emu.platform = "snes"
         emu.launch(tmp_path / "game.sfc", resume_slot)
         return emu
 
-    def test_slot_zero_still_defers_a_load(self, tmp_path, _stub_launch):
+    def test_slot_zero_still_defers_a_load(self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]) -> None:
+        """A resume request for slot 0 schedules a deferred load of slot 0."""
         self._launch(tmp_path, 0)
 
         assert [args[0] for args in _stub_launch] == [0]
 
-    def test_a_nonzero_slot_defers_a_load(self, tmp_path, _stub_launch):
+    def test_a_nonzero_slot_defers_a_load(self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]) -> None:
+        """A resume request for a nonzero slot schedules a deferred load of that slot."""
         self._launch(tmp_path, 3)
 
         assert [args[0] for args in _stub_launch] == [3]
 
-    def test_no_resume_request_defers_nothing(self, tmp_path, _stub_launch):
+    def test_no_resume_request_defers_nothing(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A launch with no resume slot starts no deferred load."""
         self._launch(tmp_path, None)
 
         assert _stub_launch == []
 
-    def test_launching_a_playlist_records_it_and_starts_on_disc_zero(self, tmp_path):
+    def test_launching_a_playlist_records_it_and_starts_on_disc_zero(self, tmp_path: Path) -> None:
+        """Launching a .m3u records the playlist and resets the disc index to zero."""
         emulator = retroarch.Retroarch()
         emulator.platform = "dc"
         playlist = tmp_path / "Game.m3u"
@@ -238,7 +340,8 @@ class TestResumeGate:
         assert emulator._playlist == playlist
         assert emulator._disc_index == 0
 
-    def test_launching_a_bare_disc_records_no_playlist(self, tmp_path):
+    def test_launching_a_bare_disc_records_no_playlist(self, tmp_path: Path) -> None:
+        """Launching a single disc image records no playlist."""
         emulator = retroarch.Retroarch()
         emulator.platform = "dc"
         disc = tmp_path / "Game.chd"
@@ -250,18 +353,25 @@ class TestResumeGate:
 
 
 class TestPlaylistPreference:
-    """A folder holding a playlist and its discs boots the playlist, because
-    the disc-swap commands step through playlist entries."""
+    """A folder holding a playlist and its discs boots the playlist.
+
+    The disc-swap commands step through playlist entries, so the playlist has
+    to be the thing that was loaded.
+    """
 
     @pytest.mark.parametrize(
         "platform", ["dc", "saturn", "segacd", "turbografx-cd", "dos"]
     )
-    def test_m3u_is_the_first_choice_on_every_disc_platform(self, platform):
+    def test_m3u_is_the_first_choice_on_every_disc_platform(self, platform: str) -> None:
+        """Every disc-based platform lists .m3u as its first extension."""
         info = retroarch._platform_info(platform)
         assert info is not None
         assert info["extensions"][0] == ".m3u"
 
-    def test_a_folder_with_a_playlist_and_discs_picks_the_playlist(self, tmp_path, monkeypatch):
+    def test_a_folder_with_a_playlist_and_discs_picks_the_playlist(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A folder holding a .m3u beside its discs resolves to the .m3u."""
         monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path)
         game = tmp_path / "Game"
         game.mkdir()
@@ -274,8 +384,9 @@ class TestPlaylistPreference:
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
 
     def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
-        self, tmp_path, monkeypatch
-    ):
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A direct path that is a symlink out of the ROM root is rejected."""
         monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path / "romm")
         (tmp_path / "romm").mkdir()
         outside = tmp_path / "elsewhere.chd"
@@ -289,10 +400,14 @@ class TestPlaylistPreference:
 
 
 class TestPlaylistHelpers:
-    """Reading a .m3u the way RetroArch does: one relative path per line,
-    comments and blanks skipped, order is the disc order."""
+    """Reading a .m3u the way RetroArch does.
 
-    def test_entries_resolve_against_the_playlist_directory(self, tmp_path):
+    One relative path per line, comments and blanks skipped, order is the
+    disc order.
+    """
+
+    def test_entries_resolve_against_the_playlist_directory(self, tmp_path: Path) -> None:
+        """Relative playlist entries resolve against the playlist's own directory."""
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
         assert retroarch._m3u_entries(playlist) == [
@@ -300,29 +415,36 @@ class TestPlaylistHelpers:
             (tmp_path / "Game (Disc 2).chd").resolve(),
         ]
 
-    def test_comments_and_blank_lines_are_skipped(self, tmp_path):
+    def test_comments_and_blank_lines_are_skipped(self, tmp_path: Path) -> None:
+        """Comment lines and blank lines contribute no entries."""
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("# a comment\n\nGame (Disc 1).chd\n\n")
         assert retroarch._m3u_entries(playlist) == [
             (tmp_path / "Game (Disc 1).chd").resolve()
         ]
 
-    def test_an_unreadable_playlist_yields_no_entries(self, tmp_path):
+    def test_an_unreadable_playlist_yields_no_entries(self, tmp_path: Path) -> None:
+        """A playlist that cannot be read yields an empty entry list."""
         assert retroarch._m3u_entries(tmp_path / "missing.m3u") == []
 
-    def test_an_unreadable_playlist_logs_a_warning(self, tmp_path, caplog):
+    def test_an_unreadable_playlist_logs_a_warning(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A playlist that cannot be read is named in a logged warning."""
         missing = tmp_path / "missing.m3u"
         with caplog.at_level(logging.WARNING):
             retroarch._m3u_entries(missing)
         assert str(missing) in caplog.text
 
-    def test_index_finds_the_matching_entry(self, tmp_path):
+    def test_index_finds_the_matching_entry(self, tmp_path: Path) -> None:
+        """The index lookup returns the position of the disc in the playlist."""
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("Game (Disc 1).chd\nGame (Disc 2).chd\n")
         target = tmp_path / "Game (Disc 2).chd"
         assert retroarch._m3u_index_for_path(playlist, target) == 1
 
-    def test_index_is_none_for_a_disc_the_playlist_does_not_list(self, tmp_path):
+    def test_index_is_none_for_a_disc_the_playlist_does_not_list(self, tmp_path: Path) -> None:
+        """The index lookup is None for a disc the playlist does not list."""
         playlist = tmp_path / "Game.m3u"
         playlist.write_text("Game (Disc 1).chd\n")
         assert retroarch._m3u_index_for_path(playlist, tmp_path / "Other.chd") is None
@@ -332,16 +454,27 @@ class TestSwapDisc:
     """Driving the tray over the command protocol."""
 
     @pytest.fixture
-    def emulator(self, tmp_path, monkeypatch):
-        """A Retroarch that looks alive and records commands instead of
-        writing them to a process."""
+    def emulator(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> retroarch.Retroarch:
+        """Build a Retroarch that looks alive and records commands instead of writing them.
+
+        Args:
+            tmp_path: Directory holding the three-disc playlist.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            A Retroarch on disc 0 of a three-disc playlist, with the commands it
+            sent collected in its `sent` list and the playlist directory in
+            `tmp_path`.
+        """
         monkeypatch.setattr(retroarch, "DISC_TRAY_SETTLE", 0)
         monkeypatch.setattr(retroarch, "DISC_STEP_DELAY", 0)
         emulator = retroarch.Retroarch()
         emulator.platform = "dc"
         emulator.sent = []
 
-        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -359,7 +492,8 @@ class TestSwapDisc:
         emulator.tmp_path = tmp_path
         return emulator
 
-    def test_swapping_forward_ejects_steps_and_closes(self, emulator):
+    def test_swapping_forward_ejects_steps_and_closes(self, emulator: retroarch.Retroarch) -> None:
+        """A swap to the next disc ejects, steps once, closes, and commits the index."""
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is True
         assert emulator.sent == [
             "GET_STATUS",
@@ -369,38 +503,52 @@ class TestSwapDisc:
         ]
         assert emulator._disc_index == 1
 
-    def test_swapping_backward_wraps_around_the_playlist(self, emulator):
+    def test_swapping_backward_wraps_around_the_playlist(self, emulator: retroarch.Retroarch) -> None:
+        """A swap to an earlier disc steps forward around the end of the playlist."""
         emulator._disc_index = 2
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is True
         # From index 2 to index 1 is two forward steps through a 3-disc list.
         assert emulator.sent.count("DISK_NEXT") == 2
         assert emulator._disc_index == 1
 
-    def test_swapping_to_the_mounted_disc_leaves_the_tray_alone(self, emulator):
+    def test_swapping_to_the_mounted_disc_leaves_the_tray_alone(self, emulator: retroarch.Retroarch) -> None:
+        """A swap to the disc already mounted sends no tray commands."""
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 1).chd") is True
         assert "DISK_EJECT_TOGGLE" not in emulator.sent
 
-    def test_a_disc_outside_the_playlist_is_refused(self, emulator):
+    def test_a_disc_outside_the_playlist_is_refused(self, emulator: retroarch.Retroarch) -> None:
+        """A disc the playlist does not list is refused before the tray is touched."""
         assert emulator.swap_disc(emulator.tmp_path / "Other.chd") is False
         assert "DISK_EJECT_TOGGLE" not in emulator.sent
 
-    def test_a_session_with_no_playlist_cannot_swap(self, emulator):
+    def test_a_session_with_no_playlist_cannot_swap(self, emulator: retroarch.Retroarch) -> None:
+        """A session launched without a playlist refuses every swap."""
         emulator._playlist = None
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
 
-    def test_a_core_that_never_reports_playing_is_refused(self, emulator, monkeypatch):
+    def test_a_core_that_never_reports_playing_is_refused(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A swap is refused when the core never answers GET_STATUS with PLAYING."""
         monkeypatch.setattr(retroarch, "DISC_SWAP_WAIT", 0)
         monkeypatch.setattr(emulator, "_send", lambda *a, **k: None)
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
 
-    def test_a_core_that_dies_mid_swap_does_not_commit_the_index(self, emulator, monkeypatch):
-        """The tray commands after PLAYING have no reply to confirm delivery,
+    def test_a_core_that_dies_mid_swap_does_not_commit_the_index(
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core dying partway through the tray sequence leaves the disc index unchanged.
+
+        The tray commands after PLAYING have no reply to confirm delivery,
         so a death partway through must not leave the tracked index pointing
-        at a disc that was never actually mounted."""
+        at a disc that was never actually mounted.
+        """
         state = {"alive": True}
         monkeypatch.setattr(emulator, "alive", lambda: state["alive"])
 
-        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -413,13 +561,18 @@ class TestSwapDisc:
         assert emulator._disc_index == 0
 
     def test_a_relaunch_during_the_wait_does_not_clobber_the_new_sessions_index(
-        self, emulator, monkeypatch
-    ):
-        """A swap outliving the session it was issued for must not stomp the
-        disc index a fresh launch() already reset, the same hazard
-        _deferred_load_state guards against with _launch_seq."""
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A swap that a relaunch overtakes during the PLAYING wait is abandoned.
 
-        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+        A swap outliving the session it was issued for must not stomp the
+        disc index a fresh launch() already reset, the same hazard
+        _deferred_load_state guards against with _launch_seq.
+        """
+
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 # A relaunch races the wait and wins: a new session starts and
@@ -433,14 +586,18 @@ class TestSwapDisc:
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
         assert emulator._disc_index == 0
 
-    def test_the_class_advertises_disc_swap(self):
+    def test_the_class_advertises_disc_swap(self) -> None:
+        """Retroarch declares support for disc swapping."""
         assert retroarch.Retroarch.supports_disc_swap is True
 
     def test_no_playlist_and_a_dead_core_are_reported_differently(
-        self, emulator, monkeypatch, caplog
-    ):
-        """A dead core is a different failure than an unloaded playlist, and
-        reporting "no playlist" for a dead core is actively misleading."""
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A missing playlist and a dead core produce different warnings.
+
+        A dead core is a different failure than an unloaded playlist, and
+        reporting "no playlist" for a dead core is actively misleading.
+        """
         playlist = emulator._playlist
 
         with caplog.at_level(logging.WARNING):
@@ -460,13 +617,18 @@ class TestSwapDisc:
         assert "playlist" not in dead_core_message.lower()
 
     def test_a_relaunch_during_the_tray_settle_aborts_before_the_next_command(
-        self, emulator, monkeypatch
-    ):
-        """A relaunch landing right after the eject must not let the sequence
-        keep sending commands (DISK_NEXT, the closing eject) to the new
-        process's stdin, which reads self._proc live."""
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A relaunch landing after the eject stops the sequence before its next command.
 
-        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+        A relaunch landing right after the eject must not let the sequence
+        keep sending commands (DISK_NEXT, the closing eject) to the new
+        process's stdin, which reads self._proc live.
+        """
+
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -479,9 +641,12 @@ class TestSwapDisc:
         assert emulator.sent == ["GET_STATUS", "DISK_EJECT_TOGGLE"]
         assert emulator._disc_index == 0
 
-    def test_a_second_concurrent_swap_is_refused(self, emulator):
-        """A swap already holding the tray lock must make a second swap fail
-        fast rather than queue up behind the multi-second sequence."""
+    def test_a_second_concurrent_swap_is_refused(self, emulator: retroarch.Retroarch) -> None:
+        """A swap issued while the tray lock is held fails fast without sending anything.
+
+        A swap already holding the tray lock must make a second swap fail
+        fast rather than queue up behind the multi-second sequence.
+        """
         emulator._disc_lock.acquire()
         try:
             assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
@@ -490,15 +655,20 @@ class TestSwapDisc:
         assert emulator.sent == []
 
     def test_concurrent_swaps_do_not_interleave_the_tray_sequence(
-        self, emulator, monkeypatch
-    ):
-        """The loser of the race must fail before touching the tray, so the
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two racing swaps leave exactly the winner's tray sequence, uninterrupted.
+
+        The loser of the race must fail before touching the tray, so the
         winner's EJECT / NEXT / EJECT sequence is never split up by another
-        thread's commands landing in the middle of it."""
+        thread's commands landing in the middle of it.
+        """
         entered_sequence = threading.Event()
         release_winner = threading.Event()
 
-        def fake_send(cmd, wait_prefix=None, timeout=5.0):
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -512,7 +682,7 @@ class TestSwapDisc:
 
         results = {}
 
-        def winner():
+        def winner() -> None:
             results["winner"] = emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd")
 
         t = threading.Thread(target=winner)
@@ -536,16 +706,19 @@ class TestSwapDisc:
         assert emulator._disc_index == 1
 
     def test_a_swap_is_refused_while_a_deferred_resume_holds_the_lock(
-        self, emulator, monkeypatch
-    ):
-        """The tray lock also excludes _deferred_load_state: a LOAD_STATE
+        self, emulator: retroarch.Retroarch, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A swap is refused while a deferred resume load is holding the tray lock.
+
+        The tray lock also excludes _deferred_load_state: a LOAD_STATE
         landing inside a swap's tray-settle window is the collision it
-        guards against, and the same holds in reverse."""
+        guards against, and the same holds in reverse.
+        """
         monkeypatch.setattr(retroarch, "RESUME_LOAD_SETTLE", 0)
         entered_lock = threading.Event()
         release_resume = threading.Event()
 
-        def fake_wait_for_state(deadline):
+        def fake_wait_for_state(deadline: float) -> bool:
             entered_lock.set()
             release_resume.wait(timeout=2)
             return True

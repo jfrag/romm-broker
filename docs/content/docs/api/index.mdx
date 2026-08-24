@@ -1,0 +1,66 @@
+---
+title: "API overview"
+description: "Where the endpoints live, how they are authenticated, and which ones RomM calls versus the room UI."
+---
+
+Every endpoint lives under the `SUBFOLDER` prefix, so with the default the
+API root is `/streaming/api/`. The examples on these pages talk to a container
+directly on its HTTPS port; behind a reverse proxy substitute RomM's origin.
+
+## Authentication
+
+`BROKER_SECRET` is a shared secret between RomM and the container. When it is
+set, the lifecycle endpoints require it in the `X-Broker-Secret` header and
+answer `403` otherwise. When it is unset nothing is checked, which is only
+sensible on a LAN you control.
+
+Endpoints fall into three groups:
+
+| Group | Caller | Auth |
+| --- | --- | --- |
+| Lifecycle: activate, join, swap-disc | RomM's backend | `X-Broker-Secret` |
+| State and archive transfer: save-state, load-state, state-file, state-screenshot, imports, exports, memory card | RomM's backend | `X-Broker-Secret` |
+| Host actions: invite, exit | the room UI | the controller token as `?token=`; exit also accepts the secret |
+| Room: context, the collab websocket | the room UI | a personal token in the URL |
+| Status and health | anyone | none |
+
+The room UI never holds the secret. Its exit and invite buttons carry the
+controller token instead, which is why exit accepts either.
+
+## Endpoints
+
+| Method | Path | Page |
+| --- | --- | --- |
+| `POST` | `/api/session/activate` | [Launch a game](/docs/api/activate) |
+| `POST` | `/api/session/swap-disc` | [Launch a game](/docs/api/activate#swap-discs) |
+| `POST` | `/api/session/join` | [Users and invites](/docs/api/join) |
+| `POST` | `/api/session/invite` | [Users and invites](/docs/api/join#invite-links) |
+| `POST` | `/api/session/save-state` | [Save states](/docs/api/state) |
+| `POST` | `/api/session/load-state` | [Save states](/docs/api/state) |
+| `GET` / `PUT` | `/api/session/state-file` | [Save states](/docs/api/state#move-a-state-file-in-or-out) |
+| `GET` | `/api/session/state-screenshot` | [Save states](/docs/api/state#fetch-the-frame-a-state-was-taken-at) |
+| `POST` | `/api/session/exit` | [Exit](/docs/api/exit) |
+| `PUT` | `/api/session/imports/{name}.zip` | [Save archives](/docs/api/archives) |
+| `GET` / `DELETE` | `/api/session/exports[/{name}.zip]` | [Save archives](/docs/api/archives) |
+| `GET` / `PUT` | `/api/session/memory-card` | [Save archives](/docs/api/archives#memory-cards) |
+| `GET` | `/api/session/status` | [Status](/docs/api/status) |
+| `GET` | `/api/health` | [Status](/docs/api/status) |
+
+The request and response models are documented in the
+[Python reference](/docs/developer/reference/api), and a running broker serves
+its own OpenAPI schema at `<SUBFOLDER>/openapi.json` with the interactive
+explorer at `<SUBFOLDER>/docs`.
+
+## Conventions
+
+- **Status codes carry meaning.** `409` is "there is no session" (or "there
+  already is one" on activate). `400` is "the running emulator cannot do
+  that", for example a state route on an emulator without save states. `413`
+  is a body over a configured ceiling. `422` is a payload the broker could not
+  act on.
+- **A `"failed"` status is a real answer, not an error.** Save and load report
+  `failed` when the emulator did not acknowledge, or the slot held no state.
+- **Slots resolve to the emulator's working slot.** RomM is the library of
+  states, so each emulator works in exactly one slot and echoes the slot it
+  actually used. Whatever slot a request names, the response says which one it
+  landed in.

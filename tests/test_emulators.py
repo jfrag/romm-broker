@@ -1,10 +1,16 @@
-"""The registry and the contract every emulator in it has to hold up."""
+"""The registry and the contract every emulator in it has to hold up.
+
+Covers registry lookups, the declarations the routes read off each emulator, and the orphan pid
+record.
+"""
 
 import json
 import signal
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -12,12 +18,14 @@ from webstation_broker import emulators
 from webstation_broker.emulators import base
 
 
-def test_an_unknown_name_resolves_to_nothing():
+def test_an_unknown_name_resolves_to_nothing() -> None:
+    """An unknown name resolves to nothing."""
     assert emulators.get_emulator("gameboy") is None
     assert emulators.get_emulator("") is None
 
 
-def test_each_name_builds_its_own_instance():
+def test_each_name_builds_its_own_instance() -> None:
+    """Each lookup of a name builds its own instance."""
     first = emulators.get_emulator("pcsx2")
     second = emulators.get_emulator("pcsx2")
 
@@ -26,7 +34,8 @@ def test_each_name_builds_its_own_instance():
 
 
 @pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
-def test_every_emulator_declares_what_the_routes_read_off_it(name):
+def test_every_emulator_declares_what_the_routes_read_off_it(name: str) -> None:
+    """Every emulator declares what the routes read off it."""
     emu = emulators.get_emulator(name)
 
     assert emu.name and emu.display_name
@@ -46,7 +55,8 @@ def test_every_emulator_declares_what_the_routes_read_off_it(name):
 
 
 @pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
-def test_a_memory_card_comes_with_everything_the_card_routes_need(name):
+def test_a_memory_card_comes_with_everything_the_card_routes_need(name: str) -> None:
+    """A memory card comes with everything the card routes need."""
     emu = emulators.get_emulator(name)
     if emu.memory_card_subtree is None:
         assert emu.memory_card_path() is None
@@ -61,15 +71,23 @@ def test_a_memory_card_comes_with_everything_the_card_routes_need(name):
     assert emu.memory_card_subtree in emu.save_subtrees
 
 
-def test_the_desktop_launcher_needs_no_rom():
+def test_the_desktop_launcher_needs_no_rom() -> None:
+    """The desktop launcher needs no ROM."""
     assert emulators.get_emulator("desktop").requires_rom is False
 
 
-def _child_of(pid: int) -> int | None:
-    """The first process reporting `pid` as its parent, or None.
+def _child_of(pid: int) -> Optional[int]:
+    """Find the first process reporting `pid` as its parent.
 
-    Read out of PPid rather than /proc/<pid>/task/<pid>/children, which needs a
-    kernel built with CONFIG_PROC_CHILDREN and is missing on some of them."""
+    Read out of PPid rather than /proc/<pid>/task/<pid>/children, which needs a kernel built with
+    CONFIG_PROC_CHILDREN and is missing on some of them.
+
+    Args:
+        pid: The parent to look for.
+
+    Returns:
+        The child's pid, or None when nothing reports that parent.
+    """
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
             continue
@@ -86,10 +104,13 @@ def _child_of(pid: int) -> int | None:
 
 
 def test_reaping_kills_an_emulator_an_earlier_broker_left_running(
-    pid_record, sleeper
-):
-    """A restarted broker has no handle on the emulator that outlived it, so
-    the recorded pid is the only way it ever gets killed."""
+    pid_record: Path, sleeper: Callable[[], subprocess.Popen[bytes]]
+) -> None:
+    """Reaping kills an emulator an earlier broker left running.
+
+    A restarted broker has no handle on the emulator that outlived it, so the recorded pid is the
+    only way it ever gets killed.
+    """
     proc = sleeper()
     base._record_pid("fake", proc.pid, ["/usr/bin/sleep", "60"])
 
@@ -100,9 +121,14 @@ def test_reaping_kills_an_emulator_an_earlier_broker_left_running(
     assert not pid_record.exists()
 
 
-def test_reaping_leaves_a_recycled_pid_alone(pid_record, sleeper):
-    """The pid may belong to something else entirely by now, so a record that
-    does not match what is running is dropped rather than acted on."""
+def test_reaping_leaves_a_recycled_pid_alone(
+    pid_record: Path, sleeper: Callable[[], subprocess.Popen[bytes]]
+) -> None:
+    """Reaping leaves a recycled pid alone.
+
+    The pid may belong to something else entirely by now, so a record that does not match what is
+    running is dropped rather than acted on.
+    """
     proc = sleeper()
     base._record_pid("fake", proc.pid, ["/usr/bin/some-other-emulator"])
 
@@ -111,10 +137,13 @@ def test_reaping_leaves_a_recycled_pid_alone(pid_record, sleeper):
     assert not pid_record.exists()
 
 
-def test_reaping_leaves_a_pid_that_leads_no_process_group_alone(pid_record):
-    """Emulators are spawned into their own session, so a recorded pid that is
-    not a group leader is not the emulator, and killing its group would take
-    down whatever unrelated process tree it belongs to."""
+def test_reaping_leaves_a_pid_that_leads_no_process_group_alone(pid_record: Path) -> None:
+    """Reaping leaves a pid that leads no process group alone.
+
+    Emulators are spawned into their own session, so a recorded pid that is not a group leader is
+    not the emulator, and killing its group would take down whatever unrelated process tree it
+    belongs to.
+    """
     parent = subprocess.Popen(["/bin/sh", "-c", "sleep 60; true"], start_new_session=True)
     try:
         deadline = time.monotonic() + 5.0
@@ -134,9 +163,14 @@ def test_reaping_leaves_a_pid_that_leads_no_process_group_alone(pid_record):
         parent.wait()
 
 
-def test_reaping_a_record_that_names_no_command_does_nothing(pid_record, sleeper):
-    """An empty cmd matches the empty cmdline every dead pid reports, so a
-    record that cannot identify its process must not be acted on."""
+def test_reaping_a_record_that_names_no_command_does_nothing(
+    pid_record: Path, sleeper: Callable[[], subprocess.Popen[bytes]]
+) -> None:
+    """Reaping a record that names no command does nothing.
+
+    An empty cmd matches the empty cmdline every dead pid reports, so a record that cannot identify
+    its process must not be acted on.
+    """
     proc = sleeper()
     pid_record.write_text(json.dumps({"name": "fake", "pid": proc.pid}))
 
@@ -145,13 +179,17 @@ def test_reaping_a_record_that_names_no_command_does_nothing(pid_record, sleeper
     assert not pid_record.exists()
 
 
-def test_reaping_with_nothing_recorded_does_nothing(pid_record):
+def test_reaping_with_nothing_recorded_does_nothing(pid_record: Path) -> None:
+    """Reaping with nothing recorded does nothing."""
     assert base.reap_orphan() is None
 
 
-def test_a_graceful_exit_clears_the_record_the_same_as_a_kill(pid_record):
-    """The emulators that quit over their own control channel never reach the
-    kill path, so they have to drop the record themselves."""
+def test_a_graceful_exit_clears_the_record_the_same_as_a_kill(pid_record: Path) -> None:
+    """A graceful exit clears the record the same as a kill.
+
+    The emulators that quit over their own control channel never reach the kill path, so they have
+    to drop the record themselves.
+    """
     emu = emulators.get_emulator("shadps4")
     cmd = ["/bin/sh", "-c", "read line"]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, start_new_session=True)
@@ -165,10 +203,13 @@ def test_a_graceful_exit_clears_the_record_the_same_as_a_kill(pid_record):
 
 
 def test_stopping_clears_the_record_so_the_next_launch_reaps_nothing(
-    pid_record, sleeper
-):
-    """A clean stop has to take the record with it: leaving it behind would
-    have the next activate hunting a pid nobody owns."""
+    pid_record: Path, sleeper: Callable[[], subprocess.Popen[bytes]]
+) -> None:
+    """Stopping clears the record so the next launch reaps nothing.
+
+    A clean stop has to take the record with it: leaving it behind would have the next activate
+    hunting a pid nobody owns.
+    """
     emu = emulators.Emulator()
     emu._proc = sleeper()
     base._record_pid("fake", emu._proc.pid, ["/usr/bin/sleep", "60"])
@@ -178,16 +219,19 @@ def test_stopping_clears_the_record_so_the_next_launch_reaps_nothing(
     assert not pid_record.exists()
 
 
-def test_an_emulator_does_not_support_disc_swap_by_default():
+def test_an_emulator_does_not_support_disc_swap_by_default() -> None:
+    """An emulator does not support disc swap by default."""
     assert base.Emulator.supports_disc_swap is False
 
 
-def test_swapping_a_disc_on_the_base_class_is_not_implemented():
+def test_swapping_a_disc_on_the_base_class_is_not_implemented() -> None:
+    """Swapping a disc on the base class is not implemented."""
     with pytest.raises(NotImplementedError):
         base.Emulator().swap_disc(Path("/romm/game/disc2.chd"))
 
 
-def test_the_launch_env_strips_named_secrets(monkeypatch):
+def test_the_launch_env_strips_named_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launch env strips named secrets."""
     monkeypatch.setenv("BROKER_SECRET", "s3cret")
     monkeypatch.setenv("SELKIES_MASTER_TOKEN", "tok")
     monkeypatch.setenv("GITHUB_TOKEN", "gh")
@@ -202,13 +246,15 @@ def test_the_launch_env_strips_named_secrets(monkeypatch):
 @pytest.mark.parametrize(
     "name", ["SOME_API_SECRET", "OAUTH_TOKEN", "DB_PASSWORD", "AWS_ACCESS_KEY"]
 )
-def test_the_launch_env_strips_anything_secret_shaped(monkeypatch, name):
+def test_the_launch_env_strips_anything_secret_shaped(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """The launch env strips anything secret-shaped."""
     monkeypatch.setenv(name, "sensitive")
 
     assert name not in base.base_launch_env()
 
 
-def test_the_launch_env_keeps_ordinary_variables(monkeypatch):
+def test_the_launch_env_keeps_ordinary_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launch env keeps ordinary variables."""
     monkeypatch.setenv("SOME_HARMLESS_VAR", "keep-me")
 
     assert base.base_launch_env()["SOME_HARMLESS_VAR"] == "keep-me"

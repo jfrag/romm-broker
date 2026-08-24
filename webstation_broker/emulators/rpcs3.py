@@ -1,6 +1,7 @@
-"""RPCS3 (PlayStation 3) launcher: config.yml/ipc.yml patching, PKG install
-hook, PINE-driven boot verification, and save states via the emulator's own
-exit-on-save hotkey.
+"""RPCS3 (PlayStation 3) emulator launcher.
+
+Handles config.yml/ipc.yml patching, the PKG install hook, PINE-driven boot
+verification, and save states via the emulator's own exit-on-save hotkey.
 
 Boot formats: decrypted .iso images and disc folder rips
 (PS3_GAME/USRDIR/EBOOT.BIN) boot directly. A .pkg is an installer, not an
@@ -49,8 +50,10 @@ import struct
 import subprocess
 import time
 import zipfile
+from collections.abc import Iterable
 from pathlib import Path
 from threading import Lock, Thread
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -60,8 +63,11 @@ ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 
 
 def _default_data_dir() -> str:
-    """RPCS3's Linux data root: $XDG_CONFIG_HOME/rpcs3 when set, otherwise
-    ~/.config/rpcs3. Config, dev_flash and dev_hdd0 all live under it."""
+    """Resolve RPCS3's Linux data root.
+
+    $XDG_CONFIG_HOME/rpcs3 when set, otherwise ~/.config/rpcs3. Config,
+    dev_flash and dev_hdd0 all live under it.
+    """
     xdg = os.environ.get("XDG_CONFIG_HOME")
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "rpcs3")
@@ -175,7 +181,7 @@ def _launch_env() -> dict[str, str]:
     return env
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -201,10 +207,13 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
 
 
 def _patch_yaml_file(path: Path, patches: dict[tuple[str, str], str]) -> None:
-    """Force ("section", "key") -> value into a two-level YAML file
-    (unindented "Section:" headers over 2-space "key: value" lines) before
-    every launch, or a flat "key: value" when section is "". RPCS3 fills
-    missing keys with defaults, so a partial file is a valid config."""
+    """Force config patches into a two-level YAML file before every launch.
+
+    Each ("section", "key") -> value pair is applied to unindented
+    "Section:" headers over 2-space "key: value" lines, or a flat
+    "key: value" when section is "". RPCS3 fills missing keys with
+    defaults, so a partial file is a valid config.
+    """
     try:
         if not path.exists():
             log.info("%s not found, seeding one", path)
@@ -274,7 +283,8 @@ def _ensure_sstate_link() -> None:
     dev_hdd0 rather than something under it, but save_root has to stay
     dev_hdd0 so the archive subtrees already in use (home/00000001/savedata,
     game/) keep resolving as they always have. A symlink is what lets
-    "savestates" join save_subtrees without moving save_root."""
+    "savestates" join save_subtrees without moving save_root.
+    """
     try:
         SSTATE_ROOT.mkdir(parents=True, exist_ok=True)
         DEV_HDD0.mkdir(parents=True, exist_ok=True)
@@ -291,9 +301,11 @@ def _ensure_sstate_link() -> None:
 
 
 def _run_headless(args: list[str], what: str) -> None:
-    """Run a one-shot `rpcs3 --headless` operation (installer CLI); the
-    process exits when the operation completes. Exit code is always 0, so
-    callers verify success by checking the expected files afterwards."""
+    """Run a one-shot `rpcs3 --headless` operation (installer CLI).
+
+    The process exits when the operation completes. Exit code is always 0,
+    so callers verify success by checking the expected files afterwards.
+    """
     cmd = [_rpcs3_bin(), "--headless", *args]
     log.info("rpcs3 %s: %s", what, " ".join(cmd))
     try:
@@ -320,8 +332,11 @@ def _run_headless(args: list[str], what: str) -> None:
 
 
 def _gamedata_dirs() -> list[Path]:
-    """cellGameData save dirs under game/: everything except installed
-    titles (which have a bootable EBOOT.BIN) and RPCS3's ＄locks dir."""
+    """List CellGameData save dirs under game/.
+
+    Everything except installed titles (which have a bootable EBOOT.BIN)
+    and RPCS3's ＄locks dir.
+    """
     dirs = []
     if GAME_DIR.is_dir():
         for d in sorted(GAME_DIR.iterdir()):
@@ -333,9 +348,8 @@ def _gamedata_dirs() -> list[Path]:
     return dirs
 
 
-def _sfo_title_id(sfo: Path) -> str | None:
-    """TITLE_ID string from a PARAM.SFO (key/data table pairs indexed from
-    a fixed-size header)."""
+def _sfo_title_id(sfo: Path) -> Optional[str]:
+    """TITLE_ID string from a PARAM.SFO (key/data table pairs indexed from a fixed-size header)."""
     try:
         data = sfo.read_bytes()
     except OSError:
@@ -387,9 +401,13 @@ def _touch_last_accessed(game_dir: Path) -> None:
 
 
 def _evict_lru(needed_bytes: int, keep: str) -> None:
-    """Evict least-recently-used extracted games until needed_bytes fits
-    within CACHE_MAX_GB. keep is the cache key currently being (re-)extracted,
-    so a stale entry for it already removed by the caller is never chosen."""
+    """Evict least-recently-used extracted games until `needed_bytes` fits within CACHE_MAX_GB.
+
+    Args:
+        needed_bytes: Additional bytes that must fit under the cache cap.
+        keep: The cache key currently being (re-)extracted, so a stale
+            entry for it already removed by the caller is never chosen.
+    """
     if not CACHE_ENABLED or not CACHE_DIR.is_dir():
         return
     max_bytes = int(CACHE_MAX_GB * 1024**3)
@@ -423,19 +441,25 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
 
 
 def _is_safe_boot_candidate(candidate: Path, root_real: Path) -> bool:
-    """False for anything but a regular file resolving inside root_real, so a
-    symlink planted by the archive cannot point rpcs3 at a path elsewhere on
-    the host."""
+    """Check that `candidate` is safe to boot.
+
+    False for anything but a regular file resolving inside root_real, so a
+    symlink planted by the archive cannot point rpcs3 at a path elsewhere
+    on the host.
+    """
     try:
         return candidate.is_file() and candidate.resolve().is_relative_to(root_real)
     except OSError:
         return False
 
 
-def _archive_boot_target(root: Path) -> Path | None:
-    """Best boot target inside an extracted archive: an EBOOT.BIN anywhere
-    (disc rip or PKG-installed layout), or failing that a bare decrypted
-    .iso an archive may hold instead of an unpacked JB folder."""
+def _archive_boot_target(root: Path) -> Optional[Path]:
+    """Find the best boot target inside an extracted archive.
+
+    An EBOOT.BIN anywhere (disc rip or PKG-installed layout), or failing
+    that a bare decrypted .iso an archive may hold instead of an unpacked
+    JB folder.
+    """
     root_real = root.resolve()
     for eboot in root.rglob("EBOOT.BIN"):
         if _is_safe_boot_candidate(eboot, root_real):
@@ -457,9 +481,11 @@ def _run_extractor(cmd: list[str], what: str) -> str:
 
 
 def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
-    """A `../` (or absolute) member path can escape dest on extraction (Zip
-    Slip); reject any member whose resolved path would land outside dest
-    before anything is written."""
+    """Reject any archive member whose path would land outside dest.
+
+    A `../` (or absolute) member path can escape dest on extraction (Zip
+    Slip); this is checked before anything is written.
+    """
     dest_real = dest.resolve()
     for member in members:
         target = (dest / member).resolve()
@@ -468,23 +494,32 @@ def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
 
 
 def _safe_extract_zip(zf: zipfile.ZipFile, dest: Path) -> None:
-    """zf.extractall() writes a member's path verbatim, so a `../` name in
-    the archive (Zip Slip) can escape dest; reject any member that would."""
+    """Extract `zf` into dest after rejecting any Zip Slip member.
+
+    zf.extractall() writes a member's path verbatim, so a `../` name in
+    the archive can escape dest; reject any member that would first.
+    """
     _reject_unsafe_members(dest, zf.namelist())
     zf.extractall(dest)
 
 
 def _rar_member_paths(archive: Path) -> list[str]:
-    """Bare member paths from `unrar lb`: one path per line, no header or
-    column formatting to parse around."""
+    """List member paths from an archive.
+
+    Bare paths from `unrar lb`, one per line, no header or column
+    formatting to parse around.
+    """
     listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})")
     return [line for line in listing.splitlines() if line]
 
 
 def _7z_member_paths(archive: Path) -> list[str]:
-    """Member paths from `7z l -slt`, the only 7z listing mode that gives a
-    full untruncated path per entry. Everything before the `----------`
-    separator describes the archive itself, not its contents."""
+    """List member paths from an archive.
+
+    Parsed from `7z l -slt`, the only 7z listing mode that gives a full
+    untruncated path per entry. Everything before the `----------`
+    separator describes the archive itself, not its contents.
+    """
     listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z list ({archive.name})")
     _, _, body = listing.partition("----------\n")
     return [line[len("Path = ") :] for line in body.splitlines() if line.startswith("Path = ")]
@@ -545,11 +580,13 @@ def _extract_archive(archive: Path, dest: Path) -> None:
 
 
 def _cache_key(archive: Path) -> str:
-    """Cache dir name for archive: its stem plus a short hash of the file's
-    own name, size, and mtime. A bare stem collides two archives that share
-    a name but differ in extension, and survives a same-named re-upload
-    with different content, either of which would otherwise serve up
-    whatever is sitting in the old cache dir as if it were the new ROM."""
+    """Cache dir name for archive: its stem plus a short hash of the file's own name, size, and mtime.
+
+    A bare stem collides two archives that share a name but differ in
+    extension, and survives a same-named re-upload with different content,
+    either of which would otherwise serve up whatever is sitting in the
+    old cache dir as if it were the new ROM.
+    """
     try:
         st = archive.stat()
         fingerprint = f"{archive.name}:{st.st_size}:{int(st.st_mtime)}"
@@ -560,14 +597,19 @@ def _cache_key(archive: Path) -> str:
 
 
 def _extract_and_cache(archive: Path) -> Path:
-    """Extract archive into CACHE_DIR, reusing a prior extraction keyed by
-    _cache_key when one already holds a bootable target. Raises on failure
-    so launch() aborts before ever starting rpcs3 on nothing bootable.
+    """Extract archive into CACHE_DIR, reusing a cached extraction when possible.
+
+    Reuses a prior extraction keyed by `_cache_key` when one already holds
+    a bootable target.
 
     Holds _CACHE_LOCK for the whole call: eviction, extraction, and the
-    boot-target lookup all touch the same CACHE_DIR tree, so a second launch
-    racing in here must wait rather than potentially evicting the directory
-    this one is mid-extracting into or about to boot from.
+    boot-target lookup all touch the same CACHE_DIR tree, so a second
+    launch racing in here must wait rather than potentially evicting the
+    directory this one is mid-extracting into or about to boot from.
+
+    Raises:
+        RuntimeError: If extraction fails, or the extracted archive holds
+            no EBOOT.BIN or decrypted .iso to boot.
     """
     with _CACHE_LOCK:
         key = _cache_key(archive)
@@ -604,9 +646,12 @@ def _extract_and_cache(archive: Path) -> Path:
     return boot
 
 
-def _pkg_title_id(pkg: Path) -> str | None:
-    """Title ID from the PKG header: the content id at offset 0x30 embeds it
-    as chars 7-15 (`UP0001-BLUS30443_00-...` -> BLUS30443)."""
+def _pkg_title_id(pkg: Path) -> Optional[str]:
+    """Title ID from the PKG header.
+
+    The content id at offset 0x30 embeds it as chars 7-15
+    (`UP0001-BLUS30443_00-...` -> BLUS30443).
+    """
     try:
         with open(pkg, "rb") as f:
             header = f.read(0x60)
@@ -621,10 +666,19 @@ def _pkg_title_id(pkg: Path) -> str | None:
 
 
 def _install_pkgs(rom: Path) -> Path:
-    """Install-if-needed hook for .pkg roms; returns the installed EBOOT to
-    boot. When the rom has its own folder, every .pkg in it is installed
-    (base + update + DLC) and every .rap/.edat license is copied into
-    exdata. Already-installed titles skip straight to the boot path."""
+    """Install a .pkg rom if it is not already installed.
+
+    When rom has its own folder, every .pkg in it is installed (base,
+    update, and DLC) and every .rap/.edat license is copied into exdata.
+    Already-installed titles skip straight to the boot path.
+
+    Returns:
+        Path to the EBOOT.BIN to boot.
+
+    Raises:
+        RuntimeError: If the title id cannot be determined, or the install
+            produces no EBOOT.BIN.
+    """
     folder = rom.parent if rom.parent.resolve() != ROM_ROOT.resolve() else None
     siblings = sorted(folder.iterdir()) if folder else [rom]
     pkgs = [p for p in siblings if p.is_file() and p.suffix.lower() == ".pkg"] or [rom]
@@ -668,11 +722,11 @@ def _install_pkgs(rom: Path) -> Path:
     return eboot
 
 
-def _state_dir_for(serial: str | None) -> Path | None:
+def _state_dir_for(serial: Optional[str]) -> Optional[Path]:
     return (SSTATE_ROOT / serial) if serial else None
 
 
-def _state_snapshot(serial: str | None) -> dict:
+def _state_snapshot(serial: Optional[str]) -> dict:
     d = _state_dir_for(serial)
     if d is None or not d.is_dir():
         return {}
@@ -687,19 +741,22 @@ def _state_snapshot(serial: str | None) -> dict:
     return snap
 
 
-def _newest_state(serial: str | None) -> Path | None:
-    """Newest state file for `serial`. RPCS3 already isolates every title
-    under its own savestates/<title_id>/ dir, so newest-by-mtime in there is
-    always this title's own most recent capture."""
-    best: tuple[float, Path] | None = None
+def _newest_state(serial: Optional[str]) -> Optional[Path]:
+    """Newest state file for `serial`.
+
+    RPCS3 already isolates every title under its own
+    savestates/<title_id>/ dir, so newest-by-mtime in there is always this
+    title's own most recent capture.
+    """
+    best: Optional[tuple[float, Path]] = None
     for p, (_size, mtime) in _state_snapshot(serial).items():
         if best is None or mtime > best[0]:
             best = (mtime, p)
     return best[1] if best is not None else None
 
 
-def _changed_state(serial: str | None, before: dict) -> Path | None:
-    best: tuple[float, Path] | None = None
+def _changed_state(serial: Optional[str], before: dict) -> Optional[Path]:
+    best: Optional[tuple[float, Path]] = None
     for p, cur in _state_snapshot(serial).items():
         if before.get(p) != cur:
             mtime = cur[1]
@@ -708,20 +765,23 @@ def _changed_state(serial: str | None, before: dict) -> Path | None:
     return best[1] if best is not None else None
 
 
-def _wait_for_state_write(serial: str | None, before: dict, deadline: float) -> Path | None:
-    """Poll the title's savestate dir until a new/changed file's size holds
-    steady for STABLE_SECS, or the deadline passes.
+def _wait_for_state_write(serial: Optional[str], before: dict, deadline: float) -> Optional[Path]:
+    """Poll until the title's savestate write stabilizes, or the deadline passes.
+
+    A new/changed file's size must hold steady for STABLE_SECS to count as
+    finished.
 
     RPCS3 exiting is not itself proof the write finished: the hotkey ends
     the process once the state is captured, but nothing here can tell
     whether compression to disk still trails that. Polling the file's own
     size is the only confirmation there is, the same as every other
-    emulator's write-confirmation loop."""
+    emulator's write-confirmation loop.
+    """
     STABLE_SECS = 0.5
     POLL_SECS = 0.2
-    target: Path | None = None
-    last_size: int | None = None
-    stable_since: float | None = None
+    target: Optional[Path] = None
+    last_size: Optional[int] = None
+    stable_since: Optional[float] = None
     while time.monotonic() < deadline:
         p = _changed_state(serial, before)
         if p is None:
@@ -745,7 +805,7 @@ def _wait_for_state_write(serial: str | None, before: dict, deadline: float) -> 
     return None
 
 
-def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
+def _pine_recv_exact(sock: _socket.socket, n: int) -> Optional[bytes]:
     buf = b""
     while len(buf) < n:
         chunk = sock.recv(n - len(buf))
@@ -755,11 +815,18 @@ def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
     return buf
 
 
-def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> bytes | None:
-    """One PINE request. Wire format (LE): u32 total size, u8 opcode, payload;
-    reply is u32 size, u8 result (0 = OK), payload. Same wire format PCSX2's
-    PINE variant uses; RPCS3 just implements a smaller opcode set (no
-    save/load-state) on top of it."""
+def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Optional[bytes]:
+    """Send one PINE request and return its reply payload.
+
+    Wire format (LE): u32 total size, u8 opcode, payload; reply is u32
+    size, u8 result (0 = OK), payload. Same wire format PCSX2's PINE
+    variant uses; RPCS3 just implements a smaller opcode set (no
+    save/load-state) on top of it.
+
+    Returns:
+        The reply payload, or None if the request failed or the socket is
+        unreachable.
+    """
     packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
@@ -782,7 +849,7 @@ def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> by
         return None
 
 
-def _pine_status() -> int | None:
+def _pine_status() -> Optional[int]:
     """0 running, 1 paused, 2 shutdown, None if IPC is down or disabled."""
     body = _pine_request(_PINE_MSG_STATUS, timeout=2.0)
     if body is None or len(body) < 4:
@@ -790,7 +857,7 @@ def _pine_status() -> int | None:
     return struct.unpack("<I", body[:4])[0]
 
 
-def _pine_title_id() -> str | None:
+def _pine_title_id() -> Optional[str]:
     body = _pine_request(_PINE_MSG_ID, timeout=2.0)
     if not body:
         return None
@@ -798,12 +865,14 @@ def _pine_title_id() -> str | None:
 
 
 class Rpcs3(Emulator):
+    """RPCS3 (PS3) launcher: exit-only savestates via PINE, plus archive boot support."""
+
     name = "rpcs3"
     display_name = "RPCS3"
     save_root = DEV_HDD0
     rom_extensions = ROM_EXTENSIONS
     _restoring = False
-    _session_serial: str | None = None
+    _session_serial: Optional[str] = None
     _session_start = 0.0
     log_path = RPCS3_LOG_PATH
     # No SIGTERM handler: the default action ends the process at once, saves
@@ -811,15 +880,18 @@ class Rpcs3(Emulator):
     # teardown of the AppImage wrapper.
     term_timeout = float(os.environ.get("RPCS3_STOP_WAIT", "2"))
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """Initialize per-session launch/extraction tracking state."""
         super().__init__()
         self._launch_seq = 0
         # Only set for an archive boot; stop() removes it when the cache is
         # disabled so nothing outlives the session it was extracted for.
-        self._extracted_dir: Path | None = None
+        self._extracted_dir: Optional[Path] = None
 
     def clear_working_slot(self) -> None:
-        """RPCS3 has no fixed slot to clear, but activate() calls this before
+        """Create the savestates symlink and wipe stale savestates before a restore.
+
+        RPCS3 has no fixed slot to clear, but activate() calls this before
         it ever reads save_subtrees to restore an archive, which makes it the
         one place that is safe to create the savestates symlink: it runs on
         every activate, but never during a bare construction (registry
@@ -832,7 +904,8 @@ class Rpcs3(Emulator):
         itself produces rather than growing across every activate. Flipping
         _restoring here, not just in prepare_restore(), matters because
         api.py reads save_subtrees for the restore extract before it ever
-        calls prepare_restore()."""
+        calls prepare_restore().
+        """
         _ensure_sstate_link()
         self._restoring = True
         if SSTATE_ROOT.is_dir():
@@ -847,14 +920,14 @@ class Rpcs3(Emulator):
 
     @property
     def save_subtrees(self) -> tuple[str, ...]:
-        """cellSaveData saves, save states, plus the cellGameData save dirs
-        under game/.
+        """CellSaveData saves, save states, plus the cellGameData save dirs under game/.
 
         game/ mixes save data with installed PKG titles and RPCS3's ＄locks
         dir, so the dump enumerates only the dirs without a bootable
         EBOOT.BIN. A restore inverts the problem: the archive holds nothing
         but previously dumped save dirs, and those dirs don't exist on disk
-        yet, so the whole game/ prefix is declared to let them through."""
+        yet, so the whole game/ prefix is declared to let them through.
+        """
         if self._restoring:
             return ("home/00000001/savedata", "game", "savestates")
         subtrees = ["home/00000001/savedata", "savestates"]
@@ -862,10 +935,22 @@ class Rpcs3(Emulator):
         return tuple(subtrees)
 
     def prepare_restore(self) -> None:
+        """Stop any running instance and mark the session as archive-restoring."""
         self.stop()
         self._restoring = True
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """Resolve a RomM path to a single bootable PKG, disc, or ISO.
+
+        A file is taken as is. A directory is searched for the game's
+        installer/disc layout via `_ROM_SEARCH_GLOBS`.
+
+        Args:
+            path: RomM's resolved rom path, file or directory.
+
+        Returns:
+            The path to boot, or None if nothing bootable was found.
+        """
         if path.is_file():
             return path
         if not path.is_dir():
@@ -878,7 +963,7 @@ class Rpcs3(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def _xdotool(self, *args: str) -> str | None:
+    def _xdotool(self, *args: str) -> Optional[str]:
         """Run xdotool, returning its stdout, or None if it failed."""
         try:
             result = subprocess.run(
@@ -896,7 +981,7 @@ class Rpcs3(Emulator):
             return None
         return result.stdout
 
-    def _game_window(self) -> str | None:
+    def _game_window(self) -> Optional[str]:
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if not out:
             log.warning("no rpcs3 window found")
@@ -908,7 +993,8 @@ class Rpcs3(Emulator):
 
         Activating first is what makes this survive the player clicking back
         into the page: XTEST delivers to whatever holds focus, so a key sent
-        at an unfocused RPCS3 goes to the desktop instead."""
+        at an unfocused RPCS3 goes to the desktop instead.
+        """
         win_id = self._game_window()
         if win_id is None:
             return False
@@ -916,7 +1002,17 @@ class Rpcs3(Emulator):
             return False
         return self._xdotool("key", "--clearmodifiers", key) is not None
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Stop any running instance and boot rpcs3 for the given ROM.
+
+        Installs PKGs and extracts archives as needed, then resolves a
+        savestate to boot into when a resume slot is requested and one
+        exists for the title.
+
+        Args:
+            rom_path: RomM's resolved rom path (file or directory).
+            resume_slot: Slot to resume from, or None for a fresh boot.
+        """
         self.stop()
         self._restoring = False
         self.boot_failed = False
@@ -977,13 +1073,15 @@ class Rpcs3(Emulator):
         Thread(target=self._boot_watchdog, args=(seq,), daemon=True).start()
 
     def _boot_watchdog(self, seq: int) -> None:
-        """Confirm the freshly launched game reaches a running state via
-        PINE, and opportunistically resolve the title id via MsgID for boots
+        """Confirm the launched game reaches a running state via PINE.
+
+        Also opportunistically resolves the title id via MsgID for boots
         that had no serial from the file path alone (a bare .iso).
 
         A process still alive when the deadline passes without ever
         reporting running is the boot-error-dialog case: RPCS3 does not exit
-        on its own, so nothing else in the broker would ever notice."""
+        on its own, so nothing else in the broker would ever notice.
+        """
         deadline = time.monotonic() + BOOT_WAIT
         while time.monotonic() < deadline:
             if self._launch_seq != seq:
@@ -1016,7 +1114,16 @@ class Rpcs3(Emulator):
         else:
             log.warning("boot watchdog: rpcs3 exited before ever reporting running")
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: Optional[int]) -> dict:
+        """Send the save-state hotkey, then stop the emulator.
+
+        Args:
+            slot: Slot to save to, or None to exit without saving.
+
+        Returns:
+            A dict with `state_saved`, `state_slot`, and `state_file` (path,
+            size, and mtime of the new state file, or None if none was saved).
+        """
         saved = False
         state_file = None
         if slot is not None and self.alive():
@@ -1058,6 +1165,7 @@ class Rpcs3(Emulator):
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
 
     def stop(self) -> None:
+        """Kill the process and remove any extracted archive copy if caching is off."""
         # Invalidate any in-flight boot watchdog before the kill.
         self._launch_seq += 1
         super().stop()
@@ -1067,8 +1175,11 @@ class Rpcs3(Emulator):
             self._extracted_dir = None
 
     def _session_save_dirs(self) -> list[Path]:
-        """This title's save dirs: name prefixed with the session serial, or
-        containing a file written while the session ran."""
+        """This title's save dirs.
+
+        A dir qualifies by name (prefixed with the session serial) or by
+        containing a file written while the session ran.
+        """
         savedata = USER_HOME / "savedata"
         candidates = sorted(d for d in savedata.iterdir() if d.is_dir()) if savedata.is_dir() else []
         candidates += _gamedata_dirs()

@@ -1,3 +1,12 @@
+"""Emulator launchers and the registry the broker picks them from.
+
+Every launcher subclasses `Emulator` from `base` and is keyed by its `name` in
+`REGISTRY`; `get_emulator` is how the rest of the broker turns a name from the
+activate payload into a fresh instance.
+"""
+
+from typing import Optional
+
 from .azahar import Azahar
 from .base import Emulator
 from .cemu import Cemu
@@ -30,8 +39,17 @@ REGISTRY: dict[str, type[Emulator]] = {
     "ppsspp": Ppsspp,
     "desktop": Desktop,
 }
+"""Emulator name to launcher class, the names the activate payload may ask for."""
 
 
-def get_emulator(name: str) -> Emulator | None:
+def get_emulator(name: str) -> Optional[Emulator]:
+    """Instantiate the launcher registered under `name`.
+
+    Args:
+        name: An emulator name as it appears in `REGISTRY`.
+
+    Returns:
+        A new launcher instance, or None when the name is not registered.
+    """
     cls = REGISTRY.get(name)
     return cls() if cls else None

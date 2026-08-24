@@ -1,27 +1,28 @@
 """xemu launcher (original Xbox): FATX-level save sync on a raw HDD image.
 
 xemu keeps game saves inside the one hard-disk image its xemu.toml points at,
-and QEMU exposes that image only as an opaque block device: the previous
-design therefore shipped the entire qcow2 as the save artifact. This version
-syncs at the filesystem level instead: the image is kept in raw format so
-pyfatx (userspace libfatx bindings, no FUSE, no NBD, container-safe) can
-read and write the FATX E partition directly, and the save archive carries
-only the launched title's save data.
+and QEMU exposes that image only as an opaque block device, so the previous
+design shipped the entire qcow2 as the save artifact. This version syncs at
+the filesystem level instead: the image is kept in raw format so pyfatx
+(userspace libfatx bindings: no FUSE, no NBD, container-safe) can read and
+write the FATX E partition directly, and the save archive carries only the
+launched title's save data.
 
-  image:  the first launch after deploy finds the configured qcow2 and
-          converts it in place with qemu-img (same filename, raw content,
-          sparse on disk), keeping the original alongside as <name>.backup.
-          A raw image cannot hold QEMU internal snapshots, so the save-state
-          interface is gone; save data is the whole artifact now.
-  launch: when the activate restored an archive, its files are written into
-          E:/UDATA and E:/TDATA before xemu boots (pre-launch hook).
-  exit:   once xemu has stopped and flushed, the launched title's UDATA and
-          TDATA trees are extracted from the image into the staging dir
-          (post-close hook), where the standard dump zips them.
-  title:  the title id (the UDATA directory name) is read from the disc's
-          default.xbe certificate; if the disc cannot be parsed, extraction
-          falls back to every title on the disk rather than losing the
-          session's saves.
+How a session moves saves in and out of the image:
+
+- image: the first launch after deploy finds the configured qcow2 and
+  converts it in place with qemu-img (same filename, raw content, sparse on
+  disk), keeping the original alongside as `<name>.backup`. A raw image
+  cannot hold QEMU internal snapshots, so the save-state interface is gone;
+  save data is the whole artifact now.
+- launch: when the activate restored an archive, its files are written into
+  E:/UDATA and E:/TDATA before xemu boots (pre-launch hook).
+- exit: once xemu has stopped and flushed, the launched title's UDATA and
+  TDATA trees are extracted from the image into the staging dir (post-close
+  hook), where the standard dump zips them.
+- title: the title id (the UDATA directory name) is read from the disc's
+  default.xbe certificate; if the disc cannot be parsed, extraction falls
+  back to every title on the disk rather than losing the session's saves.
 """
 
 import logging
@@ -31,7 +32,9 @@ import shutil
 import subprocess
 import time
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path
+from typing import IO, Any, Optional
 
 from pyfatx import Fatx
 
@@ -40,32 +43,56 @@ from .base import Emulator, base_launch_env
 log = logging.getLogger(__name__)
 
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
+"""Library root a resolved ROM must live under (env `ROM_ROOT`, default `/romm`)."""
 
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
+"""The xemu executable to spawn (env `XEMU_BIN`, default `/opt/xemu/AppRun`)."""
 XEMU_LOG_PATH = Path(os.environ.get("XEMU_LOG_PATH", "/config/xemu.log"))
+"""The emulator log file (env `XEMU_LOG_PATH`, default `/config/xemu.log`)."""
 
-# Vulkan aborts xemu on the AMD Renoir/RADV stack these containers run on, and
-# the choice persists in xemu.toml, so one session spent switching renderers
-# leaves every later launch broken. Pinned before each launch; set XEMU_RENDERER
-# to VULKAN where the driver is known good, or to KEEP to leave the file alone.
 XEMU_RENDERER = os.environ.get("XEMU_RENDERER", "OPENGL").strip().upper()
+"""Renderer pinned into xemu.toml before each launch (env `XEMU_RENDERER`, default `OPENGL`).
 
-# Which renderer xemu asks for and whether the driver can answer are separate
-# problems: on the AMD Renoir stack these containers run on, xemu aborts in
-# gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
-# XEMU_SOFTWARE_GL to render xemu on the CPU there, which the container-wide
-# LIBGL_ALWAYS_SOFTWARE cannot do without dragging every other emulator down
-# with it. Slow, so it stays off unless the host needs it.
+Vulkan aborts xemu on the AMD Renoir/RADV stack these containers run on, and
+the choice persists in xemu.toml, so one session spent switching renderers
+leaves every later launch broken. Pinned before each launch; set `XEMU_RENDERER`
+to `VULKAN` where the driver is known good, or to `KEEP` to leave the file alone.
+"""
+
+
 def _truthy(value: str) -> bool:
+    """Whether an environment flag reads as enabled.
+
+    Args:
+        value: The raw environment value.
+
+    Returns:
+        True for `1`, `true`, `yes` or `on`, case-insensitive and whitespace-trimmed.
+    """
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 XEMU_SOFTWARE_GL = _truthy(os.environ.get("XEMU_SOFTWARE_GL", ""))
+"""Whether xemu renders on the CPU via `LIBGL_ALWAYS_SOFTWARE` (env `XEMU_SOFTWARE_GL`, default off).
+
+Which renderer xemu asks for and whether the driver can answer are separate
+problems: on the AMD Renoir stack these containers run on, xemu aborts in
+gl_fence on the OpenGL path and in RADV on the Vulkan one. Set
+`XEMU_SOFTWARE_GL` to render xemu on the CPU there, which the container-wide
+`LIBGL_ALWAYS_SOFTWARE` cannot do without dragging every other emulator down
+with it. Slow, so it stays off unless the host needs it.
+"""
 
 
 def _default_toml_path() -> Path:
-    """xemu.toml lives in SDL's pref dir: $XDG_DATA_HOME/xemu/xemu, or
-    ~/.local/share/xemu/xemu when XDG_DATA_HOME is unset."""
+    """Where xemu.toml lives when `XEMU_TOML` is not set.
+
+    xemu.toml lives in SDL's pref dir: `$XDG_DATA_HOME/xemu/xemu`, or
+    `~/.local/share/xemu/xemu` when `XDG_DATA_HOME` is unset.
+
+    Returns:
+        The default xemu.toml path.
+    """
     xdg = os.environ.get("XDG_DATA_HOME")
     if xdg and os.path.isabs(xdg):
         base = Path(xdg)
@@ -75,32 +102,49 @@ def _default_toml_path() -> Path:
 
 
 XEMU_TOML = Path(os.environ.get("XEMU_TOML", str(_default_toml_path())))
-# Only when xemu.toml cannot tell us: fresh container where xemu has never
-# run, or a config with no usable hdd_path.
+"""The xemu.toml the HDD path is read from and display settings are pinned into (env `XEMU_TOML`).
+
+Defaults to the SDL pref dir location `_default_toml_path` computes.
+"""
 FALLBACK_HDD_IMAGE = Path(
     os.environ.get("XEMU_HDD_IMAGE", "/config/xemu/xbox_hdd.qcow2")
 )
+"""HDD image assumed when xemu.toml cannot say (env `XEMU_HDD_IMAGE`).
 
-# Staging directory next to the HDD image; the generic dump/restore reads and
-# writes host files here, and the launch/exit hooks move them in and out of
-# the FATX filesystem.
+Defaults to `/config/xemu/xbox_hdd.qcow2`, and is used only when xemu.toml
+cannot tell us: a fresh container where xemu has never run, or a config with
+no usable hdd_path.
+"""
+
 SAVE_STAGING_DIRNAME = "saves"
+"""Name of the staging directory next to the HDD image.
+
+The generic dump/restore reads and writes host files here, and the
+launch/exit hooks move them in and out of the FATX filesystem.
+"""
 
 QCOW2_MAGIC = b"QFI\xfb"
+"""The four-byte header that marks a qcow2 image; its absence means raw content."""
 
-# Only XISO, which is always named .iso, including the .xiso.iso double
-# extension some dumps use.
 ROM_EXTENSIONS = (".iso",)
+"""Bootable disc formats: only XISO, always named `.iso`, including the `.xiso.iso` double extension."""
 _ROM_SEARCH_GLOBS = ("*", "*/*")
+"""Glob patterns a ROM folder is searched with, one level of wrapper folder deep."""
 _DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORECASE)
+"""Matches a disc number in a file name, for ranking multi-disc dumps."""
 
 
 def _hdd_image_path() -> Path:
     """The disk image xemu will actually mount, read from the user's config.
 
-    The user configures xemu themselves, so their xemu.toml [sys.files]
+    The user configures xemu themselves, so their xemu.toml `[sys.files]`
     hdd_path is the authority; a broker-side path would drift from it the
-    moment they repoint one of them."""
+    moment they repoint one of them.
+
+    Returns:
+        The configured image path, or `FALLBACK_HDD_IMAGE` when xemu.toml is
+        missing, unparsable, or carries no usable absolute hdd_path.
+    """
     try:
         with XEMU_TOML.open("rb") as fh:
             cfg = tomllib.load(fh)
@@ -128,6 +172,12 @@ def _hdd_image_path() -> Path:
 
 
 def _launch_env() -> dict[str, str]:
+    """The environment xemu is spawned with.
+
+    Returns:
+        The base launch environment, plus `LIBGL_ALWAYS_SOFTWARE=1` when
+        `XEMU_SOFTWARE_GL` is set.
+    """
     env = base_launch_env()
     if XEMU_SOFTWARE_GL:
         env["LIBGL_ALWAYS_SOFTWARE"] = "1"
@@ -135,15 +185,25 @@ def _launch_env() -> dict[str, str]:
 
 
 _NEXT_SECTION_RE = re.compile(r"^\[", re.MULTILINE)
+"""Matches the start of the next TOML table header, bounding a section body."""
 
 
 def _pin_toml_key(text: str, section: str, key: str, value: str) -> str:
-    """Return `text` with `key = value` set under `[section]`, adding either if
-    it is missing.
+    """Set `key = value` under `[section]` in TOML text, adding either if missing.
 
     Edited as text rather than reparsed and dumped: tomllib only reads, and a
     round trip through a writer would flatten the comments and key order xemu
-    maintains in the file it owns."""
+    maintains in the file it owns.
+
+    Args:
+        text: The full xemu.toml content.
+        section: The table name without brackets, for example `display.window`.
+        key: The key to set within that table.
+        value: The value as TOML source text, quotes included where needed.
+
+    Returns:
+        The updated TOML text.
+    """
     line = f"{key} = {value}"
     header = re.search(rf"^\[{re.escape(section)}\][ \t]*$", text, re.MULTILINE)
     if header is None:
@@ -194,13 +254,34 @@ def _pin_display_settings() -> None:
 
 
 def _disc_number(rel: Path) -> int:
+    """Disc number parsed from a candidate's relative path, for multi-disc ranking.
+
+    Args:
+        rel: The candidate's path relative to the search base.
+
+    Returns:
+        The disc number found in the name, or 1 when there is none.
+    """
     match = _DISC_RE.search(str(rel))
     if match is None:
         return 1
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates, base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
+    """Pick the best bootable disc image among `candidates`.
+
+    Hidden files, non-files and anything resolving outside `ROM_ROOT` are
+    skipped. Ranking prefers disc 1, then the `ROM_EXTENSIONS` order, then
+    the shallowest path, then the lowercased name.
+
+    Args:
+        candidates: Paths found under `base` by the search globs.
+        base: The directory the candidates were searched from.
+
+    Returns:
+        The resolved path of the best candidate, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
@@ -229,16 +310,23 @@ def _pick_rom_file(candidates, base: Path) -> Path | None:
 
 
 def _ensure_raw_image(image: Path) -> bool:
-    """Make sure `image` holds raw disk content; True when FATX access is
-    possible afterwards.
+    """Make sure `image` holds raw disk content, converting a qcow2 once.
 
     Detection is the qcow2 magic, so this runs as a cheap no-op on every
     launch and converts exactly once. The raw content replaces the file under
-    its original name; xemu format-probes the content, so the .qcow2 name
+    its original name: xemu format-probes the content, so the .qcow2 name
     keeps working and the user's xemu.toml never needs to change. The
     original qcow2 (including any internal snapshots) is kept alongside as a
     backup. On any failure the qcow2 is left in place so the session can
-    still play; only save sync is lost."""
+    still play; only save sync is lost.
+
+    Args:
+        image: The HDD image xemu mounts.
+
+    Returns:
+        True when FATX access is possible afterwards, False when the image
+        could not be read or the conversion failed.
+    """
     try:
         with image.open("rb") as fh:
             magic = fh.read(len(QCOW2_MAGIC))
@@ -281,14 +369,27 @@ def _ensure_raw_image(image: Path) -> bool:
 # ── Title id from the disc image ─────────────────────────────────────────────
 
 _XISO_SECTOR = 2048
+"""Sector size of an XISO, in bytes."""
 _XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
-# Game-partition offsets to probe: 0 for an extracted XISO, 0x18300000 for a
-# full dump that still carries the video partition up front.
+"""The volume descriptor signature at sector 32 of the game partition."""
 _XISO_BASES = (0, 0x18300000)
+"""Game-partition offsets to probe.
+
+0 for an extracted XISO, 0x18300000 for a full dump that still carries the
+video partition up front.
+"""
 
 
-def _xiso_root_dir(fh) -> tuple[int, int, int] | None:
-    """(partition base, root dir file offset, root dir size) of the disc."""
+def _xiso_root_dir(fh: IO[bytes]) -> Optional[tuple[int, int, int]]:
+    """Locate the root directory of the disc's game partition.
+
+    Args:
+        fh: The disc image, open for binary reading.
+
+    Returns:
+        A `(partition base, root dir file offset, root dir size)` tuple, or
+        None when no XISO volume descriptor sits at any probed base.
+    """
     for base in _XISO_BASES:
         fh.seek(base + 32 * _XISO_SECTOR)
         vd = fh.read(_XISO_SECTOR)
@@ -299,12 +400,20 @@ def _xiso_root_dir(fh) -> tuple[int, int, int] | None:
     return None
 
 
-def _xiso_find_entry(table: bytes, name: bytes) -> tuple[int, int] | None:
-    """(start sector, file size) of `name` in one XISO directory table.
+def _xiso_find_entry(table: bytes, name: bytes) -> Optional[tuple[int, int]]:
+    """Find `name` in one XISO directory table.
 
     Entries form a binary tree; left/right links are dword offsets into the
     table. The visited set and bounds checks make a corrupt or 0xFF-padded
-    table terminate instead of looping."""
+    table terminate instead of looping.
+
+    Args:
+        table: The raw directory table bytes.
+        name: The lowercased entry name to find.
+
+    Returns:
+        A `(start sector, file size)` tuple, or None when the entry is absent.
+    """
     stack = [0]
     seen: set[int] = set()
     while stack:
@@ -327,9 +436,19 @@ def _xiso_find_entry(table: bytes, name: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _disc_title_id(rom_path: Path) -> str | None:
-    """Title id from the disc's default.xbe certificate, formatted the way
-    the Xbox names save dirs (E:/UDATA/<id>), or None when unreadable."""
+def _disc_title_id(rom_path: Path) -> Optional[str]:
+    """Title id from the disc's default.xbe certificate.
+
+    Formatted the way the Xbox names save dirs (`E:/UDATA/<id>`): eight
+    uppercase hex digits.
+
+    Args:
+        rom_path: The XISO to read.
+
+    Returns:
+        The title id, or None when the disc, its default.xbe or the XBE
+        certificate cannot be read.
+    """
     try:
         with rom_path.open("rb") as fh:
             root = _xiso_root_dir(fh)
@@ -370,7 +489,17 @@ def _disc_title_id(rom_path: Path) -> str | None:
 # ── FATX access (pyfatx surfaces libfatx errors as bare AssertionError) ──────
 
 
-def _open_fatx_e(image: Path) -> Fatx | None:
+def _open_fatx_e(image: Path) -> Optional[Fatx]:
+    """Open the FATX E partition of a raw HDD image.
+
+    pyfatx surfaces libfatx errors as bare AssertionError, hence the catch.
+
+    Args:
+        image: The raw HDD image.
+
+    Returns:
+        The open filesystem handle, or None (logged) when it cannot be opened.
+    """
     try:
         return Fatx(str(image), drive="e")
     except (AssertionError, OSError):
@@ -379,19 +508,38 @@ def _open_fatx_e(image: Path) -> Fatx | None:
 
 
 def _fatx_isdir(fs: Fatx, path: str) -> bool:
+    """Whether `path` exists on the FATX filesystem and is a directory.
+
+    Args:
+        fs: The open FATX filesystem.
+        path: The absolute path on the partition.
+
+    Returns:
+        True for an existing directory, False for anything else or a lookup error.
+    """
     try:
         return bool(fs.get_attr(path).is_directory)
     except AssertionError:
         return False
 
 
-def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
+def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> Optional[str]:
     """Path of `parent`'s child directory matching `name` whatever its case.
 
     libfatx compares names byte for byte, so a lookup has to use the case the
     disk actually holds. Titles vary in how they case their save directories,
     and the miss would be silent: nothing resolves, nothing is extracted, and
-    the session's saves stay behind in the image."""
+    the session's saves stay behind in the image.
+
+    Args:
+        fs: The open FATX filesystem.
+        parent: The directory to search, as an absolute path on the partition.
+        name: The child directory name, compared case-insensitively.
+
+    Returns:
+        The child's path in the case the disk holds, or None when there is no
+        such directory or `parent` cannot be listed.
+    """
     wanted = name.lower()
     try:
         entries = list(fs.listdir(parent))
@@ -407,26 +555,68 @@ def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
 
 
 def _reap_strays() -> None:
-    """SIGKILL any xemu the broker does not own. An orphan busy-loops CPU
-    cores and, worst, keeps writing the HDD image the save hooks are about
-    to touch. Matched by full command line so other AppImage emulators
-    (duckstation is also comm "AppRun") are left alone."""
+    """SIGKILL any xemu the broker does not own.
+
+    An orphan busy-loops CPU cores and, worst, keeps writing the HDD image
+    the save hooks are about to touch. Matched by full command line so other
+    AppImage emulators (duckstation is also comm "AppRun") are left alone.
+    """
     if subprocess.run(["pkill", "-9", "-f", XEMU_BIN], capture_output=True).returncode == 0:
         log.info("reaped stray xemu process(es)")
         time.sleep(0.5)
 
 
 class Xemu(Emulator):
+    """Original Xbox via xemu, with saves synced at the FATX level.
+
+    xemu is a QEMU derivative with no control channel the broker can reach,
+    so the session is command line in (`-dvd_path`) and SIGTERM out. SIGTERM
+    gives QEMU a clean shutdown that flushes the HDD image the post-close
+    extraction then reads, so the grace window is long enough for the flush
+    to land before the SIGKILL escalation tears it. Any xemu the broker does
+    not own is reaped with SIGKILL before every hook, because an orphan keeps
+    writing the image the hooks are about to touch. Display settings
+    (renderer and fullscreen) are pinned into xemu.toml before each launch,
+    since xemu rewrites that file on exit and drops both.
+
+    Save data lives inside the raw HDD image's FATX E partition. An archive
+    the activate restored lands in a staging directory next to the image and
+    is injected into E:/UDATA and E:/TDATA before boot; after exit the
+    launched title's trees are extracted back into the staging directory for
+    the standard dump. There are no save states: the image is kept raw so
+    pyfatx can read it, and a raw image cannot hold QEMU internal snapshots,
+    so `supports_states` stays off and a resume slot is logged and ignored.
+
+    Attributes:
+        name: Provider key, `xemu`.
+        display_name: Human-readable name.
+        rom_extensions: Bootable disc formats, `.iso` only.
+        log_path: The emulator log file.
+        term_timeout: SIGTERM grace before SIGKILL (env `XEMU_STOP_WAIT`, default 15).
+        hdd_image: The HDD image xemu mounts, resolved once per session.
+        staging_dir: Host-side directory the dump and restore read and write.
+        save_root: The image's parent directory, which the save subtrees hang off.
+        save_subtrees: The staging directory name, scoping dump and restore to it.
+    """
+
     name = "xemu"
     display_name = "xemu"
     rom_extensions = ROM_EXTENSIONS
     log_path = XEMU_LOG_PATH
-    # SIGTERM gives QEMU a clean shutdown that flushes the HDD image the
-    # post-close extraction is about to read; give the flush time to land
-    # before the SIGKILL escalation tears it.
     term_timeout = float(os.environ.get("XEMU_STOP_WAIT", "15"))
+    """SIGTERM grace before SIGKILL (env `XEMU_STOP_WAIT`, default 15).
 
-    def __init__(self):
+    SIGTERM gives QEMU a clean shutdown that flushes the HDD image the
+    post-close extraction is about to read; give the flush time to land
+    before the SIGKILL escalation tears it.
+    """
+
+    def __init__(self) -> None:
+        """Resolve the HDD image and staging directory for this session.
+
+        An image parked under `.<name>.prev` by a previous broker version is
+        moved back into place when the configured image is missing.
+        """
         super().__init__()
         # Resolved once per session so the whole activate/exit round trip
         # sees one image, even if xemu rewrites its config mid-session.
@@ -435,7 +625,7 @@ class Xemu(Emulator):
         self.save_root = self.hdd_image.parent
         self.save_subtrees = (SAVE_STAGING_DIRNAME,)
         self._restore_pending = False
-        self._title_id: str | None = None
+        self._title_id: Optional[str] = None
         parked = self.hdd_image.with_name(f".{self.hdd_image.name}.prev")
         if not self.hdd_image.exists() and parked.is_file():
             log.info("recovering HDD image parked by a previous version")
@@ -446,6 +636,7 @@ class Xemu(Emulator):
         log.info("xemu hdd image: %s (save staging %s)", self.hdd_image, self.staging_dir)
 
     def _clear_staging(self) -> None:
+        """Remove the staging directory and everything under it, logging a failure."""
         if self.staging_dir.is_dir():
             try:
                 shutil.rmtree(self.staging_dir)
@@ -453,8 +644,15 @@ class Xemu(Emulator):
                 log.warning("could not fully clear %s: %s", self.staging_dir, exc)
 
     def _inject_saves(self) -> int:
-        """Pre-launch hook: write every staged file into the FATX E
-        partition. Returns the number of files that landed."""
+        """Pre-launch hook: write every staged file into the FATX E partition.
+
+        Hidden entries and symlinks in the staging dir are skipped. Directory
+        components are matched case-insensitively against the disk so an
+        archive whose case differs lands in the existing directory.
+
+        Returns:
+            The number of files that landed on the image.
+        """
         if not self.staging_dir.is_dir():
             return 0
         files = [
@@ -504,10 +702,16 @@ class Xemu(Emulator):
         return written
 
     def _extract_saves(self) -> int:
-        """Post-close hook: copy the title's save data out of the FATX E
-        partition into the (already cleared) staging dir. The files carry
-        fresh mtimes, so the dump's launch-baseline filter ships them all:
-        the archive is the title's complete save set, not a delta."""
+        """Post-close hook: copy the title's save data out of the FATX E partition.
+
+        Files land in the (already cleared) staging dir carrying fresh mtimes,
+        so the dump's launch-baseline filter ships them all: the archive is
+        the title's complete save set, not a delta. Without a title id every
+        title's UDATA and TDATA is extracted.
+
+        Returns:
+            The number of files staged.
+        """
         fs = _open_fatx_e(self.hdd_image)
         if fs is None:
             return 0
@@ -558,7 +762,15 @@ class Xemu(Emulator):
         del fs
         return extracted
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
+        """The disc image to boot for `path`.
+
+        Args:
+            path: A ROM file, or a folder searched up to two levels deep.
+
+        Returns:
+            The file itself, the best-ranked `.iso` in the folder, or None.
+        """
         if path.is_file():
             # Defense in depth: api.py already validates path is under
             # ROM_ROOT before calling in, but this checks it independently
@@ -580,17 +792,27 @@ class Xemu(Emulator):
         return _pick_rom_file(candidates, path)
 
     def prepare_restore(self) -> None:
-        """Before the archive is extracted: stop anything holding the image,
-        make sure it is raw, and empty the staging dir: leftovers from the
-        previous session's dump would otherwise mix into the injection, and
-        the newer-file guard could skip archive members over them."""
+        """Get the image and staging dir ready before the archive is extracted.
+
+        Stops anything holding the image, makes sure it is raw, and empties
+        the staging dir: leftovers from the previous session's dump would
+        otherwise mix into the injection, and the newer-file guard could skip
+        archive members over them. Marks the restore pending so the next
+        launch injects what lands.
+        """
         self.stop()
         _reap_strays()
         _ensure_raw_image(self.hdd_image)
         self._clear_staging()
         self._restore_pending = True
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
+        """Inject any restored saves, pin display settings and boot the disc.
+
+        Args:
+            rom_path: The XISO to boot.
+            resume_slot: Ignored with a warning; a raw image holds no states.
+        """
         self.stop()
         _reap_strays()
         raw_ok = _ensure_raw_image(self.hdd_image)
@@ -619,7 +841,17 @@ class Xemu(Emulator):
         log.info("launching xemu (rom=%s)", rom_path)
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
 
-    def save_and_exit(self, slot: int | None) -> dict:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
+        """Stop xemu and stage the launched title's saves for the dump.
+
+        Args:
+            slot: Ignored; there are no save states.
+
+        Returns:
+            The state fields all None (`state_saved`, `state_slot`,
+            `state_file`), plus `title_id` and `saves_extracted`, the number
+            of files staged.
+        """
         self.stop()
         _reap_strays()
         extracted = 0

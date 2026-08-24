@@ -9,47 +9,86 @@ import logging
 import re
 import secrets
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from starlette.websockets import WebSocket, WebSocketState
 
 from . import selkies
 
+if TYPE_CHECKING:
+    from .emulators.base import Emulator
+
 log = logging.getLogger(__name__)
 
-# The active play session, or None. Shape:
-# {
-#   "id", "active", "created_at",
-#   "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
-#   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
-#   "controller_token",
-#   "viewers": [{"token","slot","mk_control","username","permission"}...],
-#   "controller_slot", "mk_owner_token", "designated_speaker",
-#   "save_baseline": float, "emulator_obj": Emulator,
-# }
-SESSION: Optional[dict] = None
+SESSION: Optional[dict[str, Any]] = None
+"""The active play session, or None.
 
-# What is left of the session that just exited: {"id", "rom", "emulator_obj"}.
-# RomM files the exit state in its library after the teardown has answered, so
-# the emulator that captured it has to outlive the session for the read routes
-# to find the file. Dropped at the next activate.
-LAST_EXIT: Optional[dict] = None
+Shape:
 
-ROOM: dict = {"controller": None, "viewers": {}, "cooldowns": {}}
+```
+{
+  "id", "active", "created_at",
+  "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
+  "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
+  "controller_token",
+  "viewers": [{"token","slot","mk_control","username","permission"}...],
+  "controller_slot", "mk_owner_token", "designated_speaker",
+  "save_baseline": float, "emulator_obj": Emulator,
+}
+```
+"""
+
+LAST_EXIT: Optional[dict[str, Any]] = None
+"""What is left of the session that just exited: `{"id", "rom", "emulator_obj"}`.
+
+RomM files the exit state in its library after the teardown has answered, so
+the emulator that captured it has to outlive the session for the read routes
+to find the file. Dropped at the next activate.
+"""
+
+ROOM: dict[str, Any] = {"controller": None, "viewers": {}, "cooldowns": {}}
+"""Live websocket connections for the room.
+
+`controller` is the controller's connection info dict (or None while offline),
+`viewers` maps each online viewer's token to its connection info dict, and
+`cooldowns` tracks per-token rate limits.
+"""
 
 
-def _session_id(raw) -> str:
-    """A caller-supplied id, reduced to what is safe in the export filename.
+def _session_id(raw: object) -> str:
+    """Reduce a caller-supplied id to what is safe in the export filename.
 
     The exit archive is named after the session, and the export routes reject
     anything with path structure in it, so an id carrying a slash or a dot
     would produce an archive the parent could never fetch back.
+
+    Args:
+        raw: The `session_id` from the activate payload, of any type or None.
+
+    Returns:
+        `raw` stringified and stripped to `[A-Za-z0-9_-]`, at most 64
+        characters, or a fresh random hex id when nothing is left.
     """
     cleaned = re.sub(r"[^A-Za-z0-9_-]", "", str(raw or ""))[:64]
     return cleaned or secrets.token_hex(8)
 
 
-def new_session(payload: dict, emulator_obj, rom_file: str) -> dict:
+def new_session(payload: dict[str, Any], emulator_obj: "Emulator", rom_file: str) -> dict[str, Any]:
+    """Replace the module-level session with a fresh one built from the activate payload.
+
+    The controller starts with gamepad 1 and mouse/keyboard control; the viewer
+    list starts empty and the save baseline is the moment of creation.
+
+    Args:
+        payload: The activate request body; `emulator` is required, the rest
+            (`session_id`, `user`, `rom`, `save`, `callback`, `multiplayer`) is
+            optional.
+        emulator_obj: The emulator instance driving this session.
+        rom_file: The resolved path of the ROM file being played.
+
+    Returns:
+        The new session dict, which is also stored in `SESSION`.
+    """
     global SESSION, LAST_EXIT
     # The previous session's state is about to be cleared off the working slot,
     # and serving it under this session's rom would file it against the wrong
@@ -96,21 +135,43 @@ def retire_session() -> None:
     SESSION = None
 
 
-def find_viewer(token: str) -> Optional[dict]:
+def find_viewer(token: str) -> Optional[dict[str, Any]]:
+    """Look up a viewer entry in the active session by its token.
+
+    Args:
+        token: The viewer's streaming token.
+
+    Returns:
+        The viewer dict, or None when there is no session or no viewer holds
+        that token.
+    """
     if SESSION is None:
         return None
     return next((v for v in SESSION.get("viewers", []) if v["token"] == token), None)
 
 
-def add_viewer(permission: str, user: Optional[dict] = None) -> dict:
-    """Mint a viewer token. A re-join by the same user (matched by id, else
-    username) replaces the old entry and invalidates its token."""
+def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Mint a viewer token and add the viewer to the active session.
+
+    A re-join by the same user (matched by id, else username) replaces the old
+    entry and invalidates its token.
+
+    Args:
+        permission: The viewer's permission level, e.g. `readonly`.
+        user: The joining user's details (`id`, `display_name`, `username`), or
+            None for an anonymous viewer who gets a generated username.
+
+    Returns:
+        The new viewer dict: `{"token", "user_id", "slot", "mk_control",
+        "username", "permission"}`.
+    """
     import random
 
     user = user or {}
     username = user.get("display_name") or user.get("username")
 
-    def _same_user(v: dict) -> bool:
+    def _same_user(v: dict[str, Any]) -> bool:
+        """Whether viewer entry `v` belongs to the user now joining."""
         if user.get("id") is not None and v.get("user_id") is not None:
             return v["user_id"] == user["id"]
         return bool(username) and v.get("username") == username
@@ -129,7 +190,15 @@ def add_viewer(permission: str, user: Optional[dict] = None) -> dict:
     return viewer
 
 
-async def broadcast_to_room(payload: dict) -> None:
+async def broadcast_to_room(payload: dict[str, Any]) -> None:
+    """Send a JSON message to every connected room member.
+
+    Sends run concurrently; a failure on one socket is logged and does not
+    stop delivery to the others.
+
+    Args:
+        payload: The JSON-serializable message, normally carrying a `type` key.
+    """
     all_ws = []
     if ROOM.get("controller"):
         all_ws.append(ROOM["controller"]["websocket"])
@@ -147,6 +216,12 @@ async def broadcast_to_room(payload: dict) -> None:
 
 
 async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None:
+    """Relay a binary media frame to every connected room member except its sender.
+
+    Args:
+        payload: The raw frame in the room's binary wire format.
+        sender_ws: The websocket the frame arrived on; it is skipped.
+    """
     all_ws = []
     if ROOM.get("controller") and ROOM["controller"]["websocket"] != sender_ws:
         all_ws.append(ROOM["controller"]["websocket"])
@@ -166,6 +241,12 @@ async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None
 
 
 async def broadcast_state() -> None:
+    """Broadcast a `state_update` describing every room member to the room.
+
+    The controller is listed first, then each viewer with its online status,
+    mouse/keyboard ownership and, while connected, its public id. Does nothing
+    when there is no session.
+    """
     if SESSION is None:
         return
     controller_name = (SESSION.get("user") or {}).get("display_name") or "Controller"
@@ -200,6 +281,18 @@ async def broadcast_state() -> None:
 
 
 async def handle_assign_slot(viewer_token: str, slot: Optional[int]) -> None:
+    """Assign a gamepad slot to a room member, or take theirs away.
+
+    A slot can only be held by one member, so whoever held it before is
+    unassigned first. The new token map is pushed to selkies and a
+    `gamepad_change` notification is broadcast for every change made, followed
+    by a state update. Unknown tokens are logged and ignored.
+
+    Args:
+        viewer_token: The token of the member to change; the controller's own
+            token targets the controller.
+        slot: The gamepad slot to assign, or None to unassign.
+    """
     if SESSION is None:
         return
     target_user = None
@@ -258,6 +351,17 @@ async def handle_assign_slot(viewer_token: str, slot: Optional[int]) -> None:
 
 
 async def handle_assign_mk(target_token: Optional[str]) -> None:
+    """Hand mouse and keyboard control to a room member.
+
+    The controller's own token and None both mean control returns to the
+    controller. A no-op when the target already holds it; otherwise the token
+    map is pushed to selkies and an `mk_change` notification and a state update
+    are broadcast.
+
+    Args:
+        target_token: The token of the viewer to receive control, or None (or
+            the controller's token) to give it back to the controller.
+    """
     if SESSION is None:
         return
     if target_token == SESSION["controller_token"]:
@@ -285,6 +389,7 @@ async def handle_assign_mk(target_token: Optional[str]) -> None:
 
 
 async def notify_session_ended() -> None:
+    """Tell the room the session has ended and forget every connection."""
     await broadcast_to_room({"type": "session_ended"})
     ROOM["controller"] = None
     ROOM["viewers"] = {}

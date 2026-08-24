@@ -1,12 +1,13 @@
 """Exit-time save archive push to the parent (RomM).
 
-The broker is normally served same-origin under the parent's SUBFOLDER, so
+The broker is normally served same-origin under the parent's `SUBFOLDER`, so
 activate derives the callback base URL from the request that launched the
-session; an explicit callback.base_url in the activate payload overrides it
+session; an explicit `callback.base_url` in the activate payload overrides it
 for split-origin deployments.
 """
 
 import logging
+from typing import Any, Optional
 
 import httpx
 
@@ -15,20 +16,40 @@ from . import settings
 log = logging.getLogger(__name__)
 
 
-def public_view(callback: dict | None) -> dict | None:
-    """Callback info safe to echo in reports: everything but the token."""
+def public_view(callback: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the callback info that is safe to echo in reports: everything but the token.
+
+    Args:
+        callback: The session's callback dict, or None when the session has none.
+
+    Returns:
+        A copy of `callback` without its `token` key, or None when `callback` is
+        empty or None.
+    """
     if not callback:
         return None
     return {k: v for k, v in callback.items() if k != "token"}
 
 
 async def push_save_archive(
-    callback: dict, zip_bytes: bytes, filename: str, sess: dict
-) -> dict:
+    callback: dict[str, Any], zip_bytes: bytes, filename: str, sess: dict[str, Any]
+) -> dict[str, Any]:
     """POST the save archive to the callback origin as multipart form data.
 
-    Returns {"mode": "uploaded"|"failed", "ok": bool, "url", ...}. Failures
-    are reported, never raised: exit teardown must finish regardless.
+    Failures are reported, never raised: exit teardown must finish regardless.
+
+    Args:
+        callback: The session's callback dict; `base_url` is required and
+            `token`, when present, is sent as a bearer token.
+        zip_bytes: The archive body.
+        filename: The filename to attach to the multipart `archive` field.
+        sess: The session the archive belongs to; its id, emulator and rom are
+            sent as form fields alongside the archive.
+
+    Returns:
+        A report of the shape `{"mode": "uploaded" | "failed", "ok": bool, "url": str, ...}`,
+        carrying `status_code` when the server answered and `error` when the
+        upload failed.
     """
     url = callback["base_url"].rstrip("/") + settings.SAVE_UPLOAD_PATH
     headers = {}
