@@ -12,7 +12,6 @@ import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -58,7 +57,7 @@ def _rom(broker_dirs: dict[str, Path], name: str = "Game.iso") -> Path:
     return rom
 
 
-def _activate(client: TestClient, broker_dirs: dict[str, Path], **overrides: Any) -> httpx.Response:
+def _activate(client: TestClient, broker_dirs: dict[str, Path], **overrides: object) -> httpx.Response:
     """Post a well-formed activate request for the fake emulator.
 
     Args:
@@ -87,6 +86,18 @@ def test_health_answers_without_a_secret(client: TestClient) -> None:
 def test_status_is_inactive_before_anything_runs(client: TestClient) -> None:
     """Status reports inactive before anything runs."""
     assert client.get(f"{API}/session/status").json() == {"active": False}
+
+
+def test_status_requires_the_broker_secret_when_one_is_set(
+    secret_client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """Status requires X-Broker-Secret, unlike /health, since it exposes usernames and ROM details."""
+    response = secret_client.get(f"{API}/session/status")
+
+    assert response.status_code == 403
+
+    secret_client.headers["X-Broker-Secret"] = "s3cret"
+    assert secret_client.get(f"{API}/session/status").json() == {"active": False}
 
 
 def test_a_wrong_secret_is_refused(secret_client: TestClient, broker_dirs: dict[str, Path]) -> None:
@@ -667,6 +678,117 @@ def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
 def test_exiting_nothing_is_a_conflict(client: TestClient) -> None:
     """Exiting with no session running is a conflict."""
     assert client.post(f"{API}/session/exit").status_code == 409
+
+
+# ── callback.base_url scheme validation ─────────────────────────────────
+
+
+def test_activate_refuses_a_non_http_callback_scheme(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Activate refuses a non-http(s) callback scheme."""
+    response = _activate(
+        client, broker_dirs, callback={"base_url": "file:///etc/passwd", "token": "t"}
+    )
+
+    assert response.status_code == 422
+
+
+def test_activate_accepts_an_http_callback_scheme(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Activate accepts an http(s) callback scheme."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    response = _activate(
+        client, broker_dirs, callback={"base_url": "http://romm.example/api", "token": "t"}
+    )
+    assert response.status_code == 200
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["callback"]["base_url"] == "http://romm.example/api"
+    assert body["upload"]["callback"]["derived"] is False
+
+
+def test_activate_accepts_no_callback_and_derives_one(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Activate with no callback derives one from the request origin."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    response = _activate(client, broker_dirs)
+    assert response.status_code == 200
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["callback"]["derived"] is True
+
+
+# ── generic 500s that don't leak filesystem details ─────────────────────
+
+
+def test_state_file_read_failure_reports_no_path_or_exception_text(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+) -> None:
+    """A state-file read failure reports no path or exception text."""
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_file = blocker / "state.bin"
+
+    response = client.get(f"{API}/session/state-file")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not read state file"
+    assert str(blocker) not in response.text
+
+
+def test_state_screenshot_read_failure_reports_no_path_or_exception_text(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+) -> None:
+    """A state-screenshot read failure reports no path or exception text."""
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_screenshot_path = lambda: blocker / "shot.png"
+
+    response = client.get(f"{API}/session/state-screenshot")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not read screenshot"
+    assert str(blocker) not in response.text
+
+
+def test_state_file_write_failure_reports_no_path_or_exception_text(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    tmp_path: Path,
+) -> None:
+    """A state-file write failure reports no path or exception text."""
+    _activate(client, broker_dirs)
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"not a directory")
+    fake_emulator[0].state_file = blocker / "GAME.03.p2s"
+
+    response = client.put(
+        f"{API}/session/state-file", params={"filename": "GAME.01.p2s"}, content=b"pushed"
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == "could not write state file"
+    assert str(blocker) not in response.text
 
 
 def test_activate_records_a_multiplayer_session(

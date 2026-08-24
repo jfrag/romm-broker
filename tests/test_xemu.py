@@ -9,7 +9,7 @@ import os
 import struct
 import tomllib
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import NoReturn
 
 import pytest
 from pyfatx import Fatx
@@ -175,6 +175,17 @@ def test_a_symlink_out_of_the_rom_root_is_rejected(rom_root: Path, tmp_path: Pat
     assert xemu.Xemu.resolve_rom_file(None, folder) is None
 
 
+def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A direct path that is a symlink out of the ROM root is rejected."""
+    outside = tmp_path / "elsewhere.iso"
+    outside.write_bytes(b"x")
+    linked = rom_root / "Game.iso"
+    linked.symlink_to(outside)
+    assert xemu.Xemu.resolve_rom_file(None, linked) is None
+
+
 # ── HDD image location ───────────────────────────────────────────────────────
 
 
@@ -244,7 +255,7 @@ def test_a_qcow2_is_converted_in_place_and_backed_up(tmp_path: Path, monkeypatch
     image = tmp_path / "hdd.qcow2"
     image.write_bytes(xemu.QCOW2_MAGIC + b"rest of the qcow2")
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> Any:
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
         Path(cmd[-1]).write_bytes(b"raw content")
         return type("R", (), {"returncode": 0, "stderr": ""})()
 
@@ -265,7 +276,7 @@ def test_a_failed_conversion_leaves_the_qcow2_playable(
     original = xemu.QCOW2_MAGIC + b"rest of the qcow2"
     image.write_bytes(original)
 
-    def fake_run(cmd: list[str], **kwargs: Any) -> NoReturn:
+    def fake_run(cmd: list[str], **kwargs: object) -> NoReturn:
         raise xemu.subprocess.CalledProcessError(1, cmd, stderr="boom")
 
     monkeypatch.setattr(xemu.subprocess, "run", fake_run)
@@ -427,7 +438,7 @@ def test_an_unwritable_config_does_not_stop_the_launch(pinned: Path, monkeypatch
     """A config that cannot be written is left as it was and the pin does not raise."""
     pinned.write_text(FULL_TOML)
 
-    def fail(*args: Any, **kwargs: Any) -> NoReturn:
+    def fail(*args: object, **kwargs: object) -> NoReturn:
         raise OSError("read-only file system")
 
     monkeypatch.setattr(Path, "write_text", fail)
@@ -527,7 +538,9 @@ def emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> xemu.Xemu:
         An Xemu with its staging directory already created.
     """
     image = tmp_path / "xbox_hdd.qcow2"
-    Fatx.create(str(image))
+    # pyfatx defaults to an 8GB image; each of this file's 24 FATX tests
+    # gets a fresh one, which is enough to exhaust a CI runner's disk.
+    Fatx.create(str(image), size=64 * 1024 * 1024)
     monkeypatch.setattr(xemu, "XEMU_TOML", _toml(tmp_path, str(image)))
     em = xemu.Xemu()
     em.staging_dir.mkdir(parents=True, exist_ok=True)
@@ -626,6 +639,20 @@ def test_extract_is_empty_when_the_title_never_saved(emulator: xemu.Xemu) -> Non
     emulator._title_id = "4D530064"
 
     assert emulator._extract_saves() == 0
+
+
+def test_extract_skips_a_save_path_that_escapes_the_staging_dir(emulator: xemu.Xemu) -> None:
+    """Extraction skips a save path that escapes the staging directory.
+
+    libfatx does not reserve ".." as a directory name, so a save partition can carry a literal ".."
+    entry that fs.walk() reports as-is; reassembled into a path and resolved on the staging side, that
+    walks straight back out of staging_dir unless the extractor catches it first.
+    """
+    _seed(emulator.hdd_image, "/UDATA/../../evil.dat", b"stolen")
+    emulator._title_id = None
+
+    assert emulator._extract_saves() == 0
+    assert not (emulator.staging_dir.parent / "evil.dat").exists()
 
 
 def test_inject_writes_staged_files_into_the_image(emulator: xemu.Xemu) -> None:

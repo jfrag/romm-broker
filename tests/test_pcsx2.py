@@ -5,8 +5,9 @@ that never comes up.
 """
 
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
 import pytest
 
@@ -30,7 +31,24 @@ def sstate_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return d
 
 
-def _touch(path: Path, mtime: float | None = None) -> Path:
+@pytest.fixture
+def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point PCSX2's ROM root at a fresh directory under tmp_path.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        The ROM root directory.
+    """
+    root = tmp_path / "romm"
+    root.mkdir()
+    monkeypatch.setattr(pcsx2, "ROM_ROOT", root)
+    return root
+
+
+def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     """Write a placeholder state file, optionally with a fixed mtime.
 
     Args:
@@ -288,7 +306,9 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(
     monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
     monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: None)
 
-    def mock_thread(target: Any, args: tuple[Any, ...], daemon: bool) -> Any:
+    def mock_thread(
+        target: Callable[..., object], args: tuple[object, ...], daemon: bool
+    ) -> object:
         """Capture Thread calls and record (target.__name__, args)."""
         started.append((target.__name__, args))
         return type("MockThread", (), {"start": lambda s: None})()
@@ -301,3 +321,15 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(
     assert len(started) == 1
     assert started[0][0] == "_boot_watchdog"
     assert started[0][1] == (None, emu._launch_seq)
+
+
+def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A direct path that is a symlink escaping the ROM library resolves to None."""
+    outside = tmp_path / "elsewhere.iso"
+    outside.write_bytes(b"iso")
+    linked = rom_root / "Game.iso"
+    linked.symlink_to(outside)
+
+    assert pcsx2.Pcsx2().resolve_rom_file(linked) is None

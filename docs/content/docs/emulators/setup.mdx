@@ -154,9 +154,11 @@ launches. You may still want to adjust per-core or general settings from the
 RetroArch main GUI on the desktop. The same menu is reachable during a single
 game launch by pressing **F1**.
 
-BIOS files and other RetroArch assets are too varied to cover here, so see the
-[core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information)
-for what each core expects.
+BIOS files and other RetroArch assets are too varied to cover in full here.
+[retroarch_cores.md](https://github.com/romm-streaming/romm-broker/blob/master/docs/retroarch_cores.md)
+summarizes what each core this repo maps a platform to actually needs; for the
+authoritative per-core detail, defer to libretro's own
+[core-specific BIOS documentation](https://docs.libretro.com/library/bios/#links-to-the-core-specific-bios-information).
 
 ## RPCS3
 
@@ -164,6 +166,26 @@ RPCS3 needs its firmware installed from **File > Install Firmware**.
 Controllers are pre-set up.
 
 Adjust graphics settings as desired and run a game to confirm.
+
+> **Special note:** Saving a state in RPCS3 always closes the game, and there
+> is no live in-game load either, so a single game launch captures a state
+> only on exit (via the same in-game save-state hotkey a player would use)
+> and resumes at the next launch by booting straight into that state rather
+> than loading it after the fact. RPCS3's IPC has no save/load-state opcode
+> at all, so it is used only to confirm a launch actually reached a running
+> game and, when a game's title id can't be read from the file path alone,
+> to look it up once the game is confirmed running.
+>
+> A ROM stored as a `.7z`, `.zip`, or `.rar` archive is extracted on launch,
+> since RPCS3 cannot boot an archive directly. By default the extracted
+> copy is removed again once the game stops, so archiving a PS3 dump saves
+> library space without leaving a permanent decompressed copy on local
+> disk. Set `RPCS3_CACHE_ENABLED=true` to keep the extraction around and
+> reuse it on later launches instead, bounded by `RPCS3_CACHE_MAX_GB`
+> (default 30GB, oldest extraction evicted first). The cache lives at
+> `/config/.config/rpcs3/extracted`; if you enable it, point a dedicated
+> bind mount or Docker volume at that path so it doesn't compete with the
+> rest of `/config` for space.
 
 ## Cemu
 
@@ -210,4 +232,26 @@ kill rather than a clean exit, meaning only what the game already wrote to its
 own save survives. The RetroArch core supports both save states and a proper
 exit. Use standalone Azahar when you want its own interface, and pick
 `retroarch` otherwise.
+</Callout>
+
+## Flycast
+
+Flycast needs the Dreamcast BIOS pair, `dc_boot.bin` and `dc_flash.bin`.
+Upload them and place them in `/config/.local/share/flycast`, the same flat
+directory VMU saves and save states live in.
+
+Controllers are pre-configured. Set your graphics and audio preferences from
+the desktop and test a game.
+
+<Callout type="info">
+A RetroArch core also covers Dreamcast (`dc` defaults to it), for anyone who
+prefers RetroArch's shared save-state UI and hotkeys. Standalone Flycast has
+neither a control socket nor a SIGTERM handler, so the only way the broker
+asks it to shut down cleanly is an Alt+F4 keypress into its window, which is
+also the only moment it will write a save state. That means, like DuckStation,
+there is no mid-session save/load: a launch resumes from whatever state was
+written on the previous clean exit, and the current session's state is
+written once, on exit. Use standalone Flycast for its own interface and
+settings, and pick `retroarch` if you'd rather manage Dreamcast alongside your
+other RetroArch cores.
 </Callout>

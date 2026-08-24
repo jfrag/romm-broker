@@ -9,9 +9,9 @@ container brings its matching profile along and the paths line up.
 
 Shutdown: Eden's Qt frontend routes SIGTERM through the event loop into a
 normal window close (graceful emulation teardown). SIGINT is `_exit(1)` in
-Eden: never use it. The close path pops a confirmation dialog unless the
-`confirmStop` UI setting is Ask_Never, so that is patched before every
-launch.
+Eden, so the broker never sends it. The close path pops a confirmation
+dialog unless the `confirmStop` UI setting is Ask_Never, so that is patched
+before every launch.
 """
 
 import logging
@@ -19,6 +19,7 @@ import os
 import re
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -57,7 +58,7 @@ SIGTERM shutdown.
 """
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable file among `candidates`.
 
     Hidden files, non-files and anything resolving outside `ROM_ROOT` are
@@ -201,7 +202,7 @@ class Eden(Emulator):
     give SIGTERM room before escalating to SIGKILL.
     """
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The file Eden should boot for `path`.
 
         Args:
@@ -222,7 +223,7 @@ class Eden(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Patch qt-config.ini and boot the game fullscreen.
 
         Args:

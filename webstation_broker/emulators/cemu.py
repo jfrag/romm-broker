@@ -24,7 +24,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
@@ -191,7 +191,7 @@ def _pad_uuids() -> list[str]:
     return [f"0_{_sdl_guid(0)}", f"0_{_sdl_guid(_crc16(_PAD_NAME.encode()))}"]
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable file among `candidates`.
 
     Hidden files, non-files and anything resolving outside `ROM_ROOT` are
@@ -354,7 +354,7 @@ class Cemu(Emulator):
         """Stop a running Cemu so the archive can be extracted under it."""
         self.stop()
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The file Cemu should boot for `path`.
 
         Args:
@@ -375,7 +375,7 @@ class Cemu(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Patch settings, seed the pad profile and boot the game fullscreen.
 
         Args:
@@ -447,6 +447,6 @@ class Cemu(Emulator):
                 if p.is_file():
                     try:
                         os.utime(p, (now, now))
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
         return {"state_saved": None, "state_slot": None, "state_file": None}

@@ -9,7 +9,7 @@ why the redirect is a monkeypatch of those globals rather than of the env.
 import subprocess
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 from fastapi.testclient import TestClient
@@ -178,7 +178,7 @@ class FakeEmulator(Emulator):
         self.loaded_slots = []
         self.exit_slots = []
         self.running = True
-        self.state_file: Path | None = None
+        self.state_file: Optional[Path] = None
         self.swapped_discs: list[Path] = []
         self.swap_ok = True
 
@@ -198,7 +198,7 @@ class FakeEmulator(Emulator):
         """Record that the working slot was emptied."""
         self.cleared = True
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Pick the bootable file for a ROM path.
 
         Args:
@@ -213,7 +213,7 @@ class FakeEmulator(Emulator):
         candidates = sorted(p for p in path.glob("*") if p.suffix.lower() in self.rom_extensions)
         return candidates[0] if candidates else None
 
-    def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Optional[Path], resume_slot: Optional[int]) -> None:
         """Record the launch instead of spawning anything.
 
         Args:
@@ -246,7 +246,7 @@ class FakeEmulator(Emulator):
         self.loaded_slots.append(slot)
         return True
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
         """Report where the working slot's state lives.
 
         Returns:
@@ -254,7 +254,7 @@ class FakeEmulator(Emulator):
         """
         return self.state_file
 
-    def state_target(self, filename: str) -> Path | None:
+    def state_target(self, filename: str) -> Optional[Path]:
         """Report where a pushed state would be written.
 
         Args:
@@ -265,7 +265,7 @@ class FakeEmulator(Emulator):
         """
         return self.state_file
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Record the exit slot and stop.
 
         Args:

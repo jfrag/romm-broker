@@ -6,6 +6,7 @@ naming contract, the undo buffer, and finding the render window.
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -46,7 +47,7 @@ def state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return d
 
 
-def _touch(path: Path, mtime: float | None = None) -> Path:
+def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     """Write a placeholder file, creating parents, optionally with a fixed mtime.
 
     Args:
@@ -137,6 +138,18 @@ def test_resolve_searches_one_level_into_a_folder(rom_root: Path) -> None:
 def test_resolve_gives_up_on_a_path_that_is_not_there(rom_root: Path) -> None:
     """A path that does not exist resolves to None."""
     assert dolphin.Dolphin().resolve_rom_file(rom_root / "gone") is None
+
+
+def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A direct path that is a symlink escaping the ROM library resolves to None."""
+    outside = tmp_path / "elsewhere.rvz"
+    outside.write_bytes(b"rvz")
+    linked = rom_root / "Game.rvz"
+    linked.symlink_to(outside)
+
+    assert dolphin.Dolphin().resolve_rom_file(linked) is None
 
 
 @pytest.mark.parametrize(
@@ -264,6 +277,15 @@ def test_load_state_refuses_an_empty_slot(state_dir: Path) -> None:
     emu._send_key = lambda key: pytest.fail("hotkey sent at an empty slot")
 
     assert emu.load_state(1) is False
+
+
+def test_memory_card_is_gamecube_only(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """GC has a physical card, Wii saves live in NAND and have none."""
+    monkeypatch.setattr(dolphin, "USER_DIR", tmp_path)
+    emu = dolphin.Dolphin()
+    assert emu.memory_card_path(platform="ngc") == tmp_path / "GC"
+    assert emu.memory_card_path(platform="wii") is None
+    assert emu.memory_card_path() is None
 
 
 def test_exit_reports_the_working_slot_without_a_running_emulator(

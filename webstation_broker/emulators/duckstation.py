@@ -18,9 +18,10 @@ API symmetry.
 import logging
 import os
 import re
+import signal
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
@@ -88,7 +89,7 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image out of a set of candidate paths.
 
     Hidden files, unsupported extensions, non-files and anything resolving
@@ -219,7 +220,7 @@ def _resume_snapshot() -> dict[Path, tuple[int, float]]:
     return snap
 
 
-def _newest_resume_state() -> Path | None:
+def _newest_resume_state() -> Optional[Path]:
     """Find the newest `<serial>_resume.sav`.
 
     After a save restore the directory only holds this game's states, so
@@ -228,27 +229,30 @@ def _newest_resume_state() -> Path | None:
     Returns:
         The most recently modified resume state, or None when there is none.
     """
-    best: tuple[float, Path] | None = None
+    best: Optional[tuple[float, Path]] = None
     for p, (_size, mtime) in _resume_snapshot().items():
         if best is None or mtime > best[0]:
             best = (mtime, p)
     return best[1] if best is not None else None
 
 
-def _changed_resume_state(before: dict[Path, tuple[int, float]]) -> Path | None:
-    """Find a resume state that is new or has changed since `before` was taken.
+def _changed_resume_state(before: dict[Path, tuple[int, float]]) -> Optional[Path]:
+    """Find the newest resume state that is new or has changed since `before` was taken.
 
     Args:
         before: Snapshot from `_resume_snapshot` taken before the shutdown.
 
     Returns:
-        The first resume state whose size or mtime differs from the snapshot, or None when
-        nothing was written.
+        The most recently modified resume state whose size or mtime differs
+        from the snapshot, or None when nothing was written.
     """
+    best: Optional[tuple[float, Path]] = None
     for p, cur in _resume_snapshot().items():
         if before.get(p) != cur:
-            return p
-    return None
+            mtime = cur[1]
+            if best is None or mtime > best[0]:
+                best = (mtime, p)
+    return best[1] if best is not None else None
 
 
 class Duckstation(Emulator):
@@ -297,7 +301,25 @@ class Duckstation(Emulator):
     give it room before the SIGKILL escalation discards it.
     """
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def clear_working_slot(self) -> None:
+        """Drop every resume state left in SSTATE_DIR before a restore.
+
+        All titles share one flat directory, and _newest_resume_state()
+        picks whichever file is newest with no serial filter. A leftover
+        from an earlier session is otherwise indistinguishable from the
+        state a restore is about to write, so clearing everything here is
+        what keeps a stale file from being served as the new game's own.
+        """
+        if not SSTATE_DIR.is_dir():
+            return
+        for stale in SSTATE_DIR.glob("*_resume.sav"):
+            try:
+                stale.unlink()
+                log.info("cleared stale resume state %s", stale.name)
+            except OSError as exc:
+                log.warning("could not clear stale resume state %s: %s", stale.name, exc)
+
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.
 
         A file is taken as is. A directory is searched one level deep for the
@@ -321,7 +343,7 @@ class Duckstation(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance, patch settings.ini, and start duckstation-qt.
 
         The binary comes from env `DUCKSTATION_BIN` (default
@@ -348,7 +370,7 @@ class Duckstation(Emulator):
         log.info("launching duckstation (rom=%s, statefile=%s)", rom_path, state)
         self._spawn(cmd, base_launch_env())
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Stop the emulator and report the resume state its shutdown wrote.
 
         The save is the graceful shutdown: the savestates directory is
@@ -364,19 +386,41 @@ class Duckstation(Emulator):
             (a dict of `path`, `size` and `mtime` for the resume state, or None).
         """
         saved = False
-        state_file: dict[str, Any] | None = None
+        state_file: Optional[dict[str, Any]] = None
         was_alive = self.alive()
         before = _resume_snapshot()
+        proc = self._proc
         self.stop()
-        # DuckStation writes its resume state on the way out whatever we ask
-        # for, so an exit with no state requested just leaves it unreported and
-        # the emulator resumes from it locally as usual.
+        # SaveStateOnExit is forced true in _patch_ini, so DuckStation writes
+        # its resume state on every graceful shutdown regardless of `slot`;
+        # an exit with no state requested only skips reporting it here, the
+        # file still lands in the save archive dump since it is newer than
+        # the session baseline. We can only trust that write if SIGTERM was
+        # enough: a SIGKILL escalation (term_timeout exceeded), or stop()
+        # never confirming the process died at all, can cut the write off
+        # mid-flight. A killed process's changed file is discarded outright
+        # rather than just left unreported, since the archive dump sweeps up
+        # anything with a fresh mtime whether or not this method reports it.
+        killed = proc is None or proc.returncode is None or proc.returncode == -signal.SIGKILL
         if was_alive and slot is not None:
             p = _changed_resume_state(before)
-            saved = p is not None
-            if p is not None:
-                st = p.stat()
-                state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
-            else:
+            if killed:
+                log.warning(
+                    "duckstation had to be force-killed, discarding possibly-incomplete resume state"
+                )
+                if p is not None:
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        log.warning("could not discard incomplete resume state %s: %s", p, exc)
+            elif p is None:
                 log.warning("no resume state written during shutdown")
+            else:
+                try:
+                    st = p.stat()
+                except OSError as exc:
+                    log.warning("could not stat resume state %s: %s", p, exc)
+                else:
+                    saved = True
+                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}

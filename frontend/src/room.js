@@ -842,6 +842,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     window.addEventListener('blur', handlePageInteraction);
 
     let ws;
+    let reconnectTimer = null;
+    let reconnectAttempts = 0;
+    let sessionEnded = false;
+    const MAX_RECONNECT_ATTEMPTS = 8;
     let username = localStorage.getItem('collab_username');
     // Use the server-provided name and skip the join prompt; the prompt only
     // remains as a fallback when no name came with the token.
@@ -851,6 +855,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     let isSidebarVisible = false;
     let messageStore = {};
+    // A long-lived room otherwise grows messageStore and the chat DOM
+    // forever -- both are pruned to this many most-recent entries.
+    const MAX_STORED_MESSAGES = 200;
     let replyingTo = null;
     let notificationAudioCtx;
     let gamepadIcons = {};
@@ -1437,7 +1444,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const overlay = document.createElement('div');
         overlay.className = 'video-overlay';
         overlay.innerHTML = `
-            <span class="username">${username}</span>
+            <span class="username">${escapeHTML(username)}</span>
             <div class="remote-controls">
                 ${controllerControls}
                 <button class="remote-control-btn mute-audio" data-token="${token}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
@@ -1749,6 +1756,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         ws.onopen = () => {
             console.log('[WS] Collaboration WebSocket connected.');
+            reconnectAttempts = 0;
             if (COLLAB_DATA.userRole === 'controller') {
                 ws.send(JSON.stringify({ action: 'request_resolutions' }));
             }
@@ -1890,6 +1898,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                     break;
                 case 'chat_message':
                     messageStore[data.messageId] = data;
+                    while (Object.keys(messageStore).length > MAX_STORED_MESSAGES) {
+                        delete messageStore[Object.keys(messageStore)[0]];
+                    }
                     appendChatMessage(data, 'chat');
                     break;
                 case 'user_joined':
@@ -1910,14 +1921,30 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         };
 
-        ws.onclose = () => {
-            console.log('[WS] WebSocket closed.');
-            handleControllerDisconnect();
+        ws.onclose = (event) => {
+            console.log('[WS] WebSocket closed.', event.code);
+            // 1008 is the server explicitly rejecting the token/session (room.py)
+            // so retrying would just be rejected again; anything else (most
+            // commonly 1006, an abnormal closure with no close frame - a broker
+            // restart from uvicorn --reload, a session-teardown race, a network
+            // blip) is worth a few reconnect attempts before giving up.
+            if (sessionEnded || event.code === 1008 || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                handleControllerDisconnect();
+                return;
+            }
+            reconnectAttempts += 1;
+            const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 10000);
+            reconnectTimer = setTimeout(connectWebSocket, delay);
         };
         ws.onerror = (err) => console.error('[WS] WebSocket error:', err);
     };
 
     const handleControllerDisconnect = () => {
+        sessionEnded = true;
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
         document.getElementById('disconnection-overlay').classList.remove('hidden');
         const iframe = document.getElementById('session-frame');
         if (iframe) iframe.remove();
@@ -2295,14 +2322,17 @@ document.addEventListener('DOMContentLoaded', async () => {
                 case 'user_joined': content = t('systemMessages.userJoined', { username: escapeHTML(data.username) }); break;
                 case 'user_left': content = t('systemMessages.userLeft', { username: escapeHTML(data.username) }); break;
                 case 'username_changed': content = t('systemMessages.usernameChanged', { old_username: escapeHTML(data.old_username), new_username: escapeHTML(data.new_username) }); break;
-                case 'gamepad_change': content = data.message; break;
-                case 'mk_change': content = data.message; break;
+                case 'gamepad_change': content = escapeHTML(data.message); break;
+                case 'mk_change': content = escapeHTML(data.message); break;
             }
             msgEl.className = 'system-message';
             msgEl.innerHTML = `<span>${content}</span>`;
         }
         
         messagesContainer.appendChild(msgEl);
+        while (messagesContainer.children.length > MAX_STORED_MESSAGES) {
+            messagesContainer.removeChild(messagesContainer.firstChild);
+        }
 
         if (isScrolledToBottom) {
             scrollContainer.scrollTop = scrollContainer.scrollHeight;

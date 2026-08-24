@@ -9,6 +9,7 @@ import os
 import time
 import zipfile
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -21,7 +22,7 @@ BASELINE = OLD + 2000
 NEW = OLD + 3000
 
 
-def _write(path: Path, content: bytes = b"data", mtime: float | None = None) -> Path:
+def _write(path: Path, content: bytes = b"data", mtime: Optional[float] = None) -> Path:
     """Write a file, creating its parents and optionally pinning its mtime.
 
     Args:
@@ -220,6 +221,38 @@ def test_write_import_lands_the_archive_under_its_final_name(
     # The staging file exists only mid-write; a leftover would be handed to a
     # later activate as a restore source.
     assert list((tmp_path / "imports").glob("*.part")) == []
+
+
+def test_restore_refuses_an_archive_with_too_many_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Restore refuses an archive with more than SAVE_FILE_MAX_ENTRIES entries."""
+    from webstation_broker import settings
+
+    monkeypatch.setattr(settings, "SAVE_FILE_MAX_ENTRIES", 2)
+    content = _zip({"GC/a.bin": b"1", "GC/b.bin": b"2", "GC/c.bin": b"3"})
+
+    result = saves.extract_save_archive(content, tmp_path, ("GC",))
+
+    assert "more than 2 entries" in result["error"]
+    assert not (tmp_path / "GC").exists()
+
+
+def test_restore_skips_a_member_whose_directory_resolves_outside_root(tmp_path: Path) -> None:
+    """Restore skips a member whose directory resolves outside root via a symlink."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root = tmp_path / "root"
+    (root / "GC").mkdir(parents=True)
+    (root / "GC" / "linked").symlink_to(outside, target_is_directory=True)
+
+    result = saves.extract_save_archive(
+        _zip({"GC/linked/card.raw": b"x"}), root, ("GC",)
+    )
+
+    assert result["failed"] == 1
+    assert result["written"] == 0
+    assert not (outside / "card.raw").exists()
 
 
 def test_write_export_persists_the_dump(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

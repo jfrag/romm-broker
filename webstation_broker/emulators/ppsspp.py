@@ -29,7 +29,7 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
@@ -132,7 +132,7 @@ See the `SAVE_KEY` note for where 71/72 come from.
 """
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable ROM out of a set of candidate paths.
 
     Hidden files, unsupported extensions, non-files and anything resolving
@@ -245,7 +245,7 @@ def _patch_config() -> None:
     _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES)
 
 
-def _state_for_slot(slot: int) -> Path | None:
+def _state_for_slot(slot: int) -> Optional[Path]:
     """Find the most recently written state in `slot`.
 
     Args:
@@ -303,9 +303,9 @@ def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float
     """
     STABLE_SECS = 0.5
     POLL_SECS = 0.1
-    target: Path | None = None
-    last_size: int | None = None
-    stable_since: float | None = None
+    target: Optional[Path] = None
+    last_size: Optional[int] = None
+    stable_since: Optional[float] = None
     while time.monotonic() < deadline:
         after = _snapshot()
         if target is None:
@@ -331,7 +331,7 @@ def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float
     return False
 
 
-def _restamp_slot(filename: str, slot: int) -> str | None:
+def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     """Rename a state for `slot`, keeping the game id and version that tie it to its game.
 
     PPSSPP resolves a state by the game id (and version) in the name, so that
@@ -401,7 +401,7 @@ class Ppsspp(Emulator):
         super().__init__()
         self._launch_seq = 0
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the ROM to boot.
 
         A file is taken as is. A directory is searched one level deep for the
@@ -414,6 +414,14 @@ class Ppsspp(Emulator):
             The ROM to pass to PPSSPPQt, or None when there is nothing bootable.
         """
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None
@@ -425,7 +433,7 @@ class Ppsspp(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def _xdotool(self, *args: str) -> str | None:
+    def _xdotool(self, *args: str) -> Optional[str]:
         """Run one xdotool command against the session display.
 
         Args:
@@ -450,7 +458,7 @@ class Ppsspp(Emulator):
             return None
         return result.stdout
 
-    def _game_window(self) -> str | None:
+    def _game_window(self) -> Optional[str]:
         """Find the window PPSSPP is running the game in.
 
         Picked by title rather than the first match: before a game is loaded
@@ -489,7 +497,7 @@ class Ppsspp(Emulator):
             return False
         return self._xdotool("key", "--clearmodifiers", key) is not None
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance, patch the inis, and start PPSSPPQt.
 
         The binary comes from env `PPSSPP_BIN` (default `PPSSPPQt`). With
@@ -576,11 +584,11 @@ class Ppsspp(Emulator):
             return False
         return self._send_key(LOAD_KEY)
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""
         return _state_for_slot(STATE_SLOT)
 
-    def state_screenshot_path(self) -> Path | None:
+    def state_screenshot_path(self) -> Optional[Path]:
         """Return the `.jpg` PPSSPP wrote beside the current state, or None when there is none."""
         state = self.state_path()
         if state is None:
@@ -606,7 +614,7 @@ class Ppsspp(Emulator):
             except OSError as exc:
                 log.warning("could not clear stale state %s: %s", stale.name, exc)
 
-    def state_target(self, filename: str) -> Path | None:
+    def state_target(self, filename: str) -> Optional[Path]:
         """Map a pushed state's filename to where it may be written.
 
         With the slot already holding a state, a pushed name has to match it;
@@ -630,7 +638,7 @@ class Ppsspp(Emulator):
             return existing if restamped == existing.name else None
         return STATE_DIR / restamped
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save a state if asked, then stop the emulator.
 
         Args:
@@ -643,14 +651,19 @@ class Ppsspp(Emulator):
             saved state, or None).
         """
         saved = False
-        state_file: dict[str, Any] | None = None
+        state_file: Optional[dict[str, Any]] = None
         if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
                 p = self.state_path()
                 if p is not None:
-                    st = p.stat()
-                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                    try:
+                        st = p.stat()
+                    except OSError as exc:
+                        log.warning("could not stat saved state %s: %s", p, exc)
+                        saved = False
+                    else:
+                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         return {
             "state_saved": saved,

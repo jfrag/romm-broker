@@ -7,8 +7,9 @@ gate, and playlist-driven disc swapping.
 import json
 import logging
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 import pytest
 
@@ -270,7 +271,12 @@ class TestResumeGate:
                 args: The positional arguments the thread was built with.
             """
 
-            def __init__(self, target: Any = None, args: tuple[Any, ...] = (), daemon: bool = False) -> None:
+            def __init__(
+                self,
+                target: Optional[Callable[..., object]] = None,
+                args: tuple[object, ...] = (),
+                daemon: bool = False,
+            ) -> None:
                 """Remember the args; the target is never run.
 
                 Args:
@@ -287,7 +293,7 @@ class TestResumeGate:
         monkeypatch.setattr(retroarch.threading, "Thread", FakeThread)
         return started
 
-    def _launch(self, tmp_path: Path, resume_slot: int | None) -> retroarch.Retroarch:
+    def _launch(self, tmp_path: Path, resume_slot: Optional[int]) -> retroarch.Retroarch:
         """Launch a snes session against a throwaway ROM path.
 
         Args:
@@ -377,6 +383,21 @@ class TestPlaylistPreference:
         emulator.platform = "dc"
         assert emulator.resolve_rom_file(game) == (game / "Game.m3u").resolve()
 
+    def test_a_direct_path_that_is_a_symlink_out_of_the_rom_root_is_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A direct path that is a symlink out of the ROM root is rejected."""
+        monkeypatch.setattr(retroarch, "ROM_ROOT", tmp_path / "romm")
+        (tmp_path / "romm").mkdir()
+        outside = tmp_path / "elsewhere.chd"
+        outside.write_bytes(b"x")
+        linked = tmp_path / "romm" / "Game.chd"
+        linked.symlink_to(outside)
+
+        emulator = retroarch.Retroarch()
+        emulator.platform = "dc"
+        assert emulator.resolve_rom_file(linked) is None
+
 
 class TestPlaylistHelpers:
     """Reading a .m3u the way RetroArch does.
@@ -451,7 +472,9 @@ class TestSwapDisc:
         emulator.platform = "dc"
         emulator.sent = []
 
-        def fake_send(cmd: str, wait_prefix: Any = None, timeout: float = 5.0) -> str | None:
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -523,7 +546,9 @@ class TestSwapDisc:
         state = {"alive": True}
         monkeypatch.setattr(emulator, "alive", lambda: state["alive"])
 
-        def fake_send(cmd: str, wait_prefix: Any = None, timeout: float = 5.0) -> str | None:
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -545,7 +570,9 @@ class TestSwapDisc:
         _deferred_load_state guards against with _launch_seq.
         """
 
-        def fake_send(cmd: str, wait_prefix: Any = None, timeout: float = 5.0) -> str | None:
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 # A relaunch races the wait and wins: a new session starts and
@@ -599,7 +626,9 @@ class TestSwapDisc:
         process's stdin, which reads self._proc live.
         """
 
-        def fake_send(cmd: str, wait_prefix: Any = None, timeout: float = 5.0) -> str | None:
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"
@@ -637,7 +666,9 @@ class TestSwapDisc:
         entered_sequence = threading.Event()
         release_winner = threading.Event()
 
-        def fake_send(cmd: str, wait_prefix: Any = None, timeout: float = 5.0) -> str | None:
+        def fake_send(
+            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+        ) -> Optional[str]:
             emulator.sent.append(cmd)
             if cmd == "GET_STATUS":
                 return "GET_STATUS PLAYING dc,Game,0"

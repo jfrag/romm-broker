@@ -20,9 +20,17 @@ from fastapi import APIRouter
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import session
+from .api import _ct_eq
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+# Comfortably above any legitimate text frame (chat caps at 500 chars,
+# username at 25); rejects a flood of oversized frames before json.loads
+# ever runs on them.
+MAX_TEXT_FRAME_BYTES = 8 * 1024
+
+CHAT_COOLDOWN_SECONDS = 1.0
 
 
 @router.websocket("/ws/room")
@@ -52,7 +60,7 @@ async def room_websocket(websocket: WebSocket) -> None:
         await websocket.close(code=1008)
         return
 
-    is_controller = token == sess["controller_token"]
+    is_controller = _ct_eq(token, sess["controller_token"])
     viewer_ref = session.find_viewer(token)
     is_viewer = viewer_ref is not None
     if not is_controller and not is_viewer:
@@ -91,6 +99,14 @@ async def room_websocket(websocket: WebSocket) -> None:
                 break
 
             if "text" in message:
+                if len(message["text"]) > MAX_TEXT_FRAME_BYTES:
+                    # 8 KiB is already comfortably above any legitimate text
+                    # frame, so one oversized frame is abuse, not a benign
+                    # edge case -- close instead of dropping and letting an
+                    # attacker hold the connection open for a repeat flood.
+                    log.warning("room websocket: oversized text frame from %s, closing", username)
+                    await websocket.close(code=1009)
+                    return
                 data = json.loads(message["text"])
                 action = data.get("action")
                 data["sender_token"] = token
@@ -106,8 +122,13 @@ async def room_websocket(websocket: WebSocket) -> None:
                     await session.broadcast_state()
 
                 elif action == "set_username" and is_viewer:
+                    # Keyed by token in session.ROOM["cooldowns"], not on
+                    # connection_info: a fresh WebSocket reconnect gets a new
+                    # connection_info every time, which would otherwise reset
+                    # the cooldown for free.
+                    cooldowns = session.ROOM["cooldowns"].setdefault(token, {})
                     now = time.time()
-                    if now - connection_info.get("last_username_change", 0) < 2.0:
+                    if now - cooldowns.get("username", 0) < 2.0:
                         continue
                     new_username = data.get("username", "").strip()
                     if new_username and 1 <= len(new_username) <= 25:
@@ -115,7 +136,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                         if old_username == new_username:
                             continue
                         viewer_ref["username"] = new_username
-                        connection_info["last_username_change"] = now
+                        cooldowns["username"] = now
                         connection_info["username"] = new_username
                         username = new_username
                         await session.broadcast_to_room(
@@ -129,8 +150,14 @@ async def room_websocket(websocket: WebSocket) -> None:
                         await session.broadcast_state()
 
                 elif action == "send_chat_message":
+                    # Same reconnect-proof keying as set_username above.
+                    cooldowns = session.ROOM["cooldowns"].setdefault(token, {})
+                    now = time.time()
+                    if now - cooldowns.get("chat", 0) < CHAT_COOLDOWN_SECONDS:
+                        continue
                     text = data.get("message", "").strip()
                     if text and 1 <= len(text) <= 500:
+                        cooldowns["chat"] = now
                         await session.broadcast_to_room(
                             {
                                 "type": "chat_message",
@@ -143,7 +170,15 @@ async def room_websocket(websocket: WebSocket) -> None:
                         )
 
                 elif action in ("video_state", "audio_state", "force_cursor_render"):
-                    await session.broadcast_to_room({"type": "control", "payload": data})
+                    # Self-reported (webcam/mic) or self-triggered (gaming-mode
+                    # cursor baking by a non-controller viewer, so this can't be
+                    # gated to the controller); sender_token above already stops
+                    # a client from spoofing another user's identity in it. The
+                    # only thing left to enforce is that state is actually a
+                    # boolean flag, not an arbitrary value forwarded verbatim
+                    # into the Selkies input channel.
+                    if data.get("state") in (0, 1):
+                        await session.broadcast_to_room({"type": "control", "payload": data})
 
                 elif action == "request_resolutions" and is_controller:
                     await session.broadcast_to_room({"type": "request_resolutions"})

@@ -8,6 +8,7 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -67,7 +68,7 @@ def save_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return save
 
 
-def _touch(path: Path, mtime: float | None = None) -> Path:
+def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     """Write a placeholder file, creating parents, optionally with a fixed mtime.
 
     Args:

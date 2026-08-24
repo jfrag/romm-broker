@@ -4,7 +4,7 @@ Covers session id sanitising, the session lifecycle, viewer seats and the token 
 on.
 """
 
-from typing import Any
+from typing import Any, Optional
 
 import pytest
 
@@ -13,7 +13,7 @@ from webstation_broker import selkies, session
 from .conftest import FakeEmulator
 
 
-def _activate(session_id: str = "sess-1", user: dict[str, Any] | None = None) -> dict[str, Any]:
+def _activate(session_id: str = "sess-1", user: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Start a session on a FakeEmulator with a minimal activate body.
 
     Args:

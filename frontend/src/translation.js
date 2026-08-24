@@ -8,7 +8,7 @@ const en = {
     exit: {
         confirm: 'Exit the game? The current state will be saved and the session will end for everyone.',
         failed: 'Exit failed: {message}',
-        summary: 'Saved state: {state} — dumped {files} save file(s), {bytes} bytes.',
+        summary: 'Saved state: {state}, dumped {files} save file(s), {bytes} bytes.',
     },
     settings: {
         title: 'Settings',

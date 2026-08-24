@@ -6,6 +6,7 @@ naming contract, and finding the game window among PPSSPP's windows.
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -46,7 +47,7 @@ def state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     return d
 
 
-def _touch(path: Path, mtime: float | None = None) -> Path:
+def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     """Write a placeholder file, creating parents, optionally with a fixed mtime.
 
     Args:
@@ -111,6 +112,18 @@ def test_resolve_searches_one_level_into_a_folder(rom_root: Path) -> None:
 def test_resolve_gives_up_on_a_path_that_is_not_there(rom_root: Path) -> None:
     """A path that does not exist resolves to None."""
     assert ppsspp.Ppsspp().resolve_rom_file(rom_root / "gone") is None
+
+
+def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A direct path that is a symlink escaping the ROM library resolves to None."""
+    outside = tmp_path / "elsewhere.iso"
+    outside.write_bytes(b"iso")
+    linked = rom_root / "Game.iso"
+    linked.symlink_to(outside)
+
+    assert ppsspp.Ppsspp().resolve_rom_file(linked) is None
 
 
 @pytest.mark.parametrize(

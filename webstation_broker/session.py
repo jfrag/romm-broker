@@ -9,7 +9,7 @@ import logging
 import re
 import secrets
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from starlette.websockets import WebSocket, WebSocketState
 
@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-SESSION: dict[str, Any] | None = None
+SESSION: Optional[dict[str, Any]] = None
 """The active play session, or None.
 
 Shape:
@@ -38,7 +38,7 @@ Shape:
 ```
 """
 
-LAST_EXIT: dict[str, Any] | None = None
+LAST_EXIT: Optional[dict[str, Any]] = None
 """What is left of the session that just exited: `{"id", "rom", "emulator_obj"}`.
 
 RomM files the exit state in its library after the teardown has answered, so
@@ -46,15 +46,16 @@ the emulator that captured it has to outlive the session for the read routes
 to find the file. Dropped at the next activate.
 """
 
-ROOM: dict[str, Any] = {"controller": None, "viewers": {}}
+ROOM: dict[str, Any] = {"controller": None, "viewers": {}, "cooldowns": {}}
 """Live websocket connections for the room.
 
-`controller` is the controller's connection info dict (or None while offline)
-and `viewers` maps each online viewer's token to its connection info dict.
+`controller` is the controller's connection info dict (or None while offline),
+`viewers` maps each online viewer's token to its connection info dict, and
+`cooldowns` tracks per-token rate limits.
 """
 
 
-def _session_id(raw: Any) -> str:
+def _session_id(raw: object) -> str:
     """Reduce a caller-supplied id to what is safe in the export filename.
 
     The exit archive is named after the session, and the export routes reject
@@ -134,7 +135,7 @@ def retire_session() -> None:
     SESSION = None
 
 
-def find_viewer(token: str) -> dict[str, Any] | None:
+def find_viewer(token: str) -> Optional[dict[str, Any]]:
     """Look up a viewer entry in the active session by its token.
 
     Args:
@@ -149,7 +150,7 @@ def find_viewer(token: str) -> dict[str, Any] | None:
     return next((v for v in SESSION.get("viewers", []) if v["token"] == token), None)
 
 
-def add_viewer(permission: str, user: dict[str, Any] | None = None) -> dict[str, Any]:
+def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Mint a viewer token and add the viewer to the active session.
 
     A re-join by the same user (matched by id, else username) replaces the old
@@ -279,7 +280,7 @@ async def broadcast_state() -> None:
     )
 
 
-async def handle_assign_slot(viewer_token: str, slot: int | None) -> None:
+async def handle_assign_slot(viewer_token: str, slot: Optional[int]) -> None:
     """Assign a gamepad slot to a room member, or take theirs away.
 
     A slot can only be held by one member, so whoever held it before is
@@ -349,7 +350,7 @@ async def handle_assign_slot(viewer_token: str, slot: int | None) -> None:
     await broadcast_state()
 
 
-async def handle_assign_mk(target_token: str | None) -> None:
+async def handle_assign_mk(target_token: Optional[str]) -> None:
     """Hand mouse and keyboard control to a room member.
 
     The controller's own token and None both mean control returns to the
@@ -392,3 +393,4 @@ async def notify_session_ended() -> None:
     await broadcast_to_room({"type": "session_ended"})
     ROOM["controller"] = None
     ROOM["viewers"] = {}
+    ROOM["cooldowns"] = {}

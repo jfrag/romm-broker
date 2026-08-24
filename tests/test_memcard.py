@@ -8,6 +8,8 @@ import io
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from webstation_broker import memcard
 
 MARKER = "_pcsx2_superblock"
@@ -167,6 +169,22 @@ def test_replace_leaves_no_staging_or_backup_behind(tmp_path: Path) -> None:
     memcard.replace(card, _zip({"BMINE-00001/save.bin": b"mine"}), MARKER)
 
     assert sorted(p.name for p in tmp_path.iterdir()) == ["Slot 1"]
+
+
+def test_replace_refuses_an_archive_with_too_many_entries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replace refuses an archive with more than SAVE_FILE_MAX_ENTRIES entries."""
+    from webstation_broker import settings
+
+    monkeypatch.setattr(settings, "SAVE_FILE_MAX_ENTRIES", 2)
+    card = tmp_path / "Slot 1"
+    content = _zip({"a.bin": b"1", "b.bin": b"2", "c.bin": b"3"})
+
+    result = memcard.replace(card, content, MARKER)
+
+    assert "more than 2 entries" in result
+    assert not card.exists()
 
 
 def test_a_replaced_card_captures_back_to_the_same_members(tmp_path: Path) -> None:

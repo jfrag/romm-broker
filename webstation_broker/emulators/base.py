@@ -12,7 +12,7 @@ import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 log = logging.getLogger(__name__)
 
@@ -30,19 +30,31 @@ leaves one playing with no handle on it, and the next launch stacks a second
 emulator on top of the first.
 """
 
+# Explicitly named broker secrets, plus a suffix pattern for anything shaped
+# like one, stripped from every spawned emulator's environment. RetroArch in
+# particular dlopen()s third-party cores with no sandboxing; a compromised
+# core inheriting these could impersonate the broker's own API client.
+_SENSITIVE_ENV_VARS = {"BROKER_SECRET", "SELKIES_MASTER_TOKEN", "GITHUB_TOKEN"}
+_SENSITIVE_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_PASSWORD", "_KEY")
+
 
 def base_launch_env() -> dict[str, str]:
     """Build the environment apps are launched into.
 
     This is the broker's own environment, pointed at the running labwc session's
     displays (`BROKER_WAYLAND_DISPLAY` and `BROKER_DISPLAY`, defaulting to
-    `wayland-0` and `:0`).
+    `wayland-0` and `:0`), with secret-shaped variables stripped out (see
+    `_SENSITIVE_ENV_VARS`).
 
     Returns:
         A copy of the broker's environment with the display variables set and
         the emulator binary directories appended to `PATH`.
     """
-    env = dict(os.environ)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _SENSITIVE_ENV_VARS and not k.endswith(_SENSITIVE_ENV_SUFFIXES)
+    }
     env["WAYLAND_DISPLAY"] = os.environ.get("BROKER_WAYLAND_DISPLAY", "wayland-0")
     env["DISPLAY"] = os.environ.get("BROKER_DISPLAY", ":0")
     # s6 services get a minimal PATH; emulator binaries live in /usr/games.
@@ -103,7 +115,7 @@ def _cmdline(pid: int) -> list[str]:
     return [part for part in raw.decode(errors="replace").split("\0") if part]
 
 
-def reap_orphan() -> dict[str, Any] | None:
+def reap_orphan() -> Optional[dict[str, Any]]:
     """Kill an emulator left running by an earlier broker process.
 
     Only ever kills the pid the broker itself recorded, and only while that pid
@@ -251,14 +263,14 @@ class Emulator:
     """Where the emulator's stdout and stderr are appended."""
     term_timeout: float = 5.0
     """Seconds SIGTERM gets before escalating to SIGKILL."""
-    memory_card_subtree: str | None = None
+    memory_card_subtree: Optional[str] = None
     """The save subtree holding the whole memory card, for emulators that have one.
 
     With whole-card sync on, that subtree travels on the memory-card routes
     instead of inside the save archive, so activate drops it from the restore
     and exit drops it from the dump.
     """
-    memory_card_marker: str | None = None
+    memory_card_marker: Optional[str] = None
     """A file the emulator looks for inside the card directory before it treats it as a card.
 
     The broker lays it down empty, the way the emulator does when it creates a
@@ -267,7 +279,7 @@ class Emulator:
 
     def __init__(self) -> None:
         """Start with no process handle and no boot failure flagged."""
-        self._proc: subprocess.Popen[bytes] | None = None
+        self._proc: Optional[subprocess.Popen[bytes]] = None
         self.boot_failed: bool = False
         """Whether the process is alive but never reached a running game.
 
@@ -357,7 +369,7 @@ class Emulator:
         newer-file guard would wrongly keep over the archived one.
         """
 
-    def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Optional[Path], resume_slot: Optional[int]) -> None:
         """Start the emulator on `rom_path`, optionally resuming a state.
 
         Args:
@@ -405,7 +417,7 @@ class Emulator:
         """
         raise NotImplementedError
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
         """The file the working slot holds right now, or None if it is empty.
 
         This is what the state-file GET serves, so it has to be the file the
@@ -418,7 +430,7 @@ class Emulator:
         """
         return None
 
-    def state_screenshot_path(self) -> Path | None:
+    def state_screenshot_path(self) -> Optional[Path]:
         """The frame captured alongside the working slot's state, or None.
 
         Only for emulators that write the thumbnail as a separate file. The
@@ -439,19 +451,21 @@ class Emulator:
         this alone; the override exists for the ones that cannot.
         """
 
-    def memory_card_path(self) -> Path | None:
+    def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
         """The directory holding the card the memory-card routes sync, or None.
 
         The broker names the card rather than reading the name out of the
         emulator's own config, because RomM lays a card down before the first
-        launch has written that config.
+        launch has written that config. `platform` is the ROM's platform slug,
+        for an emulator whose card exists on only one of several platforms it
+        serves (GameCube vs Wii on Dolphin); most emulators ignore it.
 
         Returns:
             The card directory, or None for emulators without a memory card.
         """
         return None
 
-    def state_target(self, filename: str) -> Path | None:
+    def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
 
         Validating the name against the emulator's own convention is what keeps
@@ -492,7 +506,7 @@ class Emulator:
             time.sleep(poll)
         return self.state_path() is not None
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save state (best effort) and stop.
 
         Default: nothing to save. A `slot` of None is an exit that writes no
@@ -514,7 +528,7 @@ class Emulator:
         self.stop()
         return {"state_saved": None, "state_slot": None, "state_file": None}
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """File the emulator should boot for `path` (folder or file).
 
         Args:

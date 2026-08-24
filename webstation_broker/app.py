@@ -13,6 +13,9 @@ from contextlib import asynccontextmanager
 import anyio.to_thread
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.requests import Request
+from starlette.responses import Response
 
 from . import api, room, settings
 from .emulators.base import reap_orphan
@@ -60,6 +63,18 @@ def create_app() -> FastAPI:
     )
     inner.include_router(api.router)
     inner.include_router(room.router)
+
+    @inner.middleware("http")
+    async def _no_referrer(
+        request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
+        # Session/viewer tokens travel as ?token= query params (WS auth has no
+        # header alternative, and the room is iframe-embedded); a leaked
+        # Referer header would hand a live token to whatever the page links
+        # out to.
+        response = await call_next(request)
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     if not settings.DEV_MODE and settings.FRONTEND_DIST.is_dir():
         inner.mount(

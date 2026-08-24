@@ -7,7 +7,7 @@ for split-origin deployments.
 """
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -16,7 +16,7 @@ from . import settings
 log = logging.getLogger(__name__)
 
 
-def public_view(callback: dict[str, Any] | None) -> dict[str, Any] | None:
+def public_view(callback: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Return the callback info that is safe to echo in reports: everything but the token.
 
     Args:

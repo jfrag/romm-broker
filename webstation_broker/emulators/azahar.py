@@ -25,7 +25,7 @@ import re
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from .base import Emulator, base_launch_env
 
@@ -122,7 +122,7 @@ modal behind in a session nobody can click.
 """
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable file among `candidates`.
 
     Hidden files, non-files and anything resolving outside `ROM_ROOT` are
@@ -258,7 +258,7 @@ class Azahar(Emulator):
         """Stop a running Azahar so the archive can be extracted under it."""
         self.stop()
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The file Azahar should boot for `path`.
 
         Args:
@@ -279,7 +279,7 @@ class Azahar(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Patch qt-config.ini and boot the game windowed.
 
         Args:
@@ -319,7 +319,7 @@ class Azahar(Emulator):
                     if not high.is_dir() or not _HEX8_RE.match(high.name):
                         continue
                     for title in sorted(high.iterdir()):
-                        if not title.is_dir():
+                        if not title.is_dir() or not _HEX8_RE.match(title.name):
                             continue
                         try:
                             if any(
@@ -349,10 +349,13 @@ class Azahar(Emulator):
         # titles' saves stay filtered out.
         now = time.time()
         for d in self._modified_title_saves():
-            for p in d.rglob("*"):
-                if p.is_file():
-                    try:
-                        os.utime(p, (now, now))
-                    except OSError:
-                        pass
+            try:
+                for p in d.rglob("*"):
+                    if p.is_file():
+                        try:
+                            os.utime(p, (now, now))
+                        except OSError as exc:
+                            log.warning("could not restamp %s, may be dropped from the dump: %s", p, exc)
+            except OSError as exc:
+                log.warning("could not walk %s, save dump may be incomplete: %s", d, exc)
         return {"state_saved": None, "state_slot": None, "state_file": None}

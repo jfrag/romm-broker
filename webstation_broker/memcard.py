@@ -14,7 +14,9 @@ import shutil
 import zipfile
 from pathlib import Path, PurePosixPath
 from threading import Lock
+from typing import Optional, Union
 
+from . import settings
 from .saves import SAVE_FILE_MAX_BYTES
 
 log = logging.getLogger(__name__)
@@ -42,7 +44,7 @@ def _card_files(card: Path) -> list[Path]:
     return [p for p in sorted(card.rglob("*")) if p.is_file() and not p.is_symlink()]
 
 
-def _is_blank_marker(path: Path, card: Path, marker: str | None) -> bool:
+def _is_blank_marker(path: Path, card: Path, marker: Optional[str]) -> bool:
     """Whether `path` is the marker file while it is still the empty one we laid down.
 
     Args:
@@ -61,7 +63,7 @@ def _is_blank_marker(path: Path, card: Path, marker: str | None) -> bool:
         return False
 
 
-def ensure_card(card: Path, marker: str | None) -> None:
+def ensure_card(card: Path, marker: Optional[str]) -> None:
     """Have a card the emulator will actually open waiting at `card`.
 
     A bare directory is not enough. PCSX2 skips any directory in its memcards
@@ -79,7 +81,7 @@ def ensure_card(card: Path, marker: str | None) -> None:
         (card / marker).touch(exist_ok=True)
 
 
-def build_archive(card: Path, marker: str | None = None) -> bytes | None | str:
+def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[bytes, str]]:
     """Zip the whole card at `card`, members relative to the card root.
 
     Relative so the image carries no trace of the card's name and can be laid
@@ -124,7 +126,7 @@ def build_archive(card: Path, marker: str | None = None) -> bytes | None | str:
     return buf.getvalue()
 
 
-def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
+def replace(card: Path, content: bytes, marker: Optional[str] = None) -> Union[int, str]:
     """Wipe the card at `card` and lay the pulled image down in its place.
 
     The whole card is replaced with no per-file merge: that is what isolates
@@ -153,6 +155,8 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
         infos = [i for i in zf.infolist() if not i.is_dir()]
         if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
             return "archive exceeds size limit when extracted"
+        if len(infos) > settings.SAVE_FILE_MAX_ENTRIES:
+            return f"archive holds more than {settings.SAVE_FILE_MAX_ENTRIES} entries"
         for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
@@ -170,8 +174,14 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
             # the emulator ignores. An image carrying its own marker wins.
             if marker:
                 (staging / marker).touch()
+            staging_real = staging.resolve()
             for info in infos:
                 target = staging / PurePosixPath(info.filename)
+                # Belt-and-suspenders on top of the member-path check above:
+                # confirms the resolved write location is still under the
+                # (still-empty, pre-swap) staging dir.
+                if not target.parent.resolve().is_relative_to(staging_real):
+                    raise ValueError(f"archive member resolves outside staging dir: {info.filename}")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(zf.read(info))
                 written += 1
@@ -180,7 +190,7 @@ def replace(card: Path, content: bytes, marker: str | None = None) -> int | str:
             if card.exists():
                 os.replace(card, backup)
             os.replace(staging, card)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             shutil.rmtree(staging, ignore_errors=True)
             if not card.exists() and backup.exists():
                 try:

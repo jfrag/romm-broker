@@ -34,7 +34,7 @@ import time
 import tomllib
 from collections.abc import Iterable
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, Optional
 
 from pyfatx import Fatx
 
@@ -268,7 +268,7 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image among `candidates`.
 
     Hidden files, non-files and anything resolving outside `ROM_ROOT` are
@@ -380,7 +380,7 @@ video partition up front.
 """
 
 
-def _xiso_root_dir(fh: IO[bytes]) -> tuple[int, int, int] | None:
+def _xiso_root_dir(fh: IO[bytes]) -> Optional[tuple[int, int, int]]:
     """Locate the root directory of the disc's game partition.
 
     Args:
@@ -400,7 +400,7 @@ def _xiso_root_dir(fh: IO[bytes]) -> tuple[int, int, int] | None:
     return None
 
 
-def _xiso_find_entry(table: bytes, name: bytes) -> tuple[int, int] | None:
+def _xiso_find_entry(table: bytes, name: bytes) -> Optional[tuple[int, int]]:
     """Find `name` in one XISO directory table.
 
     Entries form a binary tree; left/right links are dword offsets into the
@@ -436,7 +436,7 @@ def _xiso_find_entry(table: bytes, name: bytes) -> tuple[int, int] | None:
     return None
 
 
-def _disc_title_id(rom_path: Path) -> str | None:
+def _disc_title_id(rom_path: Path) -> Optional[str]:
     """Title id from the disc's default.xbe certificate.
 
     Formatted the way the Xbox names save dirs (`E:/UDATA/<id>`): eight
@@ -489,7 +489,7 @@ def _disc_title_id(rom_path: Path) -> str | None:
 # ── FATX access (pyfatx surfaces libfatx errors as bare AssertionError) ──────
 
 
-def _open_fatx_e(image: Path) -> Fatx | None:
+def _open_fatx_e(image: Path) -> Optional[Fatx]:
     """Open the FATX E partition of a raw HDD image.
 
     pyfatx surfaces libfatx errors as bare AssertionError, hence the catch.
@@ -523,7 +523,7 @@ def _fatx_isdir(fs: Fatx, path: str) -> bool:
         return False
 
 
-def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> str | None:
+def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> Optional[str]:
     """Path of `parent`'s child directory matching `name` whatever its case.
 
     libfatx compares names byte for byte, so a lookup has to use the case the
@@ -625,7 +625,7 @@ class Xemu(Emulator):
         self.save_root = self.hdd_image.parent
         self.save_subtrees = (SAVE_STAGING_DIRNAME,)
         self._restore_pending = False
-        self._title_id: str | None = None
+        self._title_id: Optional[str] = None
         parked = self.hdd_image.with_name(f".{self.hdd_image.name}.prev")
         if not self.hdd_image.exists() and parked.is_file():
             log.info("recovering HDD image parked by a previous version")
@@ -696,6 +696,8 @@ class Xemu(Emulator):
             except (AssertionError, OSError) as exc:
                 log.warning("could not inject %s into the HDD image: %s",
                             "/".join(parts), exc)
+        # pyfatx has no close()/flush(); __del__ is the only way to trigger
+        # fatx_close_device and commit these writes to the image.
         del fs
         return written
 
@@ -729,6 +731,7 @@ class Xemu(Emulator):
             log.warning("no save directories found on %s for title %s; the "
                         "archive will be empty", self.hdd_image, self._title_id or "<all>")
         extracted = 0
+        staging_real = self.staging_dir.resolve()
         for src in roots:
             for root, _dirs, filenames in fs.walk(src):
                 for name in filenames:
@@ -740,6 +743,13 @@ class Xemu(Emulator):
                                     fatx_path, exc)
                         continue
                     dest = self.staging_dir / fatx_path.lstrip("/")
+                    # Defense in depth: fs.walk()/read() surface whatever the
+                    # emulated guest wrote to its save partition, so a `..`
+                    # component (however unlikely from libfatx) is rejected
+                    # here rather than trusted to stay under staging_dir.
+                    if not dest.resolve().is_relative_to(staging_real):
+                        log.warning("save path escapes staging dir: %s", fatx_path)
+                        continue
                     try:
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_bytes(data)
@@ -747,10 +757,12 @@ class Xemu(Emulator):
                         log.warning("could not stage %s: %s", dest, exc)
                         continue
                     extracted += 1
+        # pyfatx has no close()/flush(); __del__ is the only way to trigger
+        # fatx_close_device and release the image.
         del fs
         return extracted
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The disc image to boot for `path`.
 
         Args:
@@ -760,6 +772,14 @@ class Xemu(Emulator):
             The file itself, the best-ranked `.iso` in the folder, or None.
         """
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None
@@ -786,7 +806,7 @@ class Xemu(Emulator):
         self._clear_staging()
         self._restore_pending = True
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Inject any restored saves, pin display settings and boot the disc.
 
         Args:
@@ -821,7 +841,7 @@ class Xemu(Emulator):
         log.info("launching xemu (rom=%s)", rom_path)
         self._spawn([XEMU_BIN, "-dvd_path", str(rom_path)], _launch_env())
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Stop xemu and stage the launched title's saves for the dump.
 
         Args:

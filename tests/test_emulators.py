@@ -10,6 +10,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -61,10 +62,12 @@ def test_a_memory_card_comes_with_everything_the_card_routes_need(name: str) -> 
         assert emu.memory_card_path() is None
         return
 
-    # The card travels on its own routes, so it has to be nameable, findable,
-    # and removable from the save archive.
-    assert emu.memory_card_marker
-    assert emu.memory_card_path() is not None
+    # The card travels on its own routes, so it has to be removable from the
+    # save archive. Findability is platform-gated for an emulator whose card
+    # exists on only some of the platforms it serves (Dolphin: GC, not Wii),
+    # so that half of the contract is exercised in that emulator's own tests
+    # instead of here. A marker is only required for emulators (PCSX2) whose
+    # own runtime refuses a markerless folder.
     assert emu.memory_card_subtree in emu.save_subtrees
 
 
@@ -73,7 +76,7 @@ def test_the_desktop_launcher_needs_no_rom() -> None:
     assert emulators.get_emulator("desktop").requires_rom is False
 
 
-def _child_of(pid: int) -> int | None:
+def _child_of(pid: int) -> Optional[int]:
     """Find the first process reporting `pid` as its parent.
 
     Read out of PPid rather than /proc/<pid>/task/<pid>/children, which needs a kernel built with
@@ -225,3 +228,33 @@ def test_swapping_a_disc_on_the_base_class_is_not_implemented() -> None:
     """Swapping a disc on the base class is not implemented."""
     with pytest.raises(NotImplementedError):
         base.Emulator().swap_disc(Path("/romm/game/disc2.chd"))
+
+
+def test_the_launch_env_strips_named_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launch env strips named secrets."""
+    monkeypatch.setenv("BROKER_SECRET", "s3cret")
+    monkeypatch.setenv("SELKIES_MASTER_TOKEN", "tok")
+    monkeypatch.setenv("GITHUB_TOKEN", "gh")
+
+    env = base.base_launch_env()
+
+    assert "BROKER_SECRET" not in env
+    assert "SELKIES_MASTER_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+@pytest.mark.parametrize(
+    "name", ["SOME_API_SECRET", "OAUTH_TOKEN", "DB_PASSWORD", "AWS_ACCESS_KEY"]
+)
+def test_the_launch_env_strips_anything_secret_shaped(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """The launch env strips anything secret-shaped."""
+    monkeypatch.setenv(name, "sensitive")
+
+    assert name not in base.base_launch_env()
+
+
+def test_the_launch_env_keeps_ordinary_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The launch env keeps ordinary variables."""
+    monkeypatch.setenv("SOME_HARMLESS_VAR", "keep-me")
+
+    assert base.base_launch_env()["SOME_HARMLESS_VAR"] == "keep-me"

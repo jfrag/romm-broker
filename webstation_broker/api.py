@@ -12,7 +12,8 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -36,9 +37,9 @@ class SaveIn(BaseModel):
         memory_card_synced: Whether the caller synced the whole memory card separately.
     """
 
-    archive: str | None = None
+    archive: Optional[str] = None
     """Container path of the save archive to restore before the emulator boots, if any."""
-    resume_slot: int | None = None
+    resume_slot: Optional[int] = None
     """State slot to load once the emulator is up, if any."""
     memory_card_synced: bool = False
     """Set when the caller syncs the whole memory card on the memory-card routes.
@@ -58,9 +59,9 @@ class RomIn(BaseModel):
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
     """
 
-    id: int | None = None
-    name: str | None = None
-    platform: str | None = None
+    id: Optional[int] = None
+    name: Optional[str] = None
+    platform: Optional[str] = None
     path: str
 
 
@@ -72,8 +73,8 @@ class CallbackIn(BaseModel):
         token: The bearer token the parent expects on the push, if any.
     """
 
-    base_url: str | None = None
-    token: str | None = None
+    base_url: Optional[str] = None
+    token: Optional[str] = None
 
 
 class JoinIn(BaseModel):
@@ -84,7 +85,7 @@ class JoinIn(BaseModel):
         permission: Either `participant` or `readonly`.
     """
 
-    user: dict[str, Any] | None = None
+    user: Optional[dict[str, Any]] = None
     permission: str = "participant"
 
 
@@ -141,13 +142,13 @@ class ActivateIn(BaseModel):
         multiplayer: Whether RomM advertises the session for joining.
     """
 
-    session_id: str | None = None
-    user: dict[str, Any] | None = None
+    session_id: Optional[str] = None
+    user: Optional[dict[str, Any]] = None
     emulator: str
-    rom: RomIn | None = None
+    rom: Optional[RomIn] = None
     """The rom to boot. Optional for launch types without a game (e.g. emulator "desktop")."""
-    save: SaveIn | None = None
-    callback: CallbackIn | None = None
+    save: Optional[SaveIn] = None
+    callback: Optional[CallbackIn] = None
     multiplayer: bool = False
     """Whether the session is advertised for joining, decided once on RomM's launch screen.
 
@@ -172,7 +173,7 @@ def _ct_eq(a: str, b: str) -> bool:
     )
 
 
-def _check_secret(header_value: str | None) -> None:
+def _check_secret(header_value: Optional[str]) -> None:
     """Reject the request unless it carries the configured broker secret.
 
     A no-op when `BROKER_SECRET` is unset.
@@ -201,7 +202,29 @@ def _landing_url(token: str) -> str:
     return f"{settings.PREFIX}/?token={token}"
 
 
-def _resolve_callback(body_cb: CallbackIn | None, request: Request) -> dict[str, Any]:
+def _check_callback_scheme(base_url: str) -> None:
+    """Reject anything but http(s) for a callback base_url.
+
+    Defense in depth: this route already requires the caller to hold
+    BROKER_SECRET, but the callback base_url itself is otherwise unrestricted
+    (split-origin deployments need it to point anywhere), so without this a
+    malicious base_url could turn the exit-save upload into a file:// read or
+    point it at a non-HTTP internal service.
+
+    Args:
+        base_url: The callback base_url to validate.
+
+    Raises:
+        HTTPException: When the scheme is not http or https.
+    """
+    scheme = urlsplit(base_url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=422, detail=f"callback.base_url must be http(s): {base_url!r}"
+        )
+
+
+def _resolve_callback(body_cb: Optional[CallbackIn], request: Request) -> dict[str, Any]:
     """Decide where the exit save archive goes.
 
     Same-origin deployments don't need to send a base_url: the broker sits
@@ -218,6 +241,7 @@ def _resolve_callback(body_cb: CallbackIn | None, request: Request) -> dict[str,
         origin was taken from the request rather than the body.
     """
     if body_cb and body_cb.base_url:
+        _check_callback_scheme(body_cb.base_url)
         return {"base_url": body_cb.base_url, "token": body_cb.token, "derived": False}
     proto = (
         request.headers.get("x-forwarded-proto") or request.url.scheme
@@ -270,7 +294,7 @@ async def health() -> dict[str, str]:
 async def activate(
     body: ActivateIn,
     request: Request,
-    x_broker_secret: str | None = Header(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Start a session: restore save data, launch the emulator and mint the controller seat.
 
@@ -403,7 +427,7 @@ async def activate(
     }
 
 
-async def _mint_viewer(permission: str, user: dict[str, Any] | None) -> dict[str, Any]:
+async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Add a seat to the running session and publish it to the control plane.
 
     Shared by the RomM-facing join route and the controller's invite route so
@@ -435,7 +459,7 @@ async def _mint_viewer(permission: str, user: dict[str, Any] | None) -> dict[str
 
 
 @router.post("/api/session/join")
-async def join(body: JoinIn, x_broker_secret: str | None = Header(default=None)) -> dict[str, Any]:
+async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Add a user to the running session.
 
     Membership policy belongs to the caller; whoever is sent gets a personal
@@ -501,7 +525,7 @@ async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
     }
 
 
-async def _do_exit(save_slot: int | None) -> dict[str, Any]:
+async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     """Save state, stop the emulator, dump the save delta, and report.
 
     A `save_slot` of None exits without writing a state. The save dump still
@@ -617,8 +641,8 @@ async def _do_exit(save_slot: int | None) -> dict[str, Any]:
 @router.post("/api/session/exit")
 async def exit_session(
     request: Request,
-    x_broker_secret: str | None = Header(default=None),
-    token: str | None = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
+    token: Optional[str] = Query(default=None),
     slot: int = Query(default=0, ge=0, le=10),
     save: bool = Query(default=True),
 ) -> dict[str, Any]:
@@ -721,7 +745,7 @@ def _readable_emulator() -> Emulator:
 
 
 @router.post("/api/session/save-state")
-async def save_state(body: StateIn, x_broker_secret: str | None = Header(default=None)) -> dict[str, Any]:
+async def save_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Save a state into the emulator's working slot.
 
     The requested slot is resolved to the single working slot and the reply
@@ -747,7 +771,7 @@ async def save_state(body: StateIn, x_broker_secret: str | None = Header(default
 
 
 @router.post("/api/session/load-state")
-async def load_state(body: StateIn, x_broker_secret: str | None = Header(default=None)) -> dict[str, Any]:
+async def load_state(body: StateIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Load the state in the emulator's working slot.
 
     The requested slot is resolved to the single working slot and the reply
@@ -777,7 +801,7 @@ async def load_state(body: StateIn, x_broker_secret: str | None = Header(default
 
 
 @router.post("/api/session/swap-disc")
-async def swap_disc(body: DiscIn, x_broker_secret: str | None = Header(default=None)) -> dict[str, str]:
+async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, str]:
     """Swap the running emulator's disc for the one at the given path.
 
     Args:
@@ -832,7 +856,7 @@ def _header_token(value: str, fallback: str) -> str:
 
 
 @router.get("/api/session/state-file")
-async def get_state_file(x_broker_secret: str | None = Header(default=None)) -> FileResponse:
+async def get_state_file(x_broker_secret: Optional[str] = Header(default=None)) -> FileResponse:
     """Serve the working slot's state file so RomM can file it in the library.
 
     The slot is the emulator's own, not the caller's: `slot` is accepted for
@@ -860,7 +884,8 @@ async def get_state_file(x_broker_secret: str | None = Header(default=None)) -> 
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"could not read state file: {exc}")
+        log.warning("state-file: could not stat %s: %s", path, exc)
+        raise HTTPException(status_code=500, detail="could not read state file")
     if size > settings.STATE_FILE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="state file exceeds size limit")
     log.info("state-file: serving %s (%d bytes)", path.name, size)
@@ -875,7 +900,7 @@ async def get_state_file(x_broker_secret: str | None = Header(default=None)) -> 
 
 
 @router.get("/api/session/state-screenshot")
-async def get_state_screenshot(x_broker_secret: str | None = Header(default=None)) -> FileResponse:
+async def get_state_screenshot(x_broker_secret: Optional[str] = Header(default=None)) -> FileResponse:
     """Serve the frame captured with the working slot's state.
 
     Only for emulators that write the thumbnail as its own file; the ones that
@@ -903,18 +928,32 @@ async def get_state_screenshot(x_broker_secret: str | None = Header(default=None
     try:
         size = path.stat().st_size
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"could not read screenshot: {exc}")
+        log.warning("state-screenshot: could not stat %s: %s", path, exc)
+        raise HTTPException(status_code=500, detail="could not read screenshot")
     if size > settings.STATE_SCREENSHOT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="screenshot exceeds size limit")
     log.info("state-screenshot: serving %s (%d bytes)", path.name, size)
     return FileResponse(path, media_type="image/png")
 
 
+def _unlink_best_effort(path: Path) -> None:
+    """Remove a temp file without letting a failed cleanup mask the real error.
+
+    tmp.unlink(missing_ok=True) still raises if the parent turned out not
+    to be a directory at all; the cleanup itself must never crash a request
+    that is already reporting the failure that led here.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("could not remove temp file %s: %s", path, exc)
+
+
 @router.put("/api/session/state-file")
 async def put_state_file(
     request: Request,
     filename: str = Query(...),
-    x_broker_secret: str | None = Header(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Write a state RomM is sending back into the working slot.
 
@@ -963,25 +1002,28 @@ async def put_state_file(
             raise HTTPException(status_code=400, detail="empty request body")
         os.replace(tmp, target)
     except HTTPException:
-        tmp.unlink(missing_ok=True)
+        _unlink_best_effort(tmp)
         raise
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"could not write state file: {exc}")
+        _unlink_best_effort(tmp)
+        log.warning("state-file: could not write %s: %s", target, exc)
+        raise HTTPException(status_code=500, detail="could not write state file")
 
     log.info("state-file: stored %s (%d bytes)", target.name, written)
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
 
 
-def _memory_card(name: str) -> tuple[Path, str | None]:
+def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str]]:
     """Return the card the named emulator syncs, and the marker file it needs inside.
 
     Named rather than read off the session, because the card is container
     state, not session state: RomM lays one down before activate, when there is
-    no session to resolve it through.
+    no session to resolve it through. `platform` disambiguates an emulator that
+    only has a card on some of the platforms it serves (Dolphin: GC, not Wii).
 
     Args:
         name: The emulator name as RomM knows it.
+        platform: The platform slug, when the emulator's card depends on it.
 
     Returns:
         The card's path and the marker filename, the latter None when the
@@ -993,7 +1035,7 @@ def _memory_card(name: str) -> tuple[Path, str | None]:
     emulator = get_emulator(name)
     if emulator is None:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {name}")
-    card = emulator.memory_card_path()
+    card = emulator.memory_card_path(platform)
     if card is None:
         raise HTTPException(
             status_code=400,
@@ -1005,7 +1047,8 @@ def _memory_card(name: str) -> tuple[Path, str | None]:
 @router.get("/api/session/memory-card")
 async def get_memory_card(
     emulator: str = Query(...),
-    x_broker_secret: str | None = Header(default=None),
+    platform: Optional[str] = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
 ) -> Response:
     """Serve the whole Slot-1 card so RomM can file it against the player.
 
@@ -1016,6 +1059,7 @@ async def get_memory_card(
 
     Args:
         emulator: The name of the emulator whose card to capture.
+        platform: The platform slug, when the emulator's card depends on it.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
@@ -1028,7 +1072,7 @@ async def get_memory_card(
             `X-Memory-Card: absent` when the slot is empty.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator)
+    card, marker = _memory_card(emulator, platform)
     # Contention means a card operation is already in flight, and the caller
     # should come back rather than queue behind it.
     if not memcard.LOCK.acquire(blocking=False):
@@ -1057,7 +1101,8 @@ async def get_memory_card(
 async def put_memory_card(
     request: Request,
     emulator: str = Query(...),
-    x_broker_secret: str | None = Header(default=None),
+    platform: Optional[str] = Query(default=None),
+    x_broker_secret: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
     """Wipe Slot 1 and lay down the card RomM is sending.
 
@@ -1069,6 +1114,7 @@ async def put_memory_card(
     Args:
         request: The request whose raw body is the card archive.
         emulator: The name of the emulator whose card to replace.
+        platform: The platform slug, when the emulator's card depends on it.
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
@@ -1081,7 +1127,7 @@ async def put_memory_card(
             another card operation is in flight or a session is active.
     """
     _check_secret(x_broker_secret)
-    card, marker = _memory_card(emulator)
+    card, marker = _memory_card(emulator, platform)
     content = bytearray()
     async for chunk in request.stream():
         content.extend(chunk)
@@ -1111,8 +1157,11 @@ async def put_memory_card(
 
 
 @router.get("/api/session/status")
-async def status() -> dict[str, Any]:
+async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """Report the current session, or that there is none.
+
+    Args:
+        x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
         `{"active": False}` when no session exists. Otherwise the session's
@@ -1120,7 +1169,11 @@ async def status() -> dict[str, Any]:
         `multiplayer` flag, whether the process is `emulator_alive`, the
         emulator's `boot_failed`, `supports_states` and `state_slot` signals,
         `started_at`, the controlling `user` and the seated `viewers`.
+
+    Raises:
+        HTTPException: 403 on a bad secret.
     """
+    _check_secret(x_broker_secret)
     sess = session.SESSION
     if sess is None:
         return {"active": False}
@@ -1193,7 +1246,7 @@ def _export_file(name: str) -> Path:
 
 @router.put("/api/session/imports/{name}")
 async def upload_import(
-    name: str, request: Request, x_broker_secret: str | None = Header(default=None)
+    name: str, request: Request, x_broker_secret: Optional[str] = Header(default=None)
 ) -> dict[str, Any]:
     """Take a save archive from the parent and return the path activate wants.
 
@@ -1233,7 +1286,7 @@ async def upload_import(
 
 
 @router.get("/api/session/exports")
-async def list_exports(x_broker_secret: str | None = Header(default=None)) -> dict[str, Any]:
+async def list_exports(x_broker_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     """List the save archives sitting on disk, newest first.
 
     Args:
@@ -1261,7 +1314,7 @@ async def list_exports(x_broker_secret: str | None = Header(default=None)) -> di
 
 @router.get("/api/session/exports/{name}")
 async def download_export(
-    name: str, x_broker_secret: str | None = Header(default=None)
+    name: str, x_broker_secret: Optional[str] = Header(default=None)
 ) -> FileResponse:
     """Hand an archive to the parent on request.
 
@@ -1286,7 +1339,7 @@ async def download_export(
 
 @router.delete("/api/session/exports/{name}")
 async def delete_export(
-    name: str, x_broker_secret: str | None = Header(default=None)
+    name: str, x_broker_secret: Optional[str] = Header(default=None)
 ) -> dict[str, str]:
     """Drop an archive once the parent has stored it.
 
@@ -1308,7 +1361,7 @@ async def delete_export(
 
 
 @router.get("/api/session/context")
-async def context(token: str | None = Query(default=None)) -> dict[str, Any]:
+async def context(token: Optional[str] = Query(default=None)) -> dict[str, Any]:
     """Resolve an arriving token into the caller's role, for the frontend bootstrap.
 
     Args:

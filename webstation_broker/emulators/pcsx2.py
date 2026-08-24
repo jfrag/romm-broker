@@ -17,7 +17,7 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 from threading import Thread
-from typing import Any
+from typing import Any, Optional
 
 from .. import memcard
 from .base import Emulator, base_launch_env
@@ -102,7 +102,7 @@ def _disc_number(rel: Path) -> int:
     return max(1, int(match.group(1)))
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image out of a set of candidate paths.
 
     Hidden files, unsupported extensions, non-files and anything resolving
@@ -330,7 +330,7 @@ it went in.
 """
 
 
-def _restamp_slot(filename: str, slot: int) -> str | None:
+def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     """Rename a state for `slot`, keeping the serial that ties it to its disc.
 
     RomM holds the library, so a stored state carries whatever slot it happened
@@ -352,7 +352,7 @@ def _restamp_slot(filename: str, slot: int) -> str | None:
 
 
 def _wait_for_sstate_write(
-    before: dict[Path, tuple[int, float]], deadline: float, slot: int | None = None
+    before: dict[Path, tuple[int, float]], deadline: float, slot: Optional[int] = None
 ) -> bool:
     """Poll `SSTATE_DIR` until a slot-matching write completes or the deadline passes.
 
@@ -371,9 +371,9 @@ def _wait_for_sstate_write(
     """
     STABLE_SECS = 0.5
     POLL_SECS = 0.1
-    target: Path | None = None
-    last_size: int | None = None
-    stable_since: float | None = None
+    target: Optional[Path] = None
+    last_size: Optional[int] = None
+    stable_since: Optional[float] = None
     while time.monotonic() < deadline:
         after = _sstate_snapshot()
         if target is None:
@@ -401,7 +401,7 @@ def _wait_for_sstate_write(
     return False
 
 
-def newest_state_for_slot(slot: int) -> Path | None:
+def newest_state_for_slot(slot: int) -> Optional[Path]:
     """Find the most recently written state in `slot`.
 
     Args:
@@ -424,7 +424,7 @@ def newest_state_for_slot(slot: int) -> Path | None:
     return max(candidates)[1]
 
 
-def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
+def _pine_recv_exact(sock: _socket.socket, n: int) -> Optional[bytes]:
     """Read exactly `n` bytes from the PINE socket.
 
     Args:
@@ -443,7 +443,7 @@ def _pine_recv_exact(sock: _socket.socket, n: int) -> bytes | None:
     return buf
 
 
-def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> bytes | None:
+def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Optional[bytes]:
     """Send one PINE request and return the reply body.
 
     Wire format (little endian): u32 total size, u8 opcode, payload; the reply
@@ -481,7 +481,7 @@ def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> by
         return None
 
 
-def _pine_emu_status() -> int | None:
+def _pine_emu_status() -> Optional[int]:
     """Query the VM status over PINE.
 
     Returns:
@@ -548,7 +548,7 @@ class Pcsx2(Emulator):
         super().__init__()
         self._launch_seq = 0
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.
 
         A file is taken as is. A directory is searched one level deep for the
@@ -561,6 +561,14 @@ class Pcsx2(Emulator):
             The image to pass to pcsx2-qt, or None when there is nothing bootable.
         """
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None
@@ -572,7 +580,7 @@ class Pcsx2(Emulator):
                 return None
         return _pick_rom_file(candidates, path)
 
-    def memory_card_path(self) -> Path | None:
+    def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
         """Return the path of the Slot-1 folder card the whole-card routes ship and replace."""
         return MEMCARD_DIR / SLOT1_CARD_NAME
 
@@ -590,7 +598,7 @@ class Pcsx2(Emulator):
         except OSError as exc:
             log.warning("could not create the slot 1 folder card at %s: %s", card, exc)
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance, prepare the config and card, and start pcsx2-qt.
 
         The binary comes from env `PCSX2_BIN` (default `pcsx2-qt`). A boot
@@ -620,7 +628,7 @@ class Pcsx2(Emulator):
             target=self._boot_watchdog, args=(resume_slot, seq), daemon=True
         ).start()
 
-    def _boot_watchdog(self, slot: int | None, seq: int) -> None:
+    def _boot_watchdog(self, slot: Optional[int], seq: int) -> None:
         """Verify the launched game reaches a running VM and deliver a deferred state load.
 
         Polls the PINE status once a second until `RESUME_LOAD_WAIT` runs out.
@@ -662,7 +670,7 @@ class Pcsx2(Emulator):
             self.boot_failed = True
             log.warning(
                 "boot watchdog: VM never reached running state and pcsx2 is "
-                "still alive — treating as a boot failure"
+                "still alive, treating as a boot failure"
             )
         else:
             log.warning("boot watchdog: pcsx2 exited before the VM ever ran")
@@ -704,7 +712,7 @@ class Pcsx2(Emulator):
             return False
         return _pine_request(_PINE_MSG_LOAD_STATE, bytes([STATE_SLOT])) is not None
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
         """Return the newest state file in the broker's slot, or None when it holds nothing."""
         return newest_state_for_slot(STATE_SLOT)
 
@@ -728,7 +736,7 @@ class Pcsx2(Emulator):
                 except OSError as exc:
                     log.warning("could not clear stale state %s: %s", stale.name, exc)
 
-    def state_target(self, filename: str) -> Path | None:
+    def state_target(self, filename: str) -> Optional[Path]:
         """Map a pushed state's filename to where it may be written.
 
         PCSX2 finds a state by the serial it reads off the running disc, so
@@ -755,7 +763,7 @@ class Pcsx2(Emulator):
             return existing if restamped == existing.name else None
         return SSTATE_DIR / restamped
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save a state if asked, then stop the emulator.
 
         Args:
@@ -768,14 +776,19 @@ class Pcsx2(Emulator):
             saved state, or None).
         """
         saved = False
-        state_file: dict[str, Any] | None = None
+        state_file: Optional[dict[str, Any]] = None
         if slot is not None and self.alive():
             saved = self.save_state(slot)
             if saved:
                 p = self.state_path()
                 if p is not None:
-                    st = p.stat()
-                    state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                    try:
+                        st = p.stat()
+                    except OSError as exc:
+                        log.warning("could not stat saved state %s: %s", p, exc)
+                        saved = False
+                    else:
+                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
         self.stop()
         return {
             "state_saved": saved,

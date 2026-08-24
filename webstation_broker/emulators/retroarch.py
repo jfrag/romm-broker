@@ -65,7 +65,7 @@ import time
 import zipfile
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 import httpx
 
@@ -85,7 +85,7 @@ RA_CONFIG_DIR = Path(os.environ.get("RETROARCH_CONFIG_DIR", str(Path.home() / ".
 """The user's RetroArch config directory, from `RETROARCH_CONFIG_DIR` (default `~/.config/retroarch`)."""
 
 
-def _configured_dir(setting: str) -> Path | None:
+def _configured_dir(setting: str) -> Optional[Path]:
     """A directory setting read out of the user's RetroArch config.
 
     Args:
@@ -281,7 +281,7 @@ a save state taken for Disc 1 resumes on Disc 1.
 """
 
 
-def _platform_info(platform: str | None) -> dict[str, Any] | None:
+def _platform_info(platform: Optional[str]) -> Optional[dict[str, Any]]:
     """Look a RomM platform slug up in `PLATFORMS`, case-insensitively.
 
     Args:
@@ -331,7 +331,7 @@ def _github_release_asset(repo: str, asset_pattern: str) -> str:
     raise RuntimeError(f"no asset matching {asset_pattern!r} in {repo} release {tag!r}")
 
 
-def _core_url(core: str, source: dict[str, Any] | None) -> str:
+def _core_url(core: str, source: Optional[dict[str, Any]]) -> str:
     """Where `core`'s zip comes from.
 
     The buildbot unless the platform names a `core_source`; an env override
@@ -356,7 +356,7 @@ def _core_url(core: str, source: dict[str, Any] | None) -> str:
     return f"{CORES_BASE_URL}/{core}_libretro.so.zip"
 
 
-def _ensure_core(core: str, source: dict[str, Any] | None = None) -> Path:
+def _ensure_core(core: str, source: Optional[dict[str, Any]] = None) -> Path:
     """Return the core's .so, downloading it if missing.
 
     The zip is fetched into memory, the first `_libretro.so` inside it is
@@ -575,8 +575,8 @@ def _wait_for_state_file(
     POLL = 0.1
     target_name = _state_name(base, slot)
     deadline = time.monotonic() + timeout
-    last_size: int | None = None
-    stable_since: float | None = None
+    last_size: Optional[int] = None
+    stable_since: Optional[float] = None
     seen_change = False
     while time.monotonic() < deadline:
         after = _state_snapshot(dir_path, base)
@@ -613,7 +613,7 @@ def _wait_for_state_file(
     return False
 
 
-def _newest_state(dir_path: Path, base: str, slot: int) -> Path | None:
+def _newest_state(dir_path: Path, base: str, slot: int) -> Optional[Path]:
     """Find the most recently written file named for `base` and `slot`.
 
     Searched recursively, since a core may redirect states into its own
@@ -629,7 +629,7 @@ def _newest_state(dir_path: Path, base: str, slot: int) -> Path | None:
         cannot be read.
     """
     name = _state_name(base, slot)
-    best: tuple[float, Path] | None = None
+    best: Optional[tuple[float, Path]] = None
     try:
         for p in dir_path.rglob(f"{base}.state*"):
             if not p.is_file() or p.name != name:
@@ -685,7 +685,7 @@ def _m3u_entries(playlist: Path) -> list[Path]:
     return entries
 
 
-def _m3u_index_for_path(playlist: Path, target: Path) -> int | None:
+def _m3u_index_for_path(playlist: Path, target: Path) -> Optional[int]:
     """Disc index `target` occupies in `playlist`, or None if unlisted.
 
     Args:
@@ -702,7 +702,7 @@ def _m3u_index_for_path(playlist: Path, target: Path) -> int | None:
     return None
 
 
-def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> Path | None:
+def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str, ...]) -> Optional[Path]:
     """Choose the file to boot out of a ROM folder's candidates.
 
     Hidden files, unsupported extensions, non-files and anything resolving
@@ -798,7 +798,7 @@ class Retroarch(Emulator):
     def __init__(self) -> None:
         """Set up the reply buffer, reader thread slot and tray tracking for a session."""
         super().__init__()
-        self.platform: str | None = None
+        self.platform: Optional[str] = None
         """The RomM platform slug, set from the activate payload's `rom.platform` before launch."""
         self._rom_base: str = ""
         """The loaded content's basename, which RetroArch names its state and SRAM files after."""
@@ -810,9 +810,9 @@ class Retroarch(Emulator):
         """Replies read off RetroArch's stdout and not yet consumed."""
         self._stdout_lock = threading.Lock()
         """Guards `_stdout_buf` between the reader thread and the callers waiting on replies."""
-        self._reader: threading.Thread | None = None
+        self._reader: Optional[threading.Thread] = None
         """The thread draining RetroArch's stdout into `_stdout_buf`."""
-        self._playlist: Path | None = None
+        self._playlist: Optional[Path] = None
         """The playlist this session booted, or None when the content was not an .m3u."""
         self._disc_index: int = 0
         """Where the tray currently sits.
@@ -847,7 +847,7 @@ class Retroarch(Emulator):
         info = _platform_info(self.platform)
         return info["extensions"] if info else ()
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """File the core should boot for `path`.
 
         A file is taken as is. A folder is searched one level deep and ranked by
@@ -869,6 +869,14 @@ class Retroarch(Emulator):
             )
             return None
         if path.is_file():
+            # Defense in depth: api.py already validates path is under
+            # ROM_ROOT before calling in, but this checks it independently
+            # rather than trusting every future caller to do the same.
+            try:
+                if not path.resolve().is_relative_to(ROM_ROOT):
+                    return None
+            except OSError:
+                return None
             return path
         if not path.is_dir():
             return None
@@ -931,7 +939,7 @@ class Retroarch(Emulator):
         except (OSError, ValueError):
             pass
 
-    def _wait_for_reply(self, prefixes: str | tuple[str, ...], timeout: float) -> str | None:
+    def _wait_for_reply(self, prefixes: Union[str, tuple[str, ...]], timeout: float) -> Optional[str]:
         """Wait for a stdout reply matching one of `prefixes`; consume it and return it.
 
         Replies are newline-terminated except the bare echoes of the `*_SLOT`
@@ -955,7 +963,7 @@ class Retroarch(Emulator):
             with self._stdout_lock:
                 buf = bytes(self._stdout_buf)
             text = buf.decode("utf-8", errors="replace")
-            best: tuple[int, str] | None = None
+            best: Optional[tuple[int, str]] = None
             for pfx in prefixes:
                 idx = text.find(pfx)
                 if idx != -1 and (best is None or idx < best[0]):
@@ -976,8 +984,8 @@ class Retroarch(Emulator):
         return None
 
     def _send(
-        self, cmd: str, wait_prefix: str | tuple[str, ...] | None = None, timeout: float = 5.0
-    ) -> str | None:
+        self, cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
+    ) -> Optional[str]:
         """Write one command to RetroArch's stdin, optionally waiting for its reply.
 
         Args:
@@ -1002,7 +1010,7 @@ class Retroarch(Emulator):
             return self._wait_for_reply(wait_prefix, timeout)
         return None
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Start RetroArch on `rom_path` with the platform's core.
 
         Any running session is stopped first. The core is downloaded if
@@ -1291,7 +1299,7 @@ class Retroarch(Emulator):
             return False
         return True
 
-    def state_path(self) -> Path | None:
+    def state_path(self) -> Optional[Path]:
         """The newest state file for the loaded content in `STATE_SLOT`, or None.
 
         Returns:
@@ -1302,7 +1310,7 @@ class Retroarch(Emulator):
             return None
         return _newest_state(STATE_DIR, self._rom_base, STATE_SLOT)
 
-    def state_screenshot_path(self) -> Path | None:
+    def state_screenshot_path(self) -> Optional[Path]:
         """The thumbnail RetroArch wrote beside the working slot's state, or None.
 
         RetroArch writes the thumbnail as `<state file>.png` beside the state,
@@ -1317,7 +1325,7 @@ class Retroarch(Emulator):
         shot = state.with_name(f"{state.name}.png")
         return shot if shot.is_file() else None
 
-    def state_target(self, filename: str) -> Path | None:
+    def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
 
         RetroArch looks a state up by the name it derives from the loaded
@@ -1341,7 +1349,7 @@ class Retroarch(Emulator):
             return existing
         return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
 
-    def save_and_exit(self, slot: int | None) -> dict[str, Any]:
+    def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save state when asked, flush SRAM, and quit RetroArch.
 
         The state save is skipped when `slot` is None or the platform entry
@@ -1367,8 +1375,13 @@ class Retroarch(Emulator):
                 if saved:
                     p = self.state_path()
                     if p is not None:
-                        st = p.stat()
-                        state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
+                        try:
+                            st = p.stat()
+                        except OSError as exc:
+                            log.warning("could not stat saved state %s: %s", p, exc)
+                            saved = False
+                        else:
+                            state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
             # Flush SRAM so the save dump ships current save data.
             self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
         self._quit()
@@ -1416,8 +1429,6 @@ class Retroarch(Emulator):
                 self._forget()
                 log.info("%s exited gracefully", self.name)
                 return
-            except (BrokenPipeError, OSError):
-                pass
             except subprocess.TimeoutExpired:
                 log.warning(
                     "%s did not exit after QUIT, escalating to SIGTERM", self.name

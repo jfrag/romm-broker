@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -61,7 +62,7 @@ _PRE_RELEASE_DIR = "pre-release"
 """Lowercased name of the pre-release folder, skipped by the semver scan."""
 
 
-def _find_binary_in(folder: Path) -> Path | None:
+def _find_binary_in(folder: Path) -> Optional[Path]:
     """The shadPS4 binary inside one release folder.
 
     Args:
@@ -79,7 +80,7 @@ def _find_binary_in(folder: Path) -> Path | None:
     return None
 
 
-def _resolve_binary() -> Path | None:
+def _resolve_binary() -> Optional[Path]:
     """Latest shadps4 binary.
 
     The explicit `SHADPS4_BIN` override, else the Pre-release build if
@@ -100,7 +101,7 @@ def _resolve_binary() -> Path | None:
         log.info("shadps4: using pre-release build %s", pre)
         return pre
 
-    best: tuple[tuple[int, int, int], Path] | None = None
+    best: Optional[tuple[tuple[int, int, int], Path]] = None
     for folder in VERSIONS_DIR.iterdir():
         if not folder.is_dir() or folder.name.lower() == _PRE_RELEASE_DIR:
             continue
@@ -160,7 +161,7 @@ class Shadps4(Emulator):
     room before escalating to SIGTERM.
     """
 
-    def resolve_rom_file(self, path: Path) -> Path | None:
+    def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The path shadPS4 should boot for `path`.
 
         Args:
@@ -176,11 +177,22 @@ class Shadps4(Emulator):
         if not path.is_dir():
             return None
         eboot = path / "eboot.bin"
-        if eboot.is_file():
-            return eboot
+        try:
+            if eboot.is_file():
+                if eboot.resolve().is_relative_to(ROM_ROOT):
+                    return eboot
+                return None  # symlink escapes ROM_ROOT
+            if eboot.exists() or eboot.is_symlink():
+                # present but not a regular file: dangling symlink, or a
+                # symlink to a directory/device/fifo. is_file() misses these,
+                # and falling through to `return path` would hand shadps4 an
+                # unvalidated target via its own eboot.bin lookup.
+                return None
+        except OSError:
+            return None
         return path  # shadps4 appends eboot.bin to directory paths itself
 
-    def launch(self, rom_path: Path, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Spawn the newest shadPS4 with IPC enabled and boot the game.
 
         Args:
@@ -207,8 +219,10 @@ class Shadps4(Emulator):
         # The IPC input thread starts with the process and stdin buffers early
         # writes; RUN then START release the run/start semaphores so the game
         # boots without waiting on the 5 s RUN deadline.
-        self._ipc_send("RUN")
-        self._ipc_send("START")
+        if not self._ipc_send("RUN"):
+            log.warning("shadps4 IPC RUN failed, game may not boot until the 5 s RUN deadline")
+        if not self._ipc_send("START"):
+            log.warning("shadps4 IPC START failed, game may not boot")
 
     def _ipc_send(self, cmd: str) -> bool:
         """Write one IPC command line to the emulator's stdin.

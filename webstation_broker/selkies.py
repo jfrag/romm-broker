@@ -7,7 +7,7 @@ broker just keeps that map in sync with room state.
 """
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -47,7 +47,7 @@ def build_token_map(session: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return tokens
 
 
-_active_url: str | None = None
+_active_url: Optional[str] = None
 """Endpoint that last accepted a push.
 
 Tried first so steady-state pushes don't re-probe the other image's URL on

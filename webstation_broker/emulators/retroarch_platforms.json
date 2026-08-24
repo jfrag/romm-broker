@@ -106,6 +106,10 @@
     "core": "yabasanshiro",
     "extensions": [".m3u", ".cue", ".chd", ".iso", ".bin", ".ccd", ".toc"]
   },
+  "psx": {
+    "core": "swanstation",
+    "extensions": [".m3u", ".chd", ".cue", ".pbp", ".ccd", ".mds", ".iso", ".img", ".ecm", ".bin", ".exe", ".psexe"]
+  },
   "psp": {
     "core": "ppsspp",
     "assets": {"PPSSPP": "/usr/share/ppsspp/assets"},

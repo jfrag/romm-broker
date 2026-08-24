@@ -6,6 +6,7 @@ Managed like any emulator session, just with no ROM and no save sync.
 
 import os
 from pathlib import Path
+from typing import Optional
 
 from .base import Emulator, base_launch_env
 
@@ -35,7 +36,7 @@ class Desktop(Emulator):
     log_path = Path("/config/selkies-desktop.log")
     """Where selkies-desktop's output is appended."""
 
-    def launch(self, rom_path: Path | None, resume_slot: int | None) -> None:
+    def launch(self, rom_path: Optional[Path], resume_slot: Optional[int]) -> None:
         """Start selkies-desktop, replacing any session already running.
 
         The binary comes from `DESKTOP_BIN` (default `selkies-desktop`).
