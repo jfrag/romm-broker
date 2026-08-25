@@ -116,6 +116,9 @@ cd docs && npm run generate && npm run dev
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR workflow.
 
+A session can stream a full desktop with a real terminal on it. Before
+exposing this beyond your own LAN, read [SECURITY.md](SECURITY.md).
+
 ## Releases
 
 Versions are semver, cut by release-please off `master` from conventional
