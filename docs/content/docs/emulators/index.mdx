@@ -22,6 +22,7 @@ state on demand.
 | `rpcs3` | PlayStation 3 | no | no | the save directories under `dev_hdd0/` |
 | `xemu` | Xbox | no | no | extracted from the HDD image into a staging directory |
 | `xenia` | Xbox 360 | no | no | `content/` under `XENIA_DATA_DIR` |
+| `flycast` | Sega Dreamcast | no (a resume state is written at exit) | no | the flat `FLYCAST_DATA_DIR` (VMU saves and the savestate) |
 | `desktop` | the webstation desktop itself | no | no | none |
 
 "Save states" is what the status response reports as `supports_states`. When
@@ -165,6 +166,24 @@ Games on Demand title folder: the broker walks the console's own layout
 (`[Content/<XUID>/]<TITLE_ID>/000D0000` or `00007000/<package>`) and boots the
 STFS package it finds there, checked by magic so DLC, title updates and the
 `.data` payload beside a GoD package are passed over.
+
+## Flycast
+
+No control socket, and no SIGTERM handler either, so the only clean shutdown
+path is a graceful window-close request: the broker activates Flycast's own
+window and sends Alt+F4, which reaches Flycast's `SDL_QUIT` handling and is
+the only place a save state gets written (`FLYCAST_STOP_WAIT` gives that room
+before escalating to a SIGTERM that skips the save entirely). Like
+DuckStation, there is no mid-session save/load: a launch resumes from
+whatever state was written on the previous clean exit, and the current
+session's state is written once, on exit.
+
+Save state is a single deterministic file, `<rom>.state`, in the flat
+`FLYCAST_DATA_DIR`. VMU saves live loose in that same directory and travel
+with it as one save subtree, since nothing separates them from the savestate
+or a first-run onboarding artifact. A RetroArch core also covers Dreamcast
+(`dc` defaults to it), for anyone who prefers RetroArch's shared save-state UI
+and hotkeys instead.
 
 ## Desktop
 

@@ -1,0 +1,147 @@
+---
+title: "The frontend"
+description: "The room UI's layout, dev server, and how to add a translation key."
+---
+
+`frontend/` is the collab room from [Using the room](/docs/using-the-room):
+vanilla JS and CSS built with vite, no framework and no code-splitting beyond
+what vite does automatically.
+
+```
+frontend/
+  index.html        static shell: overlays, video grid, sidebar mount point, settings modal
+  vite.config.js     dev server + build config
+  package.json
+  src/
+    room.js          everything: websocket, media capture/playback, DOM rendering, drag-and-drop
+    translation.js    one object literal per language, plus getTranslator()
+    room.css          all styling
+```
+
+There is no component framework: `room.js` renders the
+sidebar by building HTML strings and reattaching listeners on every re-render
+(see `renderMainSidebar` and `renderSidebar`). It is one large file by design,
+not by neglect; keep new UI in that same direct-DOM style rather than
+introducing a second pattern.
+
+<Callout type="warn" title="Nothing here is linted or tested in CI.">
+`ci.yml` only runs the Python lint, app build, and pytest suite. There's no
+`npm run lint`, no frontend test, no type checker. Read your diff carefully;
+nothing else will catch a mistake before it ships.
+</Callout>
+
+## Running it
+
+Inside a [dev-mode](/docs/container/dev-mode) container, vite already serves
+the page with hot reload on port 5173, proxied through nginx at
+`SUBFOLDER`. Edit `frontend/src/*` and the running room picks it up live.
+
+Outside the container, `frontend/` runs standalone but has nothing to talk
+to unless a broker is also listening on 8000:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+`vite.config.js` proxies `<SUBFOLDER>/api` and `<SUBFOLDER>/ws` to
+`127.0.0.1:8000`, so run the broker itself alongside it (see
+[Dev mode](/docs/container/dev-mode#running-outside-the-container)) to get a
+real session to point the room at. Without one, `GET api/session/context`
+fails and the room shows its "no active session" overlay, which is enough to
+work on layout and styling but not on anything that needs live state.
+
+`npm run build` produces the static `dist/` the image bakes in
+(`SUBFOLDER=/streaming/ npm run build`, matching what
+[image-internals](/docs/container/image-internals) does at image build time).
+The build uses a relative base so the same `dist/` works under any runtime
+`SUBFOLDER`; only the dev server needs the real prefix, since nginx proxies
+the full path through to it.
+
+## Where things live in room.js
+
+- **Bootstrap** (`DOMContentLoaded`): fetches `GET api/session/context`,
+  which returns `COLLAB_DATA` (role, permission, token, roster, game name).
+  Everything else in the file reads off that object and the websocket
+  messages that update it.
+- **Media capture and playback**: the top of the file is WebCodecs plumbing,
+  a shared worker that wraps `MediaStreamTrackProcessor` /
+  `MediaStreamTrackGenerator` where the browser has them, falling back to a
+  hidden `<video>` and canvas readback where it doesn't (Firefox, and
+  Safari's audio side). Unrelated to the DOM/UI code below it; skip this
+  block unless you're touching webcam/mic capture itself.
+- **Rendering**: `renderSidebar`, `renderUsernamePrompt`, `renderMainSidebar`
+  build the sidebar's HTML from `COLLAB_DATA` and the current roster, then
+  wire up listeners. They're called again on every roster change, so
+  listeners are attached fresh each time rather than assumed to persist.
+  `applyTranslations` runs last, resolving every `data-i18n*` attribute in
+  the rendered scope.
+- **Websocket** (`connectWebSocket` and its `onmessage`): chat, roster
+  updates, gamepad/MK reassignment broadcasts, resolution changes. The wire
+  format is documented on the [`room` module](/docs/developer/reference/room)
+  in the Python reference.
+- **Drag-and-drop** (`videoGrid.addEventListener('dragstart'/'dragover'/'drop', ...)`
+  near the bottom): the controller-assignment mechanic from the room guide.
+  Only the controller's icons are `draggable`; a viewer's tiles are valid
+  drop targets but never drag sources.
+
+## Adding or changing a translation
+
+UI text reaches the page two ways:
+
+- **Static markup in `index.html`** carries `data-i18n="key"` (innerHTML),
+  `data-i18n-placeholder="key"`, or `data-i18n-title="key"`.
+  `applyTranslations` resolves these on load and on every sidebar re-render.
+- **Anything `room.js` builds itself** calls `t('key')` directly inside the
+  template string, e.g. `t('tooltips.invite')`.
+
+Both go through the same lookup in `translation.js`: `t(key, variables)`
+walks the dotted `key` (`'settings.microphoneLabel'`) into the active
+language's object, falls back to `en` if the key or the language is missing,
+and substitutes `{placeholder}` tokens from `variables`. A `{count, plural,
+one {...} other {...}}` block picks the `one`/`other` branch off a numeric
+variable if you need pluralization.
+
+To add a new string:
+
+<Steps>
+<Step>
+### Add the key to `en`
+
+`en` at the top of `translation.js` is the fallback every other language
+reads through, so it has to be complete. Nest it under whichever existing
+group it belongs with (`tooltips`, `chat`, `alerts`, ...) or start a new one.
+</Step>
+<Step>
+### Reference it
+
+`t('yourGroup.yourKey')` in `room.js`, or `data-i18n="yourGroup.yourKey"` in
+`index.html`.
+</Step>
+<Step>
+### Add it to the other 17 languages (optional, but don't skip it silently)
+
+A missing key in any language falls back to the English string automatically
+and logs `Translation key not found` to the console, so the room never
+breaks, it just shows English for that one string. If you don't have a
+translation to hand, leave it in English rather than guessing, and say so
+in the PR description so someone who does can fill it in.
+</Step>
+</Steps>
+
+`getTranslator` matches on the base language tag (`navigator.language` split
+on `-`, lowercased), so `es-MX` and `es-ES` both resolve to `es`. There's no
+region-level fallback chain beyond that, and no in-room language switcher:
+whatever the browser reports is what's shown, per
+[Using the room](/docs/using-the-room#language).
+
+## Styling
+
+`room.css` is one flat stylesheet, no preprocessor, no CSS modules. Class
+names are the only namespacing there is, so a new component's classes should
+read unambiguously (prefix with the feature name) rather than something
+generic enough to collide. The color palette and the scrollbar styling are
+both lifted from RomM's own design tokens, noted in comments at the top of
+the file: keep pulling from there rather than hand-picking new colors, so the
+room stays visually consistent with the RomM UI it's embedded in.

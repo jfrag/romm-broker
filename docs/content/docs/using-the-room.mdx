@@ -1,0 +1,162 @@
+---
+title: "Using the room"
+description: "A player's guide to the collab room: joining, chat, webcam, controller assignment, and the other buttons in the sidebar."
+---
+
+This page is for players, not integrators. It explains what you see and click
+when you open a session, whether you started it or joined someone else's. For
+how the room talks to the broker under the hood, see [Users and invites](/docs/api/join).
+
+## Opening the room
+
+You get to the room one of two ways:
+
+- **You started the session.** RomM opens it for you directly. You are the
+  **host**.
+- **Someone invited you**, either with a link they copied from their own room,
+  or by adding you by name from RomM. Opening that link or URL drops you into
+  the same room, alongside the host.
+
+The first time a link drops you into a room with no name attached, you're
+asked to pick a username before you can do anything else. It's remembered in
+your browser, so you won't be asked again on that device.
+
+<Callout type="info">
+If the link says the session isn't running, or is no longer valid, someone
+already ended it or it hasn't started yet. Links only work while a session is
+live.
+</Callout>
+
+## Host, participant, or spectator
+
+Everyone in the room has one of three levels of access:
+
+- **Host** - whoever's game this is. Only the host can invite people, change
+  who has a controller, and end the session for everyone.
+- **Participant** - joined with a "Collaboration User" invite. Can chat, share
+  webcam and mic, and be handed a controller or the mouse and keyboard by the
+  host.
+- **Spectator** (read-only) - joined with a "Read Only" invite. Can watch and
+  chat, but has no webcam/mic controls and can never be handed input.
+
+If you're the host, you'll see an invite button in the sidebar (the
+person-plus icon) that mints both kinds of link and copies them to your
+clipboard, ready to send.
+
+<Callout type="info">
+In a solo session, chat and webcam are hidden until someone else joins, so a
+single-player game doesn't clutter the screen with controls nobody's using.
+Opening an invite link always shows the full room, even into a session that
+started solo.
+</Callout>
+
+## The sidebar
+
+The panel down the side (tap the handle on its edge to open or close it) is
+where everything but the game itself lives:
+
+- **Title bar icons**, left to right: a gaming-mode/fullscreen toggle, a
+  light/dark theme switch, a reload button for the stream if it ever freezes,
+  a settings gear, and, for the host only, invite and exit buttons.
+- **Media controls**: buttons to turn your microphone and webcam on or off,
+  and a separate volume slider/mute button for the *game's own audio* (not
+  your voice chat).
+- **Chat**, at the bottom, with a box to type into.
+
+Spectators don't get the media buttons or the settings gear, since there's
+nothing for either to control.
+
+### Settings
+
+The gear icon opens a small dialog for picking which microphone and camera to
+use, if your device has more than one. Your choice is remembered for next
+time.
+
+### Fullscreen / gaming mode
+
+The controller icon in the header requests fullscreen on the game stream
+itself, not the whole browser tab, so the sidebar and chat stay reachable if
+you back out.
+
+## Chat and webcam
+
+Chat is plain text, with a reply button on each message if you want to quote
+someone. Joins, leaves, and username changes show up as system messages so
+the room stays easy to follow.
+
+Turning your webcam or mic on shares them with everyone else in the room, not
+just the host. Each person's video tile has its own mute buttons so anyone
+can locally mute someone else's audio or hide their video without affecting
+what that person is actually sending. The host also has a star icon on each
+tile to highlight one person as the designated speaker, a visual cue for the
+room rather than anything that changes audio.
+
+<Callout type="warn" title="Your browser will ask for camera/mic permission the first time.">
+If it's ever denied by mistake, the button stays available: click it again
+and your browser will offer to re-ask.
+</Callout>
+
+## Getting a controller
+
+This is the room's signature feature: the host can hand a virtual gamepad, or
+the mouse and keyboard, to anyone in the room, live, without pausing the
+game.
+
+Only the host sees the tray of unassigned controller icons (gamepad icons
+numbered by slot, plus one mouse-and-keyboard icon). The host drags an icon
+from the tray onto someone's video tile to hand them that input; dragging it
+back to the tray takes it away again. Whoever currently holds a gamepad slot
+or the mouse and keyboard sees that icon sitting on their own tile, so
+everyone in the room can see at a glance who's driving.
+
+<Steps>
+<Step>
+### The host drags a controller icon
+
+Any of the numbered gamepad icons, or the mouse-and-keyboard icon, from the
+tray onto a participant's tile (or back onto the host's own tile).
+</Step>
+<Step>
+### The recipient's icon appears on their tile
+
+It moves live, with no reload, so everyone can see who currently has which
+input.
+</Step>
+<Step>
+### That person's gamepad or mouse/keyboard now drives the game
+
+Only while they hold the icon. Taking it back (or handing it to someone else)
+is instant.
+</Step>
+</Steps>
+
+Spectators are never a valid drop target: the host can watch and chat with
+them, but can't hand them a controller.
+
+## Resolution and stream layout
+
+The game stream automatically resizes to fit whoever's watching. If you're
+the host, a lock icon on your own tile freezes the current resolution so it
+stops adjusting itself as people join and leave; unlocking it goes back to
+automatic. A second icon lets the host manually match the stream's resolution
+to one specific participant's screen.
+
+Video tiles (yours and everyone else's) can be dragged to reorder them in the
+grid, and the whole video row can be collapsed with its own toggle if you'd
+rather focus on the game.
+
+## Ending the session
+
+Only the host sees the exit button (the power icon). It asks for
+confirmation, since it ends the session for everyone: the game saves, the
+emulator stops, and every link into the room stops working. After exit, a
+short summary shows what got saved and how much save data was written out.
+
+## Language
+
+The room's own text (buttons, chat, settings) follows your browser's
+language automatically; there's no in-room language switcher, so setting your
+browser's preferred language is what changes it. It supports English,
+Spanish, Chinese, Hindi, Portuguese, French, Russian, German, Turkish,
+Italian, Dutch, Arabic, Korean, Japanese, Vietnamese, Thai, Filipino, and
+Danish.

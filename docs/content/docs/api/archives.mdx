@@ -52,29 +52,46 @@ included, so an archive is a delta rather than the whole tree.
 
 ## Memory cards
 
-PCSX2's Slot 1 memory card is a folder card the broker owns. Rather than
+Some emulators keep a memory card the broker owns as a whole file or folder:
+PCSX2's Slot 1 folder card, and Dolphin's GameCube memory card. Rather than
 carrying it inside every save archive, RomM can sync the whole card against
 the player with its own routes:
 
 ```
 GET /streaming/api/session/memory-card?emulator=pcsx2
 PUT /streaming/api/session/memory-card?emulator=pcsx2   body: raw zip of the card
+
+GET /streaming/api/session/memory-card?emulator=dolphin&platform=ngc
+PUT /streaming/api/session/memory-card?emulator=dolphin&platform=ngc   body: raw zip of the card
 ```
 
 Both take `X-Broker-Secret`. The GET serves the card as a zip with an
-`X-Memory-Card-Slot: 1` header. A `404` carrying `X-Memory-Card: absent` is
-the broker confirming the slot is empty, which is what tells RomM the card is
-safe to wipe; every other failure reads as "could not be captured", so a card
-RomM never managed to read is not destroyed on the next claim.
+`X-Memory-Card-Slot: 1` header (a fixed value, not a real slot number for
+every emulator). A `404` carrying `X-Memory-Card: absent` is the broker
+confirming the card is empty, which is what tells RomM it is safe to wipe;
+every other failure reads as "could not be captured", so a card RomM never
+managed to read is not destroyed on the next claim.
 
-The PUT wipes Slot 1 and lays down the card being sent. It is refused with
-`409` while a session is up: the emulator holds the card open for as long as
-the game runs, and swapping it underneath corrupts it. RomM hydrates before
-activate and evacuates after exit, so the card is only ever replaced with
-nothing running.
+The PUT wipes the existing card and lays down the one being sent. It is
+refused with `409` while a session is up: the emulator holds the card open
+for as long as the game runs, and swapping it underneath corrupts it. RomM
+hydrates before activate and evacuates after exit, so the card is only ever
+replaced with nothing running.
 
-When the card is synced this way, activate is told with
+`platform` picks which card an emulator syncs when that depends on the
+platform it is serving. Dolphin is the case that needs it: the same launcher
+covers both GameCube and Wii, but only GameCube has a physical card (Wii's
+NAND has no card equivalent and always travels inside the save archive
+instead), so the route requires `platform=ngc` to confirm which one is meant.
+Leave it off, or pass anything else, and the route answers `400` exactly as
+it would for an emulator with no card at all. The card served is Dolphin's
+whole `GC/` tree rather than one region's Card A folder, since a library can
+mix regions and a sync has to carry all of them. PCSX2 needs no `platform`,
+since its Slot 1 card does not depend on one.
+
+When a card is synced this way, activate is told with
 `save.memory_card_synced: true`. The card then travels as its own image, so the
 restore passes over a stale card inside an older archive and the exit dump
 leaves the card subtree out. `400` from either route means the named emulator
-has no memory card, `422` that the emulator is unknown.
+has no memory card for the given `platform`, `422` that the emulator is
+unknown.
