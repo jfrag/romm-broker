@@ -46,8 +46,10 @@ pyfatx (for xemu's FATX images).
   docstring is documentation, not decoration. Module constants and class
   attributes get attribute docstrings (a string literal on the line after the
   assignment) so they show up too.
-- **Type hints on every signature.** PEP 604 unions (`str | None`), builtin
-  generics, `dict[str, Any]` for loosely shaped payloads.
+- **Type hints on every signature**, kept Python 3.9-safe: `Optional`/`Union`
+  from `typing`, not PEP 604 unions (`str | None`), even though the package
+  itself targets 3.11+. Builtin generics and `dict[str, Any]` for loosely
+  shaped payloads are fine.
 - **ruff enforces both.** `pyproject.toml` enables the `D` rules with the
   Google convention and the `ANN` rules alongside `E`, `F`, `W` and `I`, and CI
   fails on any of them.
@@ -58,6 +60,11 @@ pyfatx (for xemu's FATX images).
 - **No em dashes** in prose, docs or docstrings.
 - **Conventional commits.** `feat:` and `fix:` subjects drive the release
   bump; see [Releases](/docs/releases).
+
+The PR workflow itself (branching, linking issues, what to run before
+opening one) is in
+[CONTRIBUTING.md](https://github.com/romm-streaming/romm-broker/blob/master/CONTRIBUTING.md)
+at the repository root.
 
 ## Running against a real container
 
