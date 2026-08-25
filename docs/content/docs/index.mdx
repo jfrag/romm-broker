@@ -3,7 +3,7 @@ title: "Overview"
 description: "What the broker is, how a play session flows, and where it sits next to RomM and the webstation container."
 ---
 
-webstation-broker is the session broker and collaboration interface for the
+romm-broker is the session broker and collaboration interface for the
 RomM webstation container. The container hosts one play session at a time: a
 game is activated over REST, the broker launches the emulator (restoring save
 data if provided) and returns a token URL that lands on a collab room with the
@@ -13,16 +13,16 @@ archives the session's save delta.
 ## The pieces
 
 ```
-RomM (parent)  ──REST──▶  webstation-broker  ──spawns──▶  emulator
-   ▲                          │      │
-   │ iframe                   │      └──tokens──▶  selkies (stream + input)
-   └───────── browser ◀───────┘  room UI (chat, webcam, input assignment)
+RomM (parent)  ──REST──▶  romm-broker  ──spawns──▶  emulator
+   ▲                         │   │
+   │ iframe                  │   └──tokens──▶  selkies (stream + input)
+   └──────── browser ◀───────┘  room UI (chat, webcam, input assignment)
 ```
 
 - **RomM** is the library and the caller. It decides which game to launch,
   holds every save state and save archive, and calls the broker's lifecycle
   endpoints with a shared secret.
-- **webstation-broker** is a FastAPI app inside the container. It owns the
+- **romm-broker** is a FastAPI app inside the container. It owns the
   single session, launches and stops the emulator, moves save data in and out,
   and serves the collab room.
 - **selkies** streams the desktop and enforces input routing. The broker pushes

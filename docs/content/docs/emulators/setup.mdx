@@ -20,6 +20,27 @@ files, not ROMs. Games come from your RomM library. Once uploaded, use the
 pcmanfm file manager or a foot terminal on the desktop to move files into the
 directories each emulator expects.
 
+Drag-and-drop is not the only option. `/config`, the volume every deployment
+already mounts (see [Running the container](/docs/container)), is the
+container's home directory, so anything placed on the host at the matching
+path inside it shows up in the container without an upload. This is
+particularly useful for RetroArch: its shared BIOS directory is
+`RETROARCH_SYSTEM_DIR` (default `/config/.local/share/RetroArch/system`, see
+[Configuration](/docs/configuration/emulators)), one folder every libretro
+core reads from, so seeding it on the host covers every RetroArch core at
+once. The per-emulator sections below give the equivalent path for each
+standalone emulator's BIOS, keys, or firmware (for example
+`/config/.local/share/flycast` for Flycast, `/config/.local/share/Cemu` for
+Cemu's `keys.txt`).
+
+Pre-seeding a path does not skip a standalone emulator's setup wizard.
+Emulators outside RetroArch keep their own BIOS/firmware location in their own
+internal config rather than reading it from the broker, so most still need one
+visit to their setup UI to point at or select the file, even when it is
+already sitting in the expected directory. What pre-seeding removes is the
+upload step itself, not the one-time wizard visit described per emulator
+below.
+
 ## Controllers
 
 Controllers behave identically in the desktop view and in single game

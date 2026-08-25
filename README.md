@@ -44,7 +44,9 @@ docker compose up -d
 ```
 
 `/dev/dri` is GPU passthrough for Intel/AMD; NVIDIA needs the container
-runtime instead of a device mount, covered in the docs.
+runtime instead of a device mount, covered in the docs. BIOS and firmware can
+also be pre-seeded with an optional volume mount instead of dragging files
+into the desktop; see [Running the container](https://romm-streaming.github.io/romm-broker/docs/container).
 
 Then point RomM at it: add a `webstation` container under
 `streaming.containers` in RomM's `config.yml`, matching the `SUBFOLDER` and
