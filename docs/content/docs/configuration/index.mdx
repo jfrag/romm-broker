@@ -24,6 +24,8 @@ of these need setting inside the stock image except `BROKER_SECRET`, and
 | `BROKER_SAVE_UPLOAD_TIMEOUT` | `30` | Seconds allowed for the exit save upload. |
 | `BROKER_STATE_FILE_MAX_BYTES` | `268435456` | Ceiling on one state file over the state-file routes (256 MiB). RomM caps the same transfer, so raising one end alone only moves which end refuses. |
 | `BROKER_STATE_SCREENSHOT_MAX_BYTES` | `16777216` | Ceiling on the frame served with a state (16 MiB). Same two-sided cap. |
+| `SAVE_FILE_MAX_BYTES` | `268435456` | Ceiling on a save or memory-card archive, over the import, exit-dump and memory-card routes (256 MiB). Unlike the other broker settings this one has no `BROKER_` prefix. |
+| `BROKER_SAVE_FILE_MAX_ENTRIES` | `10000` | Ceiling on the number of members a save or memory-card archive may contain. Independent of `SAVE_FILE_MAX_BYTES`: a byte-size cap alone doesn't stop an archive of huge numbers of near-zero-byte, deeply nested entries from exhausting inodes or hanging the restore walk. |
 | `BROKER_GAMEPAD_SLOTS` | `4` | Number of virtual gamepad slots the room can assign. |
 | `BROKER_DEV_MODE` | unset | `true` runs from mounted source with uvicorn and vite hot reload, and disables the exit save upload (report-only). See [Dev mode](/docs/container/dev-mode). |
 

@@ -1,4 +1,4 @@
 {
   "title": "Developer",
-  "pages": ["index", "architecture", "adding-an-emulator", "documentation", "reference"]
+  "pages": ["index", "architecture", "frontend", "adding-an-emulator", "documentation", "reference"]
 }

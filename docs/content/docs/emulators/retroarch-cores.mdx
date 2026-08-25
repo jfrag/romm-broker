@@ -1,4 +1,7 @@
-# RetroArch core manifest
+---
+title: "RetroArch core manifest"
+description: "Which libretro core each RomM platform maps to, and whether it needs a BIOS, firmware, or key file before it will boot."
+---
 
 `retroarch_platforms.json` maps every RomM platform slug this repo supports to a
 libretro core. Most cores just work once downloaded, but a number of them need
@@ -41,7 +44,7 @@ not as settled.
 | Platform | Core | Setup | Details |
 | --- | --- | --- | --- |
 | GameCube / Wii | `dolphin` | Optional | HLE boot by default; a real `IPL.bin` improves accuracy. Thumbnails are disabled for this core (a GPU framebuffer grab after save can deadlock the stdin command channel), and it uses a custom save-subtree layout. |
-| 3DS | `azahar` | Optional | Most dumps boot with nothing; encrypted `.3ds`/`.cci` files need decryption keys (`boot9.bin`/`boot11.bin`) in the system dir. Sourced from a GitHub release instead of the buildbot, and uses a custom save-subtree layout. This is the only integration point for 3DS; standalone Azahar has no IPC for the broker to reach it (see [standalone_emulators.md](standalone_emulators.md#azahar)). |
+| 3DS | `azahar` | Optional | Most dumps boot with nothing; encrypted `.3ds`/`.cci` files need decryption keys (`boot9.bin`/`boot11.bin`) in the system dir. Sourced from a GitHub release instead of the buildbot, and uses a custom save-subtree layout. This is the only integration point for 3DS; standalone Azahar has no IPC for the broker to reach it (see [Azahar setup](/docs/emulators/setup#azahar)). |
 
 ## Sega
 
@@ -50,7 +53,7 @@ not as settled.
 | Genesis/MD, Master System, Game Gear, SG-1000 | `genesis_plus_gx` | None | All four cart platforms on this core boot with nothing extra. |
 | Sega CD | `genesis_plus_gx` | Required | Region CD BIOS (e.g. `bios_CD_U.bin`). Same core as the row above; only this platform needs it. |
 | 32X | `picodrive` | None | Boot code lives on the cartridge itself. |
-| Dreamcast | `flycast` | Required | `dc_boot.bin` and `dc_flash.bin`, matching the standalone Flycast module's requirement (see [standalone_emulators.md](standalone_emulators.md#flycast)). |
+| Dreamcast | `flycast` | Required | `dc_boot.bin` and `dc_flash.bin`, matching the standalone Flycast module's requirement (see [Flycast setup](/docs/emulators/setup#flycast)). |
 | Saturn | `yabasanshiro` | Required | Region Saturn BIOS. |
 
 ## Sony
