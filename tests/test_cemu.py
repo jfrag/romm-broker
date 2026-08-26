@@ -163,6 +163,31 @@ def test_settings_patch_keeps_what_the_user_tuned(config_dir: Path) -> None:
     assert root.find("graphic_api").text == "1"
 
 
+def test_settings_pins_the_audio_device_to_default(config_dir: Path) -> None:
+    """TVDevice and PadDevice are forced to the cubeb default sentinel."""
+    cemu._patch_settings()
+
+    root = ET.parse(cemu.SETTINGS_PATH).getroot()
+    audio = root.find("Audio")
+    assert audio.find("TVDevice").text == "default"
+    assert audio.find("PadDevice").text == "default"
+
+
+def test_settings_patch_overwrites_a_blank_audio_device(config_dir: Path) -> None:
+    """An existing blank TVDevice/PadDevice, Cemu's own default, is patched too."""
+    config_dir.mkdir(parents=True)
+    cemu.SETTINGS_PATH.write_text(
+        "<content><Audio><TVDevice /><PadDevice /></Audio></content>"
+    )
+
+    cemu._patch_settings()
+
+    root = ET.parse(cemu.SETTINGS_PATH).getroot()
+    audio = root.find("Audio")
+    assert audio.find("TVDevice").text == "default"
+    assert audio.find("PadDevice").text == "default"
+
+
 def test_a_broken_settings_file_is_reseeded_not_fatal(config_dir: Path) -> None:
     """A settings.xml that does not parse is reseeded instead of raising."""
     config_dir.mkdir(parents=True)

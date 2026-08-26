@@ -99,6 +99,19 @@ check_update phones home at startup; the rest keep the session free of
 dialogs and chrome.
 """
 
+_AUDIO_DEVICE_PATCHES: dict[str, str] = {
+    "TVDevice": "default",
+    "PadDevice": "default",
+}
+"""`Audio/<key>` values forced before every launch, all children of `<content>/Audio`.
+
+Cemu ships these blank. `IAudioAPI::CreateDeviceFromConfig` treats an empty
+device string as "no device" and silently skips opening any audio stream at
+all, rather than falling back to the system default. `default` is the
+sentinel `CubebAPI::GetDevices()` reserves for a null device id, the only
+string that path resolves to "let cubeb pick the system default".
+"""
+
 _PAD_NAME = os.environ.get("CEMU_PAD_NAME", "Microsoft X-Box 360 pad")
 """The selkies virtual pad's name as the interposer presents it (env `CEMU_PAD_NAME`)."""
 
@@ -251,6 +264,14 @@ def _patch_settings() -> None:
             node = root.find(key)
             if node is None:
                 node = ET.SubElement(root, key)
+            node.text = value
+        audio = root.find("Audio")
+        if audio is None:
+            audio = ET.SubElement(root, "Audio")
+        for key, value in _AUDIO_DEVICE_PATCHES.items():
+            node = audio.find(key)
+            if node is None:
+                node = ET.SubElement(audio, key)
             node.text = value
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = SETTINGS_PATH.with_suffix(".tmp")
