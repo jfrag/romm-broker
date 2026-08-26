@@ -100,13 +100,7 @@ dialogs and chrome.
 """
 
 _PAD_NAME = os.environ.get("CEMU_PAD_NAME", "Microsoft X-Box 360 pad")
-"""The selkies virtual pad's name as the kernel xpad driver presents it (env `CEMU_PAD_NAME`)."""
-_PAD_VENDOR = 0x045E
-"""USB vendor id of the virtual pad (Microsoft)."""
-_PAD_PRODUCT = 0x028E
-"""USB product id of the virtual pad (Xbox 360 controller)."""
-_PAD_VERSION = 0x0110
-"""USB device version of the virtual pad."""
+"""The selkies virtual pad's name as the interposer presents it (env `CEMU_PAD_NAME`)."""
 
 _VPAD_SDL_MAPPINGS: tuple[tuple[int, int], ...] = (
     (1, 1),    # A -> east
@@ -161,10 +155,13 @@ def _crc16(data: bytes) -> int:
 
 
 def _sdl_guid(crc: int) -> str:
-    """A Linux evdev SDL joystick GUID for the virtual pad.
+    """The SDL joystick GUID the interposer's virtual pad actually reports.
 
-    Bus, name CRC, vendor, product and version as little-endian u16 fields
-    padded to 16 bytes.
+    The interposer only exposes the pad through the legacy /dev/input/jsN
+    nodes, which carry no vendor/product ioctls, so SDL can't build the usual
+    bus+vendor+product GUID and falls back to its name-based form instead:
+    a zero bus, the name CRC, then the name itself (11 bytes, NUL-padded)
+    filling the rest.
 
     Args:
         crc: The name CRC field, zero for SDL before 2.24.
@@ -172,8 +169,12 @@ def _sdl_guid(crc: int) -> str:
     Returns:
         The 32-character lowercase hex GUID.
     """
-    fields = (0x03, crc, _PAD_VENDOR, 0, _PAD_PRODUCT, 0, _PAD_VERSION, 0)
-    return "".join(f"{f & 0xFF:02x}{(f >> 8) & 0xFF:02x}" for f in fields)
+    tail = _PAD_NAME.encode()[:11] + b"\x00"
+    guid = bytearray(16)
+    guid[2] = crc & 0xFF
+    guid[3] = (crc >> 8) & 0xFF
+    guid[4 : 4 + len(tail)] = tail
+    return guid.hex()
 
 
 def _pad_uuids() -> list[str]:

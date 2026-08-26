@@ -179,9 +179,14 @@ def test_crc16_matches_the_arc_check_value() -> None:
     assert cemu._crc16(b"123456789") == 0xBB3D
 
 
-def test_the_classic_pad_guid_is_the_known_xpad_entry() -> None:
-    """Pad index 0 produces the well-known SDL GUID of the xpad controller."""
-    assert cemu._sdl_guid(0) == "030000005e0400008e02000010010000"
+def test_sdl_guid_is_the_interposers_name_based_fallback() -> None:
+    """With crc=0, the GUID is a zero bus and crc followed by the pad name."""
+    assert cemu._sdl_guid(0) == "000000004d6963726f736f6674205800"
+
+
+def test_sdl_guid_matches_the_interposers_measured_guid_with_crc() -> None:
+    """With the real name crc, the GUID matches the one measured against a live interposer."""
+    assert cemu._sdl_guid(cemu._crc16(cemu._PAD_NAME.encode())) == "000081b84d6963726f736f6674205800"
 
 
 def test_pad_profile_carries_both_guid_variants(config_dir: Path) -> None:
