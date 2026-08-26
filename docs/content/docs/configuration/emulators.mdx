@@ -95,6 +95,11 @@ Timings are in seconds.
 | `SHADPS4_DATA_DIR` | `/config/.local/share/shadPS4` | shadPS4's data directory (`home/1000/savedata/` is the save subtree). |
 | `SHADPS4_LOG_PATH` | `/config/shadps4.log` | Where shadPS4's stdout/stderr is captured. |
 | `SHADPS4_STOP_WAIT` | `20` | How long the IPC STOP gets to finish before SIGTERM. |
+| `SHADPS4_PKG_EXTRACTOR_BIN` | `pkg_extractor` | The standalone `pkg_extractor` binary a `.pkg` ROM (or a `.7z`/`.zip`/`.rar` archive holding one) is unpacked with; requires `unrar` and `7z` on PATH too when the ROM is an archive. |
+| `SHADPS4_PKG_EXTRACT_TIMEOUT` | `1800` | Seconds a `pkg_extractor` (or archive extraction) run gets before it is considered hung. |
+| `SHADPS4_CACHE_ENABLED` | `false` | Keep a `.pkg` extraction in `SHADPS4_CACHE_DIR` and reuse it on the next launch instead of deleting it once the game stops. |
+| `SHADPS4_CACHE_DIR` | `/config/.local/share/shadPS4/extracted` | Where a kept extraction is cached, when `SHADPS4_CACHE_ENABLED` is on. |
+| `SHADPS4_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. |
 
 ## RetroArch
 
