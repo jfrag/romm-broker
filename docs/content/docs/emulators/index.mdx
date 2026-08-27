@@ -135,11 +135,23 @@ and exit sends STOP (the SDL quit event) for a graceful teardown before the
 save delta is dumped. shadPS4 has no SIGTERM handler, so SIGTERM is only the
 fallback if STOP doesn't finish in `SHADPS4_STOP_WAIT` (default 20 s).
 
+`rom.path` may be a game folder (holding `eboot.bin`), a bare `eboot.bin`, or a
+`.zar`. A `.pkg`, or a `.7z`/`.zip`/`.rar` holding one, boots only with
+`SHADPS4_CACHE_ENABLED` on, since it has to be unpacked into the cache first;
+with the cache off those formats are refused rather than accepted and failed
+later, and are left out of the emulator's advertised extensions entirely.
+
 ## RPCS3
 
 No save states; `dev_hdd0/home/` is the persistence. `rom.path` may be a
 PKG, which the launcher installs first (`RPCS3_INSTALL_TIMEOUT` bounds the
 decryption), an extracted game folder, or a disc image.
+
+A `.7z`/`.zip`/`.rar` archive of a game folder boots only with
+`RPCS3_CACHE_ENABLED` on, since it has to be extracted first; with the cache
+off it is refused rather than accepted and failed later, and is left out of
+the emulator's advertised extensions. A PKG is unaffected either way: its
+installer is separate from the cache.
 
 ## xemu
 

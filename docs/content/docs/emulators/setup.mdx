@@ -161,14 +161,23 @@ are the shadPS4 cores it downloads.
 </Callout>
 
 <Callout type="info">
-A `.pkg` ROM, or a `.7z`/`.zip`/`.rar` archive holding one, needs the
-extraction cache. Set `SHADPS4_CACHE_ENABLED=true` to boot those formats: the
-first launch extracts the ROM into the cache and every later launch reuses
-that extraction (see [Configuration](/docs/configuration/emulators)). Leave
-the flag off, its default, and a `.pkg`/archive ROM is refused outright rather
-than re-extracted and thrown away on every launch, so only natively bootable
-formats work. While extracting, `GET /api/session/status` reports
-`extraction_phase` as `"extracting_archive"` or `"extracting_pkg"`.
+shadPS4 boots an `eboot.bin` out of an extracted game folder and cannot boot a
+`.pkg` directly, so a `.pkg` ROM (or a `.7z`/`.zip`/`.rar` archive holding one)
+has to be unpacked by `pkg_extractor` before it can run, and the extraction
+cache is where that unpacked copy goes. Set `SHADPS4_CACHE_ENABLED=true` to
+boot those formats: the first launch extracts the ROM and every later launch
+reuses that extraction, bounded by `SHADPS4_CACHE_MAX_GB` (default 30GB,
+oldest extraction evicted first). The cache lives at
+`/config/.local/share/shadPS4/extracted`; if you enable it, point a dedicated
+bind mount or Docker volume at that path so it doesn't compete with the rest
+of `/config` for space.
+
+Leave `SHADPS4_CACHE_ENABLED` off, its default, and a `.pkg`/archive ROM is
+refused outright rather than re-extracted and thrown away on every launch, so
+only natively bootable formats (a game folder, a bare `eboot.bin`, a `.zar`)
+work. While extracting, `GET /api/session/status` reports `extraction_phase`
+as `"extracting_archive"` or `"extracting_pkg"` (see
+[Configuration](/docs/configuration/emulators)).
 </Callout>
 
 ## PCSX2

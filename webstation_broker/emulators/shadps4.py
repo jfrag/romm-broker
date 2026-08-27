@@ -104,8 +104,22 @@ _GPU_BLOCK_RE = re.compile(r"^GPU(\d+):\s*$", re.MULTILINE)
 _DEVICE_TYPE_RE = re.compile(r"^\s*deviceType\s*=\s*(\S+)\s*$", re.MULTILINE)
 """Matches the `deviceType = ...` line within one device's block."""
 
+_VULKANINFO_TIMEOUT = 10
+"""Seconds one `vulkaninfo --summary` probe may take before it is abandoned."""
+
+_GPU_DETECT_LOCK = Lock()
+"""Guards the detection memo and its attempt counter, both read/written from launch threads."""
+
 _DETECTED_GPU_ID: Optional[int] = None
 """Memoized successful `_detect_gpu_id` result; None means "not detected yet"."""
+
+_GPU_DETECT_ATTEMPTS = 0
+"""Failed probes so far, counted against `_MAX_GPU_DETECT_ATTEMPTS`."""
+
+_MAX_GPU_DETECT_ATTEMPTS = 3
+"""Failures after which detection stops retrying, so a vulkaninfo that hangs
+rather than exits costs `_VULKANINFO_TIMEOUT` a few times instead of on every
+launch for the broker's lifetime."""
 
 _ARCHIVE_EXTS = (".7z", ".zip", ".rar")
 """Archive formats that may hold a `.pkg`, extracted before pkg_extractor ever sees it."""
@@ -517,7 +531,9 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
 
     Raises:
         RuntimeError: If archive extraction or pkg_extractor fails, the
-            archive holds no .pkg, or the extraction holds no eboot.bin.
+            archive holds no .pkg, the extraction holds no eboot.bin, or the
+            finished extraction cannot be moved to its cache key.
+        OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _CACHE_LOCK:
         key = _cache_key(rom)
@@ -575,10 +591,24 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
                     _run_pkg_extractor(rom, staged)
                 if _extracted_boot_target(staged) is None:
                     raise RuntimeError(f"{rom.name} extracted but held no eboot.bin")
-                staged.replace(game_dir)
+                # The rmtree above uses ignore_errors, so game_dir can still
+                # be sitting there non-empty and the rename then fails.
+                try:
+                    staged.replace(game_dir)
+                except OSError as exc:
+                    log.error(
+                        "shadps4 cache: could not move the extraction of %s into %s: %s",
+                        rom.name, game_dir, exc,
+                    )
+                    raise RuntimeError(
+                        f"could not cache the extraction of {rom.name}: {exc}"
+                    ) from exc
         finally:
             emulator.extraction_phase = None
 
+        # Re-looked up under game_dir rather than carried over from staged: a
+        # relative symlink resolves against wherever it now sits, so a member
+        # contained inside the scratch tree can point outside this one.
         boot = _extracted_boot_target(game_dir)
         if boot is None:
             raise RuntimeError(f"{rom.name} extracted but held no eboot.bin")
@@ -587,7 +617,7 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
     return boot
 
 
-def _detect_gpu_id() -> Optional[int]:
+def _probe_gpu_id() -> Optional[int]:
     """The Vulkan device index of the best real GPU on this host, vendor-agnostic.
 
     Runs `vulkaninfo --summary` with `DISPLAY` cleared: with a live X/Wayland
@@ -600,24 +630,19 @@ def _detect_gpu_id() -> Optional[int]:
     `PHYSICAL_DEVICE_TYPE_CPU` and is never picked. Ties go to the
     lowest-numbered device.
 
-    A successful detection is cached for the process lifetime, since the
-    host's GPU set does not change between launches. A failure is not: a
-    probe that fails while the container is still coming up would otherwise
-    disable the pin for the broker's whole lifetime, and every later launch
-    would silently keep shadPS4's black-screen `-1`.
-
     Returns:
         The device index to pin, or None when vulkaninfo is missing, fails,
         times out, or every enumerated device is a CPU/unrecognized type.
     """
-    global _DETECTED_GPU_ID
-    if _DETECTED_GPU_ID is not None:
-        return _DETECTED_GPU_ID
     env = dict(os.environ)
     env["DISPLAY"] = ""
     try:
         result = subprocess.run(
-            [VULKANINFO_BIN, "--summary"], capture_output=True, text=True, env=env, timeout=10
+            [VULKANINFO_BIN, "--summary"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_VULKANINFO_TIMEOUT,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         log.warning("shadps4: could not run %s to detect a GPU (%s)", VULKANINFO_BIN, exc)
@@ -648,8 +673,42 @@ def _detect_gpu_id() -> Optional[int]:
         log.warning("shadps4: %s found no usable GPU device, leaving gpu_id on auto-select", VULKANINFO_BIN)
         return None
     log.info("shadps4: detected GPU index %d for gpu_id pin (%s)", best[1], VULKANINFO_BIN)
-    _DETECTED_GPU_ID = best[1]
-    return _DETECTED_GPU_ID
+    return best[1]
+
+
+def _detect_gpu_id() -> Optional[int]:
+    """`_probe_gpu_id`, memoized and bounded, for the launch path to call.
+
+    A success is kept for the process lifetime, since the host's GPU set does
+    not change between launches. A failure is retried: a probe that fails
+    while the container is still coming up would otherwise disable the pin
+    for the broker's whole lifetime, and every later launch would silently
+    keep shadPS4's black-screen `-1`. Retries stop after
+    `_MAX_GPU_DETECT_ATTEMPTS` so a vulkaninfo that hangs instead of exiting
+    cannot cost every future launch a `_VULKANINFO_TIMEOUT` stall.
+
+    The lock guards both globals and doubles as a guarantee that two launches
+    racing here run one probe between them rather than two.
+
+    Returns:
+        The device index to pin, or None while no probe has succeeded.
+    """
+    global _DETECTED_GPU_ID, _GPU_DETECT_ATTEMPTS
+    with _GPU_DETECT_LOCK:
+        if _DETECTED_GPU_ID is not None:
+            return _DETECTED_GPU_ID
+        if _GPU_DETECT_ATTEMPTS >= _MAX_GPU_DETECT_ATTEMPTS:
+            log.warning(
+                "shadps4: not retrying GPU detection, %s failed %d times",
+                VULKANINFO_BIN, _GPU_DETECT_ATTEMPTS,
+            )
+            return None
+        detected = _probe_gpu_id()
+        if detected is None:
+            _GPU_DETECT_ATTEMPTS += 1
+            return None
+        _DETECTED_GPU_ID = detected
+        return _DETECTED_GPU_ID
 
 
 def _pin_gpu_id() -> None:

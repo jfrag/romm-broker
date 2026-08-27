@@ -21,10 +21,12 @@ def _isolated_gpu_pin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     Points SHADPS4_CONFIG_PATH at a file that does not exist, so a test that
     exercises launch() without caring about the pin never touches the real
     host's config.json or shells out to vulkaninfo. A successful detection
-    is memoized process-wide, so that memo is reset before every test too.
+    is memoized process-wide and failures are counted toward a retry cap, so
+    both are reset before every test too.
     """
     monkeypatch.setattr(shadps4, "SHADPS4_CONFIG_PATH", tmp_path / "unused-config.json")
     monkeypatch.setattr(shadps4, "_DETECTED_GPU_ID", None)
+    monkeypatch.setattr(shadps4, "_GPU_DETECT_ATTEMPTS", 0)
 
 
 @pytest.fixture
@@ -456,6 +458,28 @@ def test_detect_gpu_id_retries_after_a_failure(monkeypatch: pytest.MonkeyPatch) 
 
     assert shadps4._detect_gpu_id() is None
     assert shadps4._detect_gpu_id() == 0
+
+
+def test_detect_gpu_id_stops_retrying_after_the_attempt_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection gives up once the cap is reached, so a hung vulkaninfo is not run forever.
+
+    A probe that times out costs a full `_VULKANINFO_TIMEOUT`, and paying
+    that on every launch for the process lifetime is worse than losing the
+    pin.
+    """
+    probes = 0
+
+    def fail() -> Optional[int]:
+        nonlocal probes
+        probes += 1
+        return None
+
+    monkeypatch.setattr(shadps4, "_probe_gpu_id", fail)
+
+    for _ in range(shadps4._MAX_GPU_DETECT_ATTEMPTS + 2):
+        assert shadps4._detect_gpu_id() is None
+
+    assert probes == shadps4._MAX_GPU_DETECT_ATTEMPTS
 
 
 def test_pin_gpu_id_auto_uses_the_detected_index(pinned: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1081,6 +1105,29 @@ def test_a_partial_extraction_never_appears_at_the_cache_key(
 
     assert seen == [False]
     assert (game_dir / "CUSA23079" / "eboot.bin").is_file()
+
+
+def test_an_uncleared_cache_dir_fails_the_extraction_instead_of_silently_escaping(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A game dir that would not delete raises RuntimeError, not a bare OSError.
+
+    The stale-entry cleanup ignores errors, so the rename into place can
+    still find the old directory there; launch only translates RuntimeError
+    into a useful message.
+    """
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"pkg")
+    game_dir = _touch(cache_dir / shadps4._cache_key(pkg) / "junk.txt").parent
+    monkeypatch.setattr(shadps4.shutil, "rmtree", lambda *a, **k: None)
+    monkeypatch.setattr(
+        shadps4, "_run_pkg_extractor", lambda p, d: _touch(d / "CUSA23079" / "eboot.bin")
+    )
+
+    with pytest.raises(RuntimeError, match="could not cache the extraction"):
+        shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+    assert (game_dir / "junk.txt").is_file()
 
 
 def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(

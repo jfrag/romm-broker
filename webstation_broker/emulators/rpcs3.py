@@ -447,6 +447,18 @@ def _clear_scratch() -> None:
         shutil.rmtree(entry, ignore_errors=True)
 
 
+def sweep_stale_extractions() -> None:
+    """Remove extraction scratch dirs orphaned by a crashed broker process.
+
+    `tempfile.TemporaryDirectory` cleans up on normal exit, but a killed
+    process leaves its scratch dir behind forever. Call once at broker
+    startup: the only other caller is an extraction, which a library of
+    already-extracted (or never-archived) games may never run again.
+    """
+    with _CACHE_LOCK:
+        _clear_scratch()
+
+
 def _evict_lru(needed_bytes: int, keep: str) -> None:
     """Evict least-recently-used extracted games until `needed_bytes` fits within CACHE_MAX_GB.
 
@@ -664,8 +676,10 @@ def _extract_and_cache(archive: Path, emulator: Emulator) -> Path:
             returning or raising.
 
     Raises:
-        RuntimeError: If extraction fails, or the extracted archive holds
-            no EBOOT.BIN or decrypted .iso to boot.
+        RuntimeError: If extraction fails, the extracted archive holds no
+            EBOOT.BIN or decrypted .iso to boot, or the finished extraction
+            cannot be moved to its cache key.
+        OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _CACHE_LOCK:
         key = _cache_key(archive)
@@ -709,10 +723,24 @@ def _extract_and_cache(archive: Path, emulator: Emulator) -> Path:
                     raise RuntimeError(
                         f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso"
                     )
-                staged.replace(game_dir)
+                # The rmtree above uses ignore_errors, so game_dir can still
+                # be sitting there non-empty and the rename then fails.
+                try:
+                    staged.replace(game_dir)
+                except OSError as exc:
+                    log.error(
+                        "rpcs3 cache: could not move the extraction of %s into %s: %s",
+                        archive.name, game_dir, exc,
+                    )
+                    raise RuntimeError(
+                        f"could not cache the extraction of {archive.name}: {exc}"
+                    ) from exc
         finally:
             emulator.extraction_phase = None
 
+        # Re-looked up under game_dir rather than carried over from staged: a
+        # relative symlink resolves against wherever it now sits, so a member
+        # contained inside the scratch tree can point outside this one.
         boot = _archive_boot_target(game_dir)
         if boot is None:
             raise RuntimeError(f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso")

@@ -1507,6 +1507,66 @@ def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(
     assert scratch_at_eviction == [False]
 
 
+def test_an_uncleared_cache_dir_fails_the_extraction_instead_of_silently_escaping(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A game dir that would not delete raises RuntimeError, not a bare OSError.
+
+    The stale-entry cleanup ignores errors, so the rename into place can
+    still find the old directory there; launch only translates RuntimeError
+    into a useful message.
+    """
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+    game_dir = _touch(cache_dir / rpcs3._cache_key(archive) / "junk.txt").parent
+    monkeypatch.setattr(rpcs3.shutil, "rmtree", lambda *a, **k: None)
+    monkeypatch.setattr(
+        rpcs3, "_extract_archive", lambda a, d: _touch(d / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
+    )
+
+    with pytest.raises(RuntimeError, match="could not cache the extraction"):
+        rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
+
+    assert (game_dir / "junk.txt").is_file()
+
+
+def test_sweep_stale_extractions_removes_orphaned_scratch_dirs_but_keeps_real_ones(
+    cache_dir: Path,
+) -> None:
+    """Sweep stale extractions empties the scratch subtree but keeps real cache entries."""
+    scratch = _touch(
+        cache_dir / rpcs3._SCRATCH_DIR_NAME / "Game-abc123-xyz987" / "leftover.iso"
+    ).parent
+    game_dir = _touch(cache_dir / "Game-abc123" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").parent
+
+    rpcs3.sweep_stale_extractions()
+
+    assert not scratch.exists()
+    assert game_dir.exists()
+
+
+def test_sweep_stale_extractions_removes_a_scratch_dir_holding_a_bootable_decoy(
+    cache_dir: Path,
+) -> None:
+    """An orphaned scratch dir is swept even when it holds a bootable-looking file.
+
+    Scratch holds an archive's raw contents, so an EBOOT.BIN under it proves
+    nothing; living under the scratch subtree is what makes it scratch.
+    """
+    scratch = _touch(
+        cache_dir / rpcs3._SCRATCH_DIR_NAME / "Game-abc123" / "PS3_GAME" / "USRDIR" / "EBOOT.BIN"
+    ).parent.parent.parent
+
+    rpcs3.sweep_stale_extractions()
+
+    assert not scratch.exists()
+
+
+def test_sweep_stale_extractions_is_a_noop_without_a_cache_dir(cache_dir: Path) -> None:
+    """Sweep stale extractions is a no-op when the cache dir does not exist yet."""
+    rpcs3.sweep_stale_extractions()  # must not raise
+
+
 def test_launch_extracts_and_boots_from_an_archive_rom(
     rpcs3_dirs: dict[str, Path],
     no_boot_watchdog: list[tuple[str, tuple]],

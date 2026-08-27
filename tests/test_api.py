@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from webstation_broker import session, settings
 from webstation_broker.app import create_app
-from webstation_broker.emulators import base
+from webstation_broker.emulators import base, rpcs3, shadps4
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -674,6 +674,31 @@ def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
 
     assert proc.wait(timeout=10) == -signal.SIGTERM
     assert not pid_record.exists()
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, ""])
+def test_starting_the_app_sweeps_the_scratch_dirs_both_caching_emulators_leave(
+    prefix: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Startup reclaims orphaned extraction scratch for every emulator that extracts.
+
+    Scratch is otherwise only cleared by the next extraction, and a library
+    whose games are already extracted may never run one again.
+    """
+    monkeypatch.setattr(settings, "PREFIX", prefix)
+    orphans = []
+    for module, name in ((shadps4, "shadps4"), (rpcs3, "rpcs3")):
+        cache = tmp_path / name
+        monkeypatch.setattr(module, "CACHE_DIR", cache)
+        scratch = cache / module._SCRATCH_DIR_NAME / "dead-run"
+        scratch.mkdir(parents=True)
+        (scratch / "leftover").write_bytes(b"x")
+        orphans.append(scratch)
+
+    with TestClient(create_app()):
+        pass
+
+    assert [o.exists() for o in orphans] == [False, False]
 
 
 def test_exiting_nothing_is_a_conflict(client: TestClient) -> None:

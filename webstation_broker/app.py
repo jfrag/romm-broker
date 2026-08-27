@@ -19,7 +19,8 @@ from starlette.responses import Response
 
 from . import api, room, settings
 from .emulators.base import reap_orphan
-from .emulators.shadps4 import sweep_stale_extractions
+from .emulators.rpcs3 import sweep_stale_extractions as sweep_rpcs3_extractions
+from .emulators.shadps4 import sweep_stale_extractions as sweep_shadps4_extractions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +38,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     next activate is what keeps it killable at all: exit answers 409 without a
     session, so otherwise the only way out is launching another game.
 
-    Also sweeps shadPS4 archive-extraction scratch dirs left behind by a
-    crashed broker process, before any new extraction can be in flight.
+    Also sweeps the shadPS4 and RPCS3 extraction scratch dirs left behind by
+    a crashed broker process, before any new extraction can be in flight.
 
     Args:
         _app: The application being started; unused.
@@ -47,7 +48,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Nothing; control passes to the running application once the orphan is reaped.
     """
     await anyio.to_thread.run_sync(reap_orphan)
-    await anyio.to_thread.run_sync(sweep_stale_extractions)
+    await anyio.to_thread.run_sync(sweep_shadps4_extractions)
+    await anyio.to_thread.run_sync(sweep_rpcs3_extractions)
     yield
 
 
