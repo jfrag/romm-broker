@@ -1167,8 +1167,9 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
         `{"active": False}` when no session exists. Otherwise the session's
         `active` flag, `session_id`, `emulator`, `rom`, `rom_file` and
         `multiplayer` flag, whether the process is `emulator_alive`, the
-        emulator's `boot_failed`, `supports_states` and `state_slot` signals,
-        `started_at`, the controlling `user` and the seated `viewers`.
+        emulator's `boot_failed`, `extraction_phase`, `supports_states` and
+        `state_slot` signals, `started_at`, the controlling `user` and the
+        seated `viewers`.
 
     Raises:
         HTTPException: 403 on a bad secret.
@@ -1189,6 +1190,10 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
         # today, via PINE). Passive: RomM decides what to do about it, this
         # route only reports it.
         "boot_failed": sess["emulator_obj"].boot_failed,
+        # Set while a slow pre-launch extraction (shadPS4/RPCS3 pkg or
+        # archive) is running, else None. Same passive-signal shape as
+        # boot_failed: RomM decides what to show, this route only reports it.
+        "extraction_phase": sess["emulator_obj"].extraction_phase,
         # The emulator class is the authority on what it can do, so RomM reads
         # this rather than keeping its own per-emulator table.
         "supports_states": sess["emulator_obj"].supports_states,

@@ -160,6 +160,17 @@ configure through it, but the binaries that single game launches actually use
 are the shadPS4 cores it downloads.
 </Callout>
 
+<Callout type="info">
+A `.pkg` ROM, or a `.7z`/`.zip`/`.rar` archive holding one, needs the
+extraction cache. Set `SHADPS4_CACHE_ENABLED=true` to boot those formats: the
+first launch extracts the ROM into the cache and every later launch reuses
+that extraction (see [Configuration](/docs/configuration/emulators)). Leave
+the flag off, its default, and a `.pkg`/archive ROM is refused outright rather
+than re-extracted and thrown away on every launch, so only natively bootable
+formats work. While extracting, `GET /api/session/status` reports
+`extraction_phase` as `"extracting_archive"` or `"extracting_pkg"`.
+</Callout>
+
 ## PCSX2
 
 PCSX2 runs a setup wizard much like DuckStation's. Upload your BIOS files and
@@ -167,6 +178,17 @@ select them, skip the game folder step, and for controller setup pick the
 proper SDL devices: SDL 0 for player 1 and SDL 1 for player 2.
 
 Set your graphics preferences and test a game before moving on.
+
+## PPSSPP
+
+PPSSPP needs no BIOS; PSP support is fully HLE. Controllers work out of the
+box through SDL, so the desktop visit is mostly about graphics and audio.
+
+PPSSPP is hotkey driven like Dolphin, working in state slot 1. Save data and
+states live under `PSP/` in `PPSSPP_CONFIG_DIR` (default
+`/config/.config/ppsspp`).
+
+Set your graphics options and test a real game before moving on.
 
 ## RetroArch
 
@@ -197,16 +219,22 @@ Adjust graphics settings as desired and run a game to confirm.
 > game and, when a game's title id can't be read from the file path alone,
 > to look it up once the game is confirmed running.
 >
-> A ROM stored as a `.7z`, `.zip`, or `.rar` archive is extracted on launch,
-> since RPCS3 cannot boot an archive directly. By default the extracted
-> copy is removed again once the game stops, so archiving a PS3 dump saves
-> library space without leaving a permanent decompressed copy on local
-> disk. Set `RPCS3_CACHE_ENABLED=true` to keep the extraction around and
-> reuse it on later launches instead, bounded by `RPCS3_CACHE_MAX_GB`
-> (default 30GB, oldest extraction evicted first). The cache lives at
+> A ROM stored as a `.7z`, `.zip`, or `.rar` archive has to be extracted
+> before it can boot, since RPCS3 cannot boot an archive directly, so those
+> formats need the extraction cache. Set `RPCS3_CACHE_ENABLED=true` to boot
+> them: the first launch extracts the ROM and every later launch reuses that
+> extraction, bounded by `RPCS3_CACHE_MAX_GB` (default 30GB, oldest
+> extraction evicted first). The cache lives at
 > `/config/.config/rpcs3/extracted`; if you enable it, point a dedicated
 > bind mount or Docker volume at that path so it doesn't compete with the
 > rest of `/config` for space.
+>
+> Leave `RPCS3_CACHE_ENABLED` off, its default, and an archived ROM is
+> refused outright rather than re-extracted and thrown away on every launch,
+> so only natively bootable formats (`.iso`, an installed `.pkg`) work.
+> `.pkg` is unaffected either way: it always installs through its own
+> installer, never through this cache. While an archive is extracting,
+> `GET /api/session/status` reports `extraction_phase: "extracting_archive"`.
 
 ## Cemu
 

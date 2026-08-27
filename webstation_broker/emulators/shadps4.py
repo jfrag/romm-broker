@@ -18,16 +18,18 @@ only the escalation fallback.
 shadPS4 has no PKG installer of its own; a `.pkg` ROM, or a `.7z`/`.zip`/
 `.rar` archive holding one, is unpacked with the standalone `pkg_extractor`
 tool into CACHE_DIR, mirroring rpcs3's archive cache
-(`webstation_broker/emulators/rpcs3.py`): extracted once and reused on
-relaunch when caching is enabled, removed again once the game stops when it
-is not, so an archived title never leaves a permanent decompressed copy on
-disk by default. An archive is unpacked to a scratch dir first to locate the
-`.pkg` it holds; only pkg_extractor's own output lands in CACHE_DIR, so the
-cache key is taken from the archive itself rather than the throwaway scratch
-extraction.
+(`webstation_broker/emulators/rpcs3.py`): extracted once and reused on every
+later launch. Those formats are only bootable at all with `CACHE_ENABLED`,
+since a multi-GB extraction thrown away on every launch buys nothing; with
+the cache off `resolve_rom_file` refuses them and only natively bootable
+formats work. An archive is unpacked to a scratch dir first to locate the
+`.pkg` it holds; only pkg_extractor's own output lands in the game dir, so
+the cache key is taken from the archive itself rather than the throwaway
+scratch extraction.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -64,6 +66,47 @@ DATA_DIR = Path(os.environ.get("SHADPS4_DATA_DIR", str(Path(XDG_DATA_HOME) / "sh
 SHADPS4_LOG_PATH = Path(os.environ.get("SHADPS4_LOG_PATH", "/config/shadps4.log"))
 """The emulator log file (env `SHADPS4_LOG_PATH`, default `/config/shadps4.log`)."""
 
+SHADPS4_CONFIG_PATH = Path(
+    os.environ.get("SHADPS4_CONFIG_PATH", str(DATA_DIR / "config.json"))
+)
+"""shadPS4's own config file (env `SHADPS4_CONFIG_PATH`, default `<data>/config.json`)."""
+
+SHADPS4_GPU_ID = os.environ.get("SHADPS4_GPU_ID", "auto")
+"""Vulkan device index pinned into config.json before each launch (env `SHADPS4_GPU_ID`, default `auto`).
+
+shadPS4's own `gpu_id: -1` (auto-select) can land on a CPU-rendered Vulkan
+device (llvmpipe, swiftshader, ...) instead of a real GPU: the game keeps
+running (audio, playtime counter) but every frame is presented black, since
+software rendering never keeps up with the presentation deadline. `auto`
+picks a real device via `_detect_gpu_id`, vendor-agnostic; an integer pins
+that index directly for a host `vulkaninfo` cannot read; `-1` or `KEEP`
+leaves config.json alone. The choice persists in config.json, so it is
+pinned before each launch regardless of which one shadPS4 wrote last.
+"""
+
+VULKANINFO_BIN = os.environ.get("SHADPS4_VULKANINFO_BIN", "vulkaninfo")
+"""The `vulkaninfo` binary used by `_detect_gpu_id` (env `SHADPS4_VULKANINFO_BIN`)."""
+
+_GPU_TYPE_PRIORITY = {
+    "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU": 0,
+    "PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU": 1,
+    "PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU": 2,
+}
+"""vulkaninfo `deviceType` values worth pinning to, best first.
+
+`PHYSICAL_DEVICE_TYPE_CPU` (llvmpipe, swiftshader, ...) and anything not
+listed here are never picked: this is the same vendor-neutral field
+regardless of whether the real device is AMD, NVIDIA, Intel, or virtio-gpu.
+"""
+
+_GPU_BLOCK_RE = re.compile(r"^GPU(\d+):\s*$", re.MULTILINE)
+"""Matches a `GPUn:` device header in `vulkaninfo --summary` output."""
+_DEVICE_TYPE_RE = re.compile(r"^\s*deviceType\s*=\s*(\S+)\s*$", re.MULTILINE)
+"""Matches the `deviceType = ...` line within one device's block."""
+
+_DETECTED_GPU_ID: Optional[int] = None
+"""Memoized successful `_detect_gpu_id` result; None means "not detected yet"."""
+
 _ARCHIVE_EXTS = (".7z", ".zip", ".rar")
 """Archive formats that may hold a `.pkg`, extracted before pkg_extractor ever sees it."""
 
@@ -81,15 +124,21 @@ PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
 PKG_EXTRACT_TIMEOUT = float(os.environ.get("SHADPS4_PKG_EXTRACT_TIMEOUT", "1800"))
 """Seconds a pkg_extractor run gets before it is considered hung (env `SHADPS4_PKG_EXTRACT_TIMEOUT`)."""
 
-# PS4 titles run several GB decrypted. With the cache enabled, a .pkg is
-# extracted once into CACHE_DIR and reused on relaunch; with it disabled
-# (the default), the extraction is removed again once the game stops, so
-# a .pkg ROM never leaves a permanent decompressed copy behind. Mirrors
-# rpcs3's identically-named archive cache.
+# PS4 titles run several GB decrypted, so a .pkg is extracted once into
+# CACHE_DIR and reused on every later launch. CACHE_ENABLED therefore gates
+# whether .pkg/archive ROMs are bootable at all, not just whether the
+# extraction is kept. Mirrors rpcs3's identically-named archive cache.
 CACHE_DIR = Path(os.environ.get("SHADPS4_CACHE_DIR", str(DATA_DIR / "extracted")))
 CACHE_ENABLED = _truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false"))
 CACHE_MAX_GB = float(os.environ.get("SHADPS4_CACHE_MAX_GB", "30"))
 _LAST_ACCESSED_MARKER = ".last_accessed"
+_SCRATCH_DIR_NAME = ".scratch"
+"""Subdirectory of CACHE_DIR every archive scratch extraction lives under.
+
+Keeping scratch dirs out of CACHE_DIR's top level means a cache entry and a
+scratch dir can never be confused by name, so eviction and the startup sweep
+both work off location rather than guessing from a filename.
+"""
 
 # Serializes cache-dir mutation: eviction picking a victim, extraction of a
 # new one, and the boot-target lookup that follows all touch the same
@@ -240,7 +289,7 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
     while current + needed_bytes > max_bytes:
         candidates = []
         for game_dir in CACHE_DIR.iterdir():
-            if not game_dir.is_dir() or game_dir.name == keep:
+            if not game_dir.is_dir() or game_dir.name in (keep, _SCRATCH_DIR_NAME):
                 continue
             marker = game_dir / _LAST_ACCESSED_MARKER
             try:
@@ -407,47 +456,64 @@ def _run_pkg_extractor(pkg: Path, dest: Path) -> None:
         )
 
 
+def _clear_scratch() -> None:
+    """Remove every scratch dir under CACHE_DIR. Callers must hold _CACHE_LOCK.
+
+    Everything under `_SCRATCH_DIR_NAME` is scratch by construction, so the
+    whole subtree goes without inspecting names or contents. Guessing from
+    either would be unsound in both directions: a real cache dir's key can
+    contain any substring the ROM's own filename does, and a scratch dir
+    holds whatever the archive held, up to and including a file named
+    eboot.bin.
+
+    The lock is what makes this safe: no extraction can be mid-flight while
+    it is held, so anything still sitting here was orphaned by a process
+    that died.
+    """
+    scratch_root = CACHE_DIR / _SCRATCH_DIR_NAME
+    if not scratch_root.is_dir():
+        return
+    for entry in scratch_root.iterdir():
+        log.warning("shadps4 cache: removing orphaned scratch dir %s", entry.name)
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 def sweep_stale_extractions() -> None:
-    """Remove archive-extraction scratch dirs orphaned by a crashed broker process.
+    """Remove extraction scratch dirs orphaned by a crashed broker process.
 
     `tempfile.TemporaryDirectory` cleans up on normal exit, but a killed
-    process leaves its `<key>-archive-*` scratch dir under CACHE_DIR behind
-    forever, since nothing else revisits it. Call once at broker startup,
-    before any extraction can be in flight.
-
-    The `-archive-` substring alone is not a safe discriminator: a ROM
-    whose own filename stem contains it (`_cache_key` is `<stem>-<digest>`)
-    would produce a real, already-booted cache dir with the same substring.
-    A genuine scratch dir never gets pkg_extractor's output or the
-    last-accessed marker, both written only to the real game_dir, so a
-    match with either present is a same-named cache dir, not a scratch dir.
+    process leaves its scratch dir behind forever. Call once at broker
+    startup so the space is reclaimed before the first launch rather than
+    only when the next extraction happens to run.
     """
-    if not CACHE_DIR.is_dir():
-        return
     with _CACHE_LOCK:
-        for entry in CACHE_DIR.iterdir():
-            if not entry.is_dir() or "-archive-" not in entry.name:
-                continue
-            if (entry / _LAST_ACCESSED_MARKER).exists() or _extracted_boot_target(entry) is not None:
-                continue
-            log.warning("shadps4 cache: removing orphaned scratch dir %s", entry.name)
-            shutil.rmtree(entry, ignore_errors=True)
+        _clear_scratch()
 
 
-def _extract_and_cache_pkg(rom: Path) -> Path:
+def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
     """Get rom (a .pkg, or an archive holding one) booting from CACHE_DIR.
 
     Reuses a prior extraction keyed by `_cache_key` when one already holds
-    a bootable eboot.bin. An archive is unpacked to a throwaway scratch dir
-    first to locate the .pkg it holds; only pkg_extractor's own output ever
-    lands in the persistent game_dir, keyed off rom itself, so relaunching
-    the same archive still hits the cache even though its scratch
-    extraction is discarded every time.
+    a bootable eboot.bin. Everything is unpacked under `_SCRATCH_DIR_NAME`
+    and only renamed to the persistent game_dir once a boot target is
+    confirmed, so game_dir either does not exist or holds a complete
+    extraction: a process killed mid-run leaves scratch to be reclaimed
+    rather than a truncated eboot.bin the next launch would cache-hit on
+    forever. An archive is unpacked to a second scratch dir first to locate
+    the .pkg it holds; only pkg_extractor's own output is kept, so
+    relaunching the same archive still hits the cache even though its
+    scratch extraction is discarded every time.
 
     Holds _CACHE_LOCK for the whole call: eviction, extraction, and the
     boot-target lookup all touch the same CACHE_DIR tree, so a second
     launch racing in here must wait rather than potentially evicting the
     directory this one is mid-extracting into or about to boot from.
+
+    Args:
+        rom: The .pkg or archive to extract.
+        emulator: The launching emulator; `emulator.extraction_phase` is set
+            while this runs so RomM can poll it, and cleared again before
+            returning or raising.
 
     Raises:
         RuntimeError: If archive extraction or pkg_extractor fails, the
@@ -466,45 +532,189 @@ def _extract_and_cache_pkg(rom: Path) -> Path:
             log.warning("shadps4 cache: %s has no boot target, re-extracting", rom.name)
             shutil.rmtree(game_dir, ignore_errors=True)
 
+        is_archive = rom.suffix.lower() in _ARCHIVE_EXTS
+        # Set before eviction, not after: eviction can rmtree tens of GB
+        # under the lock, and a caller polling extraction_phase should see
+        # that stall rather than an idle-looking None.
+        emulator.extraction_phase = "extracting_archive" if is_archive else "extracting_pkg"
         try:
-            size = rom.stat().st_size
-        except OSError:
-            size = 0
-        # An archive needs its scratch extraction and pkg_extractor's final
-        # output living under CACHE_DIR at the same time, not just the
-        # eventual cached copy alone.
-        needed = int(size * (2.2 if rom.suffix.lower() in _ARCHIVE_EXTS else 1.1))
-        _evict_lru(needed, key)
+            try:
+                size = rom.stat().st_size
+            except OSError:
+                size = 0
+            # An archive needs its scratch extraction and pkg_extractor's
+            # staged output living under CACHE_DIR at the same time, not
+            # just the eventual cached copy alone.
+            needed = int(size * (2.2 if is_archive else 1.1))
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # Orphaned scratch is un-evictable but still counts toward the
+            # cap, so reclaim it before sizing the cache rather than letting
+            # it push real entries out.
+            _clear_scratch()
+            _evict_lru(needed, key)
 
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        game_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            if rom.suffix.lower() == ".pkg":
-                _run_pkg_extractor(rom, game_dir)
-            else:
-                # The scratch dir lives under CACHE_DIR so the archive's
-                # extraction shares a filesystem with the final output
-                # rather than risking a cross-device copy or a smaller /tmp.
-                with tempfile.TemporaryDirectory(
-                    prefix=f"{key}-archive-", dir=str(CACHE_DIR)
-                ) as scratch:
-                    scratch_dir = Path(scratch)
-                    _extract_archive(rom, scratch_dir)
-                    pkg = _archive_pkg_member(scratch_dir)
+            # Scratch lives under CACHE_DIR so the staged output shares a
+            # filesystem with game_dir: the rename below is then atomic
+            # rather than a cross-device copy, and a big archive is never
+            # unpacked into a smaller /tmp.
+            scratch_root = CACHE_DIR / _SCRATCH_DIR_NAME
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=f"{key}-", dir=str(scratch_root)) as scratch:
+                staged = Path(scratch) / "extracted"
+                staged.mkdir()
+                if is_archive:
+                    unpacked = Path(scratch) / "archive"
+                    unpacked.mkdir()
+                    _extract_archive(rom, unpacked)
+                    pkg = _archive_pkg_member(unpacked)
                     if pkg is None:
                         raise RuntimeError(f"{rom.name} extracted but held no .pkg")
-                    _run_pkg_extractor(pkg, game_dir)
-        except RuntimeError:
-            shutil.rmtree(game_dir, ignore_errors=True)
-            raise
+                    emulator.extraction_phase = "extracting_pkg"
+                    _run_pkg_extractor(pkg, staged)
+                else:
+                    _run_pkg_extractor(rom, staged)
+                if _extracted_boot_target(staged) is None:
+                    raise RuntimeError(f"{rom.name} extracted but held no eboot.bin")
+                staged.replace(game_dir)
+        finally:
+            emulator.extraction_phase = None
 
         boot = _extracted_boot_target(game_dir)
         if boot is None:
-            shutil.rmtree(game_dir, ignore_errors=True)
             raise RuntimeError(f"{rom.name} extracted but held no eboot.bin")
         _touch_last_accessed(game_dir)
         log.info("shadps4: extracted %s, booting %s", rom.name, boot)
     return boot
+
+
+def _detect_gpu_id() -> Optional[int]:
+    """The Vulkan device index of the best real GPU on this host, vendor-agnostic.
+
+    Runs `vulkaninfo --summary` with `DISPLAY` cleared: with a live X/Wayland
+    connection vulkaninfo also probes surface creation, which can fail and
+    abort before the device list ever prints, and the device list is all
+    this needs. Devices are ranked by their `deviceType`
+    (`_GPU_TYPE_PRIORITY`), a field Vulkan itself defines the same way for
+    every vendor, so this needs no AMD/NVIDIA/Intel-specific logic; a
+    software rasterizer (llvmpipe, swiftshader, ...) reports as
+    `PHYSICAL_DEVICE_TYPE_CPU` and is never picked. Ties go to the
+    lowest-numbered device.
+
+    A successful detection is cached for the process lifetime, since the
+    host's GPU set does not change between launches. A failure is not: a
+    probe that fails while the container is still coming up would otherwise
+    disable the pin for the broker's whole lifetime, and every later launch
+    would silently keep shadPS4's black-screen `-1`.
+
+    Returns:
+        The device index to pin, or None when vulkaninfo is missing, fails,
+        times out, or every enumerated device is a CPU/unrecognized type.
+    """
+    global _DETECTED_GPU_ID
+    if _DETECTED_GPU_ID is not None:
+        return _DETECTED_GPU_ID
+    env = dict(os.environ)
+    env["DISPLAY"] = ""
+    try:
+        result = subprocess.run(
+            [VULKANINFO_BIN, "--summary"], capture_output=True, text=True, env=env, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("shadps4: could not run %s to detect a GPU (%s)", VULKANINFO_BIN, exc)
+        return None
+    if result.returncode != 0:
+        log.warning(
+            "shadps4: %s exited %d, cannot auto-detect a GPU: %s",
+            VULKANINFO_BIN, result.returncode, result.stderr.strip(),
+        )
+        return None
+
+    blocks = list(_GPU_BLOCK_RE.finditer(result.stdout))
+    best: Optional[tuple[int, int]] = None  # (priority, device index)
+    for i, block in enumerate(blocks):
+        index = int(block.group(1))
+        start = block.end()
+        end = blocks[i + 1].start() if i + 1 < len(blocks) else len(result.stdout)
+        type_match = _DEVICE_TYPE_RE.search(result.stdout, start, end)
+        if type_match is None:
+            continue
+        priority = _GPU_TYPE_PRIORITY.get(type_match.group(1))
+        if priority is None:
+            continue
+        if best is None or priority < best[0]:
+            best = (priority, index)
+
+    if best is None:
+        log.warning("shadps4: %s found no usable GPU device, leaving gpu_id on auto-select", VULKANINFO_BIN)
+        return None
+    log.info("shadps4: detected GPU index %d for gpu_id pin (%s)", best[1], VULKANINFO_BIN)
+    _DETECTED_GPU_ID = best[1]
+    return _DETECTED_GPU_ID
+
+
+def _pin_gpu_id() -> None:
+    """Force `Vulkan.gpu_id` in config.json to a real GPU before launch.
+
+    A missing config is left for shadPS4 to create; its own compiled default
+    is `-1`, the auto-select that can land on a software device, so a brand
+    new container can still hit the bug on its very first launch, same as
+    xemu's renderer pin leaves a missing xemu.toml alone.
+    """
+    setting = SHADPS4_GPU_ID.strip()
+    if setting.upper() in ("", "KEEP", "-1"):
+        log.debug("shadps4 gpu_id pin disabled (SHADPS4_GPU_ID=%r)", SHADPS4_GPU_ID)
+        return
+
+    # Read and parse the config before detection: a missing/corrupt file
+    # means there's nothing to pin regardless of what detection would say,
+    # and it saves the vulkaninfo subprocess on that path entirely.
+    try:
+        text = SHADPS4_CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.debug("could not read %s to pin gpu_id (%s)", SHADPS4_CONFIG_PATH, exc)
+        return
+    try:
+        cfg = json.loads(text)
+    except json.JSONDecodeError as exc:
+        log.warning("shadps4: %s is not valid JSON, leaving gpu_id alone (%s)", SHADPS4_CONFIG_PATH, exc)
+        return
+    if not isinstance(cfg, dict):
+        log.warning("shadps4: %s is not a JSON object, leaving gpu_id alone", SHADPS4_CONFIG_PATH)
+        return
+
+    if setting.lower() == "auto":
+        gpu_id = _detect_gpu_id()
+        if gpu_id is None:
+            return
+    else:
+        try:
+            gpu_id = int(setting)
+        except ValueError:
+            log.warning(
+                "shadps4: SHADPS4_GPU_ID=%r is not 'auto', 'KEEP', or an integer, "
+                "leaving config.json alone", SHADPS4_GPU_ID,
+            )
+            return
+
+    vulkan = cfg.setdefault("Vulkan", {})
+    if not isinstance(vulkan, dict):
+        log.warning("shadps4: %s Vulkan is not a JSON object, leaving gpu_id alone", SHADPS4_CONFIG_PATH)
+        return
+    if vulkan.get("gpu_id") == gpu_id:
+        return
+    vulkan["gpu_id"] = gpu_id
+    # Written through a temp file: a truncating in-place write that fails
+    # part way (full disk, killed process) would leave shadPS4 with a
+    # half-written config.json and lose every setting in it.
+    tmp = SHADPS4_CONFIG_PATH.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        tmp.replace(SHADPS4_CONFIG_PATH)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        log.warning("shadps4: could not pin gpu_id into %s (%s)", SHADPS4_CONFIG_PATH, exc)
+        return
+    log.info("shadps4: pinned Vulkan.gpu_id=%d in %s", gpu_id, SHADPS4_CONFIG_PATH)
 
 
 class Shadps4(Emulator):
@@ -524,15 +734,14 @@ class Shadps4(Emulator):
     carries. A resume slot is logged and ignored.
 
     A `.pkg` ROM, or a `.7z`/`.zip`/`.rar` archive holding one, is unpacked
-    through the CACHE_DIR extraction cache before boot; `stop()` removes
-    that copy again when caching is disabled.
+    through the CACHE_DIR extraction cache before boot, and is only bootable
+    at all when that cache is enabled.
 
     Attributes:
         name: Provider key, `shadps4`.
         display_name: Human-readable name.
         save_root: The data directory the save subtree hangs off.
         save_subtrees: Save data plus its per-title param.sfo, under the default PS4 user.
-        rom_extensions: Bootable formats.
         log_path: The emulator log file.
         term_timeout: Seconds STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
     """
@@ -542,7 +751,6 @@ class Shadps4(Emulator):
     save_root = DATA_DIR
     save_subtrees = ("home/1000/savedata",)
     """Save data plus its per-title param.sfo, under the default PS4 user."""
-    rom_extensions = ROM_EXTENSIONS
     log_path = SHADPS4_LOG_PATH
     term_timeout = float(os.environ.get("SHADPS4_STOP_WAIT", "20"))
     """Seconds the IPC STOP gets before SIGTERM (env `SHADPS4_STOP_WAIT`, default 20).
@@ -551,12 +759,17 @@ class Shadps4(Emulator):
     room before escalating to SIGTERM.
     """
 
-    def __init__(self) -> None:
-        """Initialize per-session pkg-extraction cache tracking."""
-        super().__init__()
-        # Only set for a .pkg boot; stop() removes it when the cache is
-        # disabled so nothing outlives the session it was extracted for.
-        self._extracted_dir: Optional[Path] = None
+    @property
+    def rom_extensions(self) -> tuple[str, ...]:
+        """Bootable formats, minus the ones needing the disabled extraction cache.
+
+        `.pkg` and the archive formats only reach a boot target by way of
+        CACHE_DIR, so with the cache off they are not bootable and must not
+        be advertised as accepted.
+        """
+        if CACHE_ENABLED:
+            return ROM_EXTENSIONS
+        return tuple(e for e in ROM_EXTENSIONS if e != ".pkg" and e not in _ARCHIVE_EXTS)
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """The path shadPS4 should boot for `path`.
@@ -567,9 +780,18 @@ class Shadps4(Emulator):
         Returns:
             The file itself, the folder's `eboot.bin`, the folder when it
             has none (shadPS4 appends eboot.bin to directory paths itself),
-            or None when the path does not exist.
+            or None when the path does not exist, or is a `.pkg`/archive
+            with the extraction cache disabled.
         """
         if path.is_file():
+            if not CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
+                log.warning(
+                    "shadps4: refusing %s, %s needs the extraction cache "
+                    "(set SHADPS4_CACHE_ENABLED=true to boot this format)",
+                    path.name,
+                    path.suffix.lower(),
+                )
+                return None
             return path
         if not path.is_dir():
             return None
@@ -611,10 +833,10 @@ class Shadps4(Emulator):
             raise RuntimeError(f"no shadps4 binary found under {VERSIONS_DIR}")
         ext = rom_path.suffix.lower()
         if ext == ".pkg" or ext in _ARCHIVE_EXTS:
-            boot = _extract_and_cache_pkg(rom_path)
-            self._extracted_dir = CACHE_DIR / _cache_key(rom_path)
+            boot = _extract_and_cache_pkg(rom_path, self)
         else:
             boot = rom_path
+        _pin_gpu_id()
         env = base_launch_env()
         env["SHADPS4_ENABLE_IPC"] = "true"
         log.info("launching shadps4 (rom=%s, boot=%s, binary=%s)", rom_path, boot, binary)
@@ -652,8 +874,7 @@ class Shadps4(Emulator):
 
         STOP is written to stdin and the process given `term_timeout` to
         exit on its own; a broken pipe or a timeout falls through to the
-        SIGTERM then SIGKILL sequence in the base class. Either path then
-        removes the pkg-extraction cache copy if caching is disabled.
+        SIGTERM then SIGKILL sequence in the base class.
         """
         proc = self._proc
         if proc is not None and proc.poll() is None and proc.stdin is not None:
@@ -664,7 +885,6 @@ class Shadps4(Emulator):
                 proc.wait(timeout=self.term_timeout)
                 self._forget()
                 log.info("%s exited gracefully", self.name)
-                self._cleanup_extracted()
                 return
             except (BrokenPipeError, OSError):
                 pass
@@ -673,11 +893,3 @@ class Shadps4(Emulator):
                     "%s did not exit after STOP, escalating to SIGTERM", self.name
                 )
         super().stop()
-        self._cleanup_extracted()
-
-    def _cleanup_extracted(self) -> None:
-        """Remove the cached pkg extraction for this session if caching is disabled."""
-        if not CACHE_ENABLED and self._extracted_dir is not None:
-            log.info("shadps4 cache disabled: removing extracted copy %s", self._extracted_dir.name)
-            shutil.rmtree(self._extracted_dir, ignore_errors=True)
-            self._extracted_dir = None

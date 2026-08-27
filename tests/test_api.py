@@ -237,6 +237,7 @@ def test_status_reports_what_romm_reads_off_the_running_session(
     assert body["emulator"] == "fake"
     assert body["emulator_alive"] is True
     assert body["boot_failed"] is False
+    assert body["extraction_phase"] is None
     assert body["supports_states"] is True
     assert body["state_slot"] == 3
 

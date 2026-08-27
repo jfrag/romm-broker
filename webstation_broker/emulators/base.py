@@ -223,6 +223,8 @@ class Emulator:
             before it treats it as a card, or None.
         boot_failed: Set by an emulator that can tell its process is alive but
             never reached a running game.
+        extraction_phase: Set while a slow pre-launch extraction is running,
+            else None.
     """
 
     name: str = "base"
@@ -278,13 +280,19 @@ class Emulator:
     """
 
     def __init__(self) -> None:
-        """Start with no process handle and no boot failure flagged."""
+        """Start with no process handle, no boot failure, and no extraction running."""
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self.boot_failed: bool = False
         """Whether the process is alive but never reached a running game.
 
         Set by an emulator that can tell: the boot-error-dialog case. Passive
         signal only: the broker surfaces it and takes no action of its own.
+        """
+        self.extraction_phase: Optional[str] = None
+        """Set while a slow pre-launch extraction is running, else None.
+
+        e.g. "extracting_archive", "extracting_pkg". Passive signal only, like
+        boot_failed: the broker surfaces it, RomM decides what to show.
         """
 
     def _spawn(self, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False) -> None:

@@ -48,6 +48,7 @@ import shutil
 import socket as _socket
 import struct
 import subprocess
+import tempfile
 import time
 import zipfile
 from collections.abc import Iterable
@@ -105,10 +106,10 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-# Decrypted PS3 dumps run 2-25GB. With the cache enabled, an archive is
-# extracted once into CACHE_DIR and reused on relaunch; with it disabled
-# (the default), the extraction is removed again once the game stops, so
-# an archived title never leaves a permanent decompressed copy behind.
+# Decrypted PS3 dumps run 2-25GB. An archive is extracted once into
+# CACHE_DIR and reused on relaunch; with the cache disabled (the default)
+# an archived ROM is refused outright, since re-extracting multiple GB on
+# every launch and discarding it buys nothing.
 CACHE_DIR = Path(os.environ.get("RPCS3_CACHE_DIR", str(DATA_DIR / "extracted")))
 # Off by default: local disk headroom is limited on a typical host, and an
 # unattended cache would otherwise grow until an operator notices. 30GB
@@ -117,6 +118,14 @@ CACHE_DIR = Path(os.environ.get("RPCS3_CACHE_DIR", str(DATA_DIR / "extracted")))
 CACHE_ENABLED = _truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false"))
 CACHE_MAX_GB = float(os.environ.get("RPCS3_CACHE_MAX_GB", "30"))
 _LAST_ACCESSED_MARKER = ".last_accessed"
+_SCRATCH_DIR_NAME = ".scratch"
+"""Subdirectory of CACHE_DIR every in-progress extraction is staged under.
+
+Staging keeps a partial extraction out of CACHE_DIR's top level, so a game
+dir either does not exist or is complete: a process killed mid-extraction
+leaves scratch to be reclaimed rather than a truncated EBOOT.BIN the next
+launch would cache-hit on forever.
+"""
 
 # Serializes cache-dir mutation: eviction picking a victim, extraction of a
 # new one, and the boot-target lookup that follows all touch the same
@@ -182,12 +191,35 @@ def _launch_env() -> dict[str, str]:
 
 
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
+    """Best boot target among `candidates`, ranked by ROM_EXTENSIONS preference.
+
+    Candidates escaping ROM_ROOT by symlink are dropped, as are archives
+    when the extraction cache is disabled: those only reach a boot target
+    through CACHE_DIR, so picking one would fail deep inside `launch()`
+    instead of here.
+
+    Args:
+        candidates: Paths found by the caller's directory search.
+        base: The directory the search started from, used to rank shallower
+            hits above deeper ones.
+
+    Returns:
+        The resolved path to boot, or None when nothing qualifies.
+    """
     ranked = []
     for p in candidates:
         if p.name.startswith("."):
             continue
         ext = p.suffix.lower()
         if ext not in ROM_EXTENSIONS:
+            continue
+        if ext in _ARCHIVE_EXTS and not CACHE_ENABLED:
+            log.debug(
+                "rpcs3: skipping %s, %s needs the extraction cache "
+                "(set RPCS3_CACHE_ENABLED=true to boot this format)",
+                p.name,
+                ext,
+            )
             continue
         if ext in _EBOOT_EXTS and not p.name.upper().startswith("EBOOT"):
             continue
@@ -400,6 +432,21 @@ def _touch_last_accessed(game_dir: Path) -> None:
         log.warning("rpcs3 cache: could not update last-accessed marker for %s: %s", game_dir, exc)
 
 
+def _clear_scratch() -> None:
+    """Remove every staged extraction under CACHE_DIR. Callers must hold _CACHE_LOCK.
+
+    The lock is what makes this safe: no extraction can be mid-flight while
+    it is held, so anything still sitting here was orphaned by a process
+    that died.
+    """
+    scratch_root = CACHE_DIR / _SCRATCH_DIR_NAME
+    if not scratch_root.is_dir():
+        return
+    for entry in scratch_root.iterdir():
+        log.warning("rpcs3 cache: removing orphaned scratch dir %s", entry.name)
+        shutil.rmtree(entry, ignore_errors=True)
+
+
 def _evict_lru(needed_bytes: int, keep: str) -> None:
     """Evict least-recently-used extracted games until `needed_bytes` fits within CACHE_MAX_GB.
 
@@ -415,7 +462,7 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
     while current + needed_bytes > max_bytes:
         candidates = []
         for game_dir in CACHE_DIR.iterdir():
-            if not game_dir.is_dir() or game_dir.name == keep:
+            if not game_dir.is_dir() or game_dir.name in (keep, _SCRATCH_DIR_NAME):
                 continue
             marker = game_dir / _LAST_ACCESSED_MARKER
             try:
@@ -596,16 +643,25 @@ def _cache_key(archive: Path) -> str:
     return f"{archive.stem}-{digest}"
 
 
-def _extract_and_cache(archive: Path) -> Path:
+def _extract_and_cache(archive: Path, emulator: Emulator) -> Path:
     """Extract archive into CACHE_DIR, reusing a cached extraction when possible.
 
     Reuses a prior extraction keyed by `_cache_key` when one already holds
-    a bootable target.
+    a bootable target. The archive is unpacked under `_SCRATCH_DIR_NAME`
+    and only renamed to the persistent game_dir once a boot target is
+    confirmed, so game_dir either does not exist or holds a complete
+    extraction.
 
     Holds _CACHE_LOCK for the whole call: eviction, extraction, and the
     boot-target lookup all touch the same CACHE_DIR tree, so a second
     launch racing in here must wait rather than potentially evicting the
     directory this one is mid-extracting into or about to boot from.
+
+    Args:
+        archive: The archive to extract.
+        emulator: The launching emulator; `emulator.extraction_phase` is set
+            while this runs so RomM can poll it, and cleared again before
+            returning or raising.
 
     Raises:
         RuntimeError: If extraction fails, or the extracted archive holds
@@ -624,22 +680,41 @@ def _extract_and_cache(archive: Path) -> Path:
             log.warning("rpcs3 cache: %s has no boot target, re-extracting", archive.name)
             shutil.rmtree(game_dir, ignore_errors=True)
 
+        # Set before eviction, not after: eviction can rmtree tens of GB
+        # under the lock, and a caller polling extraction_phase should see
+        # that stall rather than an idle-looking None.
+        emulator.extraction_phase = "extracting_archive"
         try:
-            needed = int(archive.stat().st_size * 1.1)
-        except OSError:
-            needed = 0
-        _evict_lru(needed, key)
+            try:
+                needed = int(archive.stat().st_size * 1.1)
+            except OSError:
+                needed = 0
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            # Orphaned scratch is un-evictable but still counts toward the
+            # cap, so reclaim it before sizing the cache rather than letting
+            # it push real entries out.
+            _clear_scratch()
+            _evict_lru(needed, key)
 
-        game_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            _extract_archive(archive, game_dir)
-        except RuntimeError:
-            shutil.rmtree(game_dir, ignore_errors=True)
-            raise
+            # Scratch lives under CACHE_DIR so the staged extraction shares
+            # a filesystem with game_dir: the rename below is then atomic
+            # rather than a cross-device copy.
+            scratch_root = CACHE_DIR / _SCRATCH_DIR_NAME
+            scratch_root.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=f"{key}-", dir=str(scratch_root)) as scratch:
+                staged = Path(scratch) / "extracted"
+                staged.mkdir()
+                _extract_archive(archive, staged)
+                if _archive_boot_target(staged) is None:
+                    raise RuntimeError(
+                        f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso"
+                    )
+                staged.replace(game_dir)
+        finally:
+            emulator.extraction_phase = None
 
         boot = _archive_boot_target(game_dir)
         if boot is None:
-            shutil.rmtree(game_dir, ignore_errors=True)
             raise RuntimeError(f"{archive.name} extracted but held no EBOOT.BIN or decrypted .iso")
         _touch_last_accessed(game_dir)
         log.info("rpcs3: extracted %s, booting %s", archive.name, boot)
@@ -870,7 +945,6 @@ class Rpcs3(Emulator):
     name = "rpcs3"
     display_name = "RPCS3"
     save_root = DEV_HDD0
-    rom_extensions = ROM_EXTENSIONS
     _restoring = False
     _session_serial: Optional[str] = None
     _session_start = 0.0
@@ -881,12 +955,22 @@ class Rpcs3(Emulator):
     term_timeout = float(os.environ.get("RPCS3_STOP_WAIT", "2"))
 
     def __init__(self) -> None:
-        """Initialize per-session launch/extraction tracking state."""
+        """Initialize per-session launch tracking state."""
         super().__init__()
         self._launch_seq = 0
-        # Only set for an archive boot; stop() removes it when the cache is
-        # disabled so nothing outlives the session it was extracted for.
-        self._extracted_dir: Optional[Path] = None
+
+    @property
+    def rom_extensions(self) -> tuple[str, ...]:
+        """Bootable formats, minus the archives needing the disabled extraction cache.
+
+        An archive only reaches a boot target by way of CACHE_DIR, so with
+        the cache off it is not bootable and must not be advertised as
+        accepted. `.pkg` is unaffected: it installs through `_install_pkgs`
+        into GAME_DIR regardless of the cache flag.
+        """
+        if CACHE_ENABLED:
+            return ROM_EXTENSIONS
+        return tuple(e for e in ROM_EXTENSIONS if e not in _ARCHIVE_EXTS)
 
     def clear_working_slot(self) -> None:
         """Create the savestates symlink and wipe stale savestates before a restore.
@@ -949,9 +1033,20 @@ class Rpcs3(Emulator):
             path: RomM's resolved rom path, file or directory.
 
         Returns:
-            The path to boot, or None if nothing bootable was found.
+            The path to boot, or None if nothing bootable was found, or path
+            is a `.7z`/`.zip`/`.rar` archive with the extraction cache
+            disabled (`.pkg` is unaffected: it installs via `_install_pkgs`
+            regardless of the cache flag).
         """
         if path.is_file():
+            if path.suffix.lower() in _ARCHIVE_EXTS and not CACHE_ENABLED:
+                log.warning(
+                    "rpcs3: refusing %s, %s needs the extraction cache "
+                    "(set RPCS3_CACHE_ENABLED=true to boot this format)",
+                    path.name,
+                    path.suffix.lower(),
+                )
+                return None
             return path
         if not path.is_dir():
             return None
@@ -1025,8 +1120,7 @@ class Rpcs3(Emulator):
         if ext == ".pkg":
             boot = _install_pkgs(rom_path)
         elif ext in _ARCHIVE_EXTS:
-            boot = _extract_and_cache(rom_path)
-            self._extracted_dir = CACHE_DIR / _cache_key(rom_path)
+            boot = _extract_and_cache(rom_path, self)
         else:
             boot = rom_path
 
@@ -1165,14 +1259,9 @@ class Rpcs3(Emulator):
         return {"state_saved": saved, "state_slot": slot, "state_file": state_file}
 
     def stop(self) -> None:
-        """Kill the process and remove any extracted archive copy if caching is off."""
-        # Invalidate any in-flight boot watchdog before the kill.
+        """Kill the process, invalidating any in-flight boot watchdog first."""
         self._launch_seq += 1
         super().stop()
-        if not CACHE_ENABLED and self._extracted_dir is not None:
-            log.info("rpcs3 cache disabled: removing extracted copy %s", self._extracted_dir.name)
-            shutil.rmtree(self._extracted_dir, ignore_errors=True)
-            self._extracted_dir = None
 
     def _session_save_dirs(self) -> list[Path]:
         """This title's save dirs.

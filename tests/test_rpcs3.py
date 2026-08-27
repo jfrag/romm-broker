@@ -1215,11 +1215,15 @@ def test_extract_and_cache_serializes_a_second_call_racing_the_same_archive(
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract_archive)
 
-    first = threading.Thread(target=rpcs3._extract_and_cache, args=(archive,))
+    first = threading.Thread(
+        target=rpcs3._extract_and_cache, args=(archive, rpcs3.Rpcs3())
+    )
     first.start()
     assert entered.wait(timeout=5)
 
-    second = threading.Thread(target=rpcs3._extract_and_cache, args=(archive,))
+    second = threading.Thread(
+        target=rpcs3._extract_and_cache, args=(archive, rpcs3.Rpcs3())
+    )
     second.start()
     time.sleep(0.2)
     # Still 1: the second call is blocked on _CACHE_LOCK, not free to run its
@@ -1314,7 +1318,7 @@ def test_extract_and_cache_does_not_reuse_a_stale_entry_from_a_replaced_archive(
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
 
-    boot = rpcs3._extract_and_cache(archive)
+    boot = rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert boot != stale_eboot
     assert boot.parent != stale_eboot.parent
@@ -1331,7 +1335,7 @@ def test_extract_and_cache_reuses_an_existing_bootable_extraction(
     called = []
     monkeypatch.setattr(rpcs3, "_extract_archive", lambda *a: called.append(a))
 
-    boot = rpcs3._extract_and_cache(archive)
+    boot = rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert boot == eboot
     assert called == []
@@ -1352,7 +1356,7 @@ def test_extract_and_cache_re_extracts_a_stale_cache_dir_with_no_boot_target(
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
 
-    boot = rpcs3._extract_and_cache(archive)
+    boot = rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert boot.name == "EBOOT.BIN"
     assert not (stale / "readme.txt").exists()
@@ -1370,7 +1374,7 @@ def test_extract_and_cache_extracts_and_returns_the_boot_target_on_a_miss(
 
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
 
-    boot = rpcs3._extract_and_cache(archive)
+    boot = rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert boot.name == "EBOOT.BIN"
     assert (cache_dir / rpcs3._cache_key(archive) / rpcs3._LAST_ACCESSED_MARKER).exists()
@@ -1389,9 +1393,49 @@ def test_extract_and_cache_cleans_up_and_raises_when_extraction_fails(
     monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
 
     with pytest.raises(RuntimeError, match="boom"):
-        rpcs3._extract_and_cache(archive)
+        rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert not (cache_dir / rpcs3._cache_key(archive)).exists()
+
+
+def test_extract_and_cache_sets_and_clears_the_extraction_phase(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extraction reports the extracting_archive phase, then clears it on success."""
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+    emulator = rpcs3.Rpcs3()
+    seen_phase = []
+
+    def fake_extract(archive_: Path, dest: Path) -> None:
+        seen_phase.append(emulator.extraction_phase)
+        _touch(dest / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
+
+    monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
+
+    rpcs3._extract_and_cache(archive, emulator)
+
+    assert seen_phase == ["extracting_archive"]
+    assert emulator.extraction_phase is None
+
+
+def test_extract_and_cache_clears_the_phase_when_extraction_fails(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extraction phase resets to None even when extraction raises."""
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+    emulator = rpcs3.Rpcs3()
+
+    def fake_extract(archive_: Path, dest: Path) -> NoReturn:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        rpcs3._extract_and_cache(archive, emulator)
+
+    assert emulator.extraction_phase is None
 
 
 def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extracted(
@@ -1403,9 +1447,64 @@ def test_extract_and_cache_cleans_up_and_raises_when_nothing_bootable_was_extrac
     monkeypatch.setattr(rpcs3, "_extract_archive", lambda a, d: None)
 
     with pytest.raises(RuntimeError, match="no EBOOT.BIN"):
-        rpcs3._extract_and_cache(archive)
+        rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert not (cache_dir / rpcs3._cache_key(archive)).exists()
+
+
+def test_a_partial_extraction_never_appears_at_the_cache_key(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing is written under the cache key until a boot target is confirmed.
+
+    A process killed mid-extraction must not leave a truncated EBOOT.BIN
+    where the next launch would take it for a finished cache entry, so the
+    game dir may only appear once, complete, by rename.
+    """
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+    game_dir = cache_dir / rpcs3._cache_key(archive)
+    seen = []
+
+    def fake_extract(archive_: Path, dest: Path) -> None:
+        # Mid-extraction: whatever has been unpacked so far is not yet
+        # reachable under the cache key.
+        seen.append(game_dir.exists())
+        _touch(dest / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
+
+    monkeypatch.setattr(rpcs3, "_extract_archive", fake_extract)
+
+    rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
+
+    assert seen == [False]
+    assert (game_dir / "PS3_GAME" / "USRDIR" / "EBOOT.BIN").is_file()
+
+
+def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scratch left by a dead process is removed before eviction, not evicted around.
+
+    Scratch is exempt from eviction but still counts toward CACHE_MAX_GB, so
+    leaving an orphan in place would make eviction delete real cache entries
+    to make room for space that is already garbage.
+    """
+    orphan = _touch(cache_dir / rpcs3._SCRATCH_DIR_NAME / "dead-run" / "huge.iso").parent
+    scratch_at_eviction = []
+    monkeypatch.setattr(
+        rpcs3,
+        "_evict_lru",
+        lambda needed, keep: scratch_at_eviction.append(orphan.exists()),
+    )
+    monkeypatch.setattr(
+        rpcs3, "_extract_archive", lambda a, d: _touch(d / "PS3_GAME" / "USRDIR" / "EBOOT.BIN")
+    )
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"zip")
+
+    rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
+
+    assert scratch_at_eviction == [False]
 
 
 def test_launch_extracts_and_boots_from_an_archive_rom(
@@ -1422,7 +1521,7 @@ def test_launch_extracts_and_boots_from_an_archive_rom(
         rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: spawned.setdefault("cmd", cmd)
     )
     extracted_boot = _touch(tmp_path / "extracted" / "EBOOT.BIN")
-    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: extracted_boot)
+    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive, emulator: extracted_boot)
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
 
@@ -1431,47 +1530,23 @@ def test_launch_extracts_and_boots_from_an_archive_rom(
     assert spawned["cmd"][-1] == str(extracted_boot)
 
 
-def test_stop_removes_the_extraction_when_the_cache_is_disabled(
+def test_stop_keeps_the_extraction_for_the_next_launch(
     rpcs3_dirs: dict[str, Path],
     cache_dir: Path,
     no_boot_watchdog: list[tuple[str, tuple]],
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Stop removes the extraction when the cache is disabled."""
+    """Stop leaves the cached extraction alone so the next launch reuses it."""
     monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
     monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
     monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
     archive = tmp_path / "Game.7z"
     archive.write_bytes(b"7z")
     game_dir = cache_dir / rpcs3._cache_key(archive)
-    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
-
-    emu = rpcs3.Rpcs3()
-    emu.launch(archive, None)
-    assert game_dir.exists()
-
-    emu.stop()
-
-    assert not game_dir.exists()
-
-
-def test_stop_keeps_the_extraction_when_the_cache_is_enabled(
-    rpcs3_dirs: dict[str, Path],
-    cache_dir: Path,
-    no_boot_watchdog: list[tuple[str, tuple]],
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Stop keeps the extraction when the cache is enabled."""
-    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
-    monkeypatch.setattr(rpcs3, "_patch_config", lambda: None)
-    monkeypatch.setattr(rpcs3, "_patch_ipc", lambda: None)
-    monkeypatch.setattr(rpcs3.Rpcs3, "_spawn", lambda self, cmd, env: None)
-    archive = tmp_path / "Game.7z"
-    archive.write_bytes(b"7z")
-    game_dir = cache_dir / rpcs3._cache_key(archive)
-    monkeypatch.setattr(rpcs3, "_extract_and_cache", lambda archive: _touch(game_dir / "EBOOT.BIN"))
+    monkeypatch.setattr(
+        rpcs3, "_extract_and_cache", lambda archive, emulator: _touch(game_dir / "EBOOT.BIN")
+    )
 
     emu = rpcs3.Rpcs3()
     emu.launch(archive, None)
@@ -1484,3 +1559,78 @@ def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> No
     """The cache is disabled by default when RPCS3_CACHE_ENABLED is unset."""
     monkeypatch.delenv("RPCS3_CACHE_ENABLED", raising=False)
     assert rpcs3._truthy(os.environ.get("RPCS3_CACHE_ENABLED", "false")) is False
+
+
+# ── CACHE_ENABLED gating of archive ROMs ────────────────────────────────
+
+
+@pytest.mark.parametrize("ext", [".7z", ".zip", ".rar"])
+def test_resolve_rejects_an_archive_file_when_the_cache_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ext: str
+) -> None:
+    """An archive ROM is refused outright when the extraction cache is disabled.
+
+    Without the cache, an extraction would just be discarded on every
+    launch, so only natively bootable formats should resolve at all.
+    """
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
+    rom = tmp_path / f"game{ext}"
+    rom.write_bytes(b"")
+
+    assert rpcs3.Rpcs3().resolve_rom_file(rom) is None
+
+
+@pytest.mark.parametrize("ext", [".7z", ".zip", ".rar"])
+def test_resolve_accepts_an_archive_file_when_the_cache_is_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ext: str
+) -> None:
+    """An archive ROM resolves normally once the extraction cache is enabled."""
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    rom = tmp_path / f"game{ext}"
+    rom.write_bytes(b"")
+
+    assert rpcs3.Rpcs3().resolve_rom_file(rom) == rom
+
+
+@pytest.mark.parametrize("cache_enabled", [False, True])
+def test_resolve_accepts_a_pkg_file_regardless_of_the_cache_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cache_enabled: bool
+) -> None:
+    """A .pkg ROM resolves the same whether the cache is on or off.
+
+    .pkg installs through _install_pkgs into GAME_DIR, a separate always-on
+    path unrelated to the archive extraction cache.
+    """
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", cache_enabled)
+    rom = tmp_path / "game.pkg"
+    rom.write_bytes(b"")
+
+    assert rpcs3.Rpcs3().resolve_rom_file(rom) == rom
+
+
+def test_pick_rom_file_skips_an_archive_candidate_when_the_cache_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A folder holding only an archive yields nothing when the cache is disabled."""
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", False)
+    monkeypatch.setattr(rpcs3, "ROM_ROOT", tmp_path)
+    folder = tmp_path / "MyGame"
+    archive = folder / "game.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"")
+
+    assert rpcs3._pick_rom_file([archive], folder) is None
+
+
+def test_pick_rom_file_accepts_an_archive_candidate_when_the_cache_is_enabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A folder holding an archive yields it once the cache is enabled."""
+    monkeypatch.setattr(rpcs3, "CACHE_ENABLED", True)
+    monkeypatch.setattr(rpcs3, "ROM_ROOT", tmp_path)
+    folder = tmp_path / "MyGame"
+    archive = folder / "game.zip"
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"")
+
+    assert rpcs3._pick_rom_file([archive], folder) == archive

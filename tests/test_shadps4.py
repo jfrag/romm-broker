@@ -1,5 +1,6 @@
 """shadPS4 ROM resolution, binary version selection, launch, and IPC-driven stop."""
 
+import json
 import os
 import subprocess
 import threading
@@ -11,6 +12,19 @@ from typing import NoReturn, Optional
 import pytest
 
 from webstation_broker.emulators import base, shadps4
+
+
+@pytest.fixture(autouse=True)
+def _isolated_gpu_pin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Keep every test's gpu_id pin off the real filesystem and detection cache.
+
+    Points SHADPS4_CONFIG_PATH at a file that does not exist, so a test that
+    exercises launch() without caring about the pin never touches the real
+    host's config.json or shells out to vulkaninfo. A successful detection
+    is memoized process-wide, so that memo is reset before every test too.
+    """
+    monkeypatch.setattr(shadps4, "SHADPS4_CONFIG_PATH", tmp_path / "unused-config.json")
+    monkeypatch.setattr(shadps4, "_DETECTED_GPU_ID", None)
 
 
 @pytest.fixture
@@ -108,6 +122,34 @@ def test_resolve_returns_nothing_for_a_path_that_is_neither_file_nor_folder(
     assert shadps4.Shadps4().resolve_rom_file(missing) is None
 
 
+@pytest.mark.parametrize("ext", [".pkg", ".7z", ".zip", ".rar"])
+def test_resolve_rejects_pkg_and_archives_when_the_cache_is_disabled(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, ext: str
+) -> None:
+    """A .pkg or archive ROM is refused when the extraction cache is disabled.
+
+    Without the cache, an extraction would just be discarded on every launch,
+    so only natively bootable formats should resolve at all.
+    """
+    monkeypatch.setattr(shadps4, "CACHE_ENABLED", False)
+    rom = rom_root / f"game{ext}"
+    rom.write_bytes(b"")
+
+    assert shadps4.Shadps4().resolve_rom_file(rom) is None
+
+
+@pytest.mark.parametrize("ext", [".pkg", ".7z", ".zip", ".rar"])
+def test_resolve_accepts_pkg_and_archives_when_the_cache_is_enabled(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, ext: str
+) -> None:
+    """A .pkg or archive ROM resolves normally once the extraction cache is enabled."""
+    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    rom = rom_root / f"game{ext}"
+    rom.write_bytes(b"")
+
+    assert shadps4.Shadps4().resolve_rom_file(rom) == rom
+
+
 @pytest.fixture
 def versions_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point shadps4's VERSIONS_DIR at a fresh temporary directory."""
@@ -191,6 +233,264 @@ def test_a_versions_dir_with_no_usable_binary_resolves_to_nothing(versions_dir: 
     assert shadps4._resolve_binary() is None
 
 
+@pytest.fixture
+def pinned(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point the gpu_id pin at a throwaway config, defaulted to device 0.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        tmp_path: The per-test temporary directory.
+
+    Returns:
+        The path of the config the pin will edit; the file does not exist yet.
+    """
+    cfg = tmp_path / "config.json"
+    monkeypatch.setattr(shadps4, "SHADPS4_CONFIG_PATH", cfg)
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "0")
+    return cfg
+
+
+def test_gpu_id_is_pinned_into_an_existing_config(pinned: Path) -> None:
+    """An auto-select gpu_id of -1 is pinned to the configured device index."""
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1, "vkvalidation_enabled": False}}))
+    shadps4._pin_gpu_id()
+    cfg = json.loads(pinned.read_text())
+    assert cfg["Vulkan"]["gpu_id"] == 0
+
+
+def test_pinning_leaves_the_rest_of_the_config_alone(pinned: Path) -> None:
+    """Pinning rewrites only Vulkan.gpu_id; every other key is untouched."""
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}, "General": {"volume_slider": 100}}))
+    shadps4._pin_gpu_id()
+    cfg = json.loads(pinned.read_text())
+    assert cfg["General"] == {"volume_slider": 100}
+
+
+def test_a_config_with_no_vulkan_section_gains_one(pinned: Path) -> None:
+    """A config with no Vulkan table gains one carrying just the pinned gpu_id."""
+    pinned.write_text(json.dumps({"General": {"volume_slider": 100}}))
+    shadps4._pin_gpu_id()
+    cfg = json.loads(pinned.read_text())
+    assert cfg["Vulkan"] == {"gpu_id": 0}
+
+
+def test_the_gpu_id_is_configurable_for_hosts_where_auto_select_works(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pinned gpu_id follows SHADPS4_GPU_ID, so another device can be chosen."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "1")
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == 1
+
+
+@pytest.mark.parametrize("setting", ["KEEP", "", "-1"])
+def test_the_gpu_id_pin_can_be_turned_off(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch, setting: str
+) -> None:
+    """Turning the pin off leaves an existing gpu_id alone."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", setting)
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == -1
+
+
+def test_a_missing_config_is_not_created(pinned: Path) -> None:
+    """A missing config is left for shadPS4 to create on its own first launch."""
+    shadps4._pin_gpu_id()
+    assert not pinned.exists()
+
+
+def test_an_unparseable_config_is_left_alone(pinned: Path) -> None:
+    """Invalid JSON is not overwritten; the pin logs and backs off instead of guessing."""
+    pinned.write_text("not json")
+    shadps4._pin_gpu_id()
+    assert pinned.read_text() == "not json"
+
+
+def test_a_config_that_is_not_a_json_object_is_left_alone(pinned: Path) -> None:
+    """A top-level JSON array (or any non-object) is not overwritten, just backed off."""
+    pinned.write_text(json.dumps(["not", "an", "object"]))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text()) == ["not", "an", "object"]
+
+
+def test_a_non_object_vulkan_section_is_left_alone(pinned: Path) -> None:
+    """A Vulkan key that isn't itself an object is not overwritten, just backed off."""
+    pinned.write_text(json.dumps({"Vulkan": None}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text()) == {"Vulkan": None}
+
+
+def test_an_unwritable_config_is_left_as_it_was(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config that cannot be written is left intact and the pin backs off without raising."""
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+
+    def fail(*args: object, **kwargs: object) -> NoReturn:
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(Path, "write_text", fail)
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == -1
+
+
+def test_an_invalid_gpu_id_env_value_is_left_alone(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-integer SHADPS4_GPU_ID is ignored rather than crashing the launch."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "not-a-number")
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == -1
+
+
+def _fake_vulkaninfo(returncode: int = 0, stdout: str = "", stderr: str = "") -> object:
+    """A stand-in for subprocess.run's result, shaped like _detect_gpu_id needs."""
+    return type("R", (), {"returncode": returncode, "stdout": stdout, "stderr": stderr})()
+
+
+_AMD_RENOIR_SUMMARY = """\
+Devices:
+========
+GPU0:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdeviceName         = AMD Radeon Graphics (RADV RENOIR)
+\tdriverName         = radv
+GPU1:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_CPU
+\tdeviceName         = llvmpipe (LLVM 21.1.8, 256 bits)
+\tdriverName         = llvmpipe
+"""
+"""Trimmed real `vulkaninfo --summary` output captured on the AMD Renoir/RADV
+hardware the black-screen bug was diagnosed on: index 0 is the real GPU."""
+
+_MIXED_VENDOR_SUMMARY = """\
+Devices:
+========
+GPU0:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+\tdeviceName         = Intel(R) UHD Graphics
+\tdriverName         = intel
+GPU1:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+\tdeviceName         = NVIDIA GeForce RTX 4070
+\tdriverName         = nvidia
+GPU2:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_CPU
+\tdeviceName         = llvmpipe (LLVM 21.1.8, 256 bits)
+\tdriverName         = llvmpipe
+"""
+"""A synthetic multi-vendor listing: proves the discrete NVIDIA card at
+index 1 wins over the Intel iGPU at index 0 on deviceType alone, with no
+vendor name anywhere in the selection logic."""
+
+_CPU_ONLY_SUMMARY = """\
+Devices:
+========
+GPU0:
+\tdeviceType         = PHYSICAL_DEVICE_TYPE_CPU
+\tdeviceName         = llvmpipe (LLVM 21.1.8, 256 bits)
+\tdriverName         = llvmpipe
+"""
+
+
+def test_detect_gpu_id_matches_our_actual_amd_hardware(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection picks the real RADV device over llvmpipe on the hardware this was diagnosed on."""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_vulkaninfo(stdout=_AMD_RENOIR_SUMMARY))
+    assert shadps4._detect_gpu_id() == 0
+
+
+def test_detect_gpu_id_prefers_a_discrete_gpu_over_an_earlier_integrated_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later discrete GPU outranks an earlier integrated one, purely by deviceType."""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_vulkaninfo(stdout=_MIXED_VENDOR_SUMMARY))
+    assert shadps4._detect_gpu_id() == 1
+
+
+def test_detect_gpu_id_returns_none_when_only_cpu_devices_exist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A host with no real GPU (only llvmpipe) yields no pin, not a bad index."""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_vulkaninfo(stdout=_CPU_ONLY_SUMMARY))
+    assert shadps4._detect_gpu_id() is None
+
+
+def test_detect_gpu_id_returns_none_when_vulkaninfo_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing vulkaninfo binary is handled, not raised."""
+    def raise_oserror(*a: object, **k: object) -> NoReturn:
+        raise OSError("not found")
+
+    monkeypatch.setattr(subprocess, "run", raise_oserror)
+    assert shadps4._detect_gpu_id() is None
+
+
+def test_detect_gpu_id_returns_none_on_a_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A vulkaninfo failure (bad ICD, broken driver, ...) is handled, not raised."""
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _fake_vulkaninfo(returncode=1, stderr="boom"))
+    assert shadps4._detect_gpu_id() is None
+
+
+def test_detect_gpu_id_is_only_run_once_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detection is cached: a second call does not shell out again."""
+    calls = []
+    monkeypatch.setattr(
+        subprocess, "run",
+        lambda *a, **k: (calls.append(1), _fake_vulkaninfo(stdout=_AMD_RENOIR_SUMMARY))[1],
+    )
+    assert shadps4._detect_gpu_id() == 0
+    assert shadps4._detect_gpu_id() == 0
+    assert len(calls) == 1
+
+
+def test_detect_gpu_id_retries_after_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed probe is not memoized, so a later launch tries again.
+
+    vulkaninfo can fail while the container is still coming up; caching that
+    would leave shadPS4 on its black-screen auto-select for the broker's
+    whole lifetime.
+    """
+    results = [_fake_vulkaninfo(returncode=1, stderr="boom"),
+               _fake_vulkaninfo(stdout=_AMD_RENOIR_SUMMARY)]
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: results.pop(0))
+
+    assert shadps4._detect_gpu_id() is None
+    assert shadps4._detect_gpu_id() == 0
+
+
+def test_pin_gpu_id_auto_uses_the_detected_index(pinned: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SHADPS4_GPU_ID=auto pins whatever _detect_gpu_id finds."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "auto")
+    monkeypatch.setattr(shadps4, "_detect_gpu_id", lambda: 1)
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == 1
+
+
+def test_pin_gpu_id_auto_leaves_config_alone_when_detection_fails(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SHADPS4_GPU_ID=auto with no detectable GPU leaves the existing gpu_id as-is."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "auto")
+    monkeypatch.setattr(shadps4, "_detect_gpu_id", lambda: None)
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == -1
+
+
+def test_pin_gpu_id_auto_does_not_detect_without_a_config_to_write(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No config file means nothing to pin, so detection (the vulkaninfo subprocess) never runs."""
+    monkeypatch.setattr(shadps4, "SHADPS4_GPU_ID", "auto")
+
+    def fail() -> NoReturn:
+        raise AssertionError("_detect_gpu_id should not run when there is no config to pin")
+
+    monkeypatch.setattr(shadps4, "_detect_gpu_id", fail)
+    shadps4._pin_gpu_id()  # pinned does not exist; must not raise
+
+
 class _FakeStdin:
     def __init__(self, fail: bool = False) -> None:
         self.written: list[bytes] = []
@@ -255,6 +555,30 @@ def test_launch_stops_first_then_spawns_with_ipc_enabled(
     assert spawned["env"]["SHADPS4_ENABLE_IPC"] == "true"
     assert spawned["stdin_pipe"] is True
     assert emu._proc.stdin.written == [b"RUN\n", b"START\n"]
+
+
+def test_launch_pins_gpu_id_before_spawning(
+    monkeypatch: pytest.MonkeyPatch, versions_dir: Path, rom_root: Path
+) -> None:
+    """Launch pins gpu_id before it spawns the emulator, not after."""
+    _make_release(versions_dir, "v0.17.0 - Only Release")
+    monkeypatch.setattr(shadps4.Shadps4, "stop", lambda self: None)
+    order = []
+    monkeypatch.setattr(shadps4, "_pin_gpu_id", lambda: order.append("pin"))
+
+    def fake_spawn(
+        self: shadps4.Shadps4, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False
+    ) -> None:
+        order.append("spawn")
+        self._proc = _FakeProc()
+
+    monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
+    rom = rom_root / "game.zar"
+    rom.write_bytes(b"")
+
+    shadps4.Shadps4().launch(rom, resume_slot=None)
+
+    assert order == ["pin", "spawn"]
 
 
 def test_launch_logs_and_ignores_a_resume_slot(
@@ -614,7 +938,7 @@ def test_extract_and_cache_pkg_reuses_an_existing_bootable_extraction(
     called = []
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda *a: called.append(a))
 
-    boot = shadps4._extract_and_cache_pkg(pkg)
+    boot = shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     assert boot == eboot
     assert called == []
@@ -635,7 +959,7 @@ def test_extract_and_cache_pkg_re_extracts_a_stale_cache_dir_with_no_boot_target
 
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
 
-    boot = shadps4._extract_and_cache_pkg(pkg)
+    boot = shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     assert boot.name == "eboot.bin"
     assert not (stale / "readme.txt").exists()
@@ -653,10 +977,50 @@ def test_extract_and_cache_pkg_extracts_and_returns_the_boot_target_on_a_miss(
 
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
 
-    boot = shadps4._extract_and_cache_pkg(pkg)
+    boot = shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     assert boot.name == "eboot.bin"
     assert (cache_dir / shadps4._cache_key(pkg) / shadps4._LAST_ACCESSED_MARKER).exists()
+
+
+def test_extract_and_cache_pkg_sets_and_clears_extracting_pkg_phase(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Extracting a bare .pkg reports the extracting_pkg phase, then clears it."""
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"pkg")
+    emulator = shadps4.Shadps4()
+    seen_phase = []
+
+    def fake_extract(pkg_: Path, dest: Path) -> None:
+        seen_phase.append(emulator.extraction_phase)
+        _touch(dest / "CUSA23079" / "eboot.bin")
+
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
+
+    shadps4._extract_and_cache_pkg(pkg, emulator)
+
+    assert seen_phase == ["extracting_pkg"]
+    assert emulator.extraction_phase is None
+
+
+def test_extract_and_cache_pkg_clears_the_phase_when_extraction_fails(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The extraction phase resets to None even when pkg_extractor raises."""
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"pkg")
+    emulator = shadps4.Shadps4()
+
+    def fake_extract(pkg_: Path, dest: Path) -> NoReturn:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        shadps4._extract_and_cache_pkg(pkg, emulator)
+
+    assert emulator.extraction_phase is None
 
 
 def test_extract_and_cache_pkg_cleans_up_and_raises_when_extraction_fails(
@@ -672,7 +1036,7 @@ def test_extract_and_cache_pkg_cleans_up_and_raises_when_extraction_fails(
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
 
     with pytest.raises(RuntimeError, match="boom"):
-        shadps4._extract_and_cache_pkg(pkg)
+        shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     assert not (cache_dir / shadps4._cache_key(pkg)).exists()
 
@@ -686,9 +1050,62 @@ def test_extract_and_cache_pkg_cleans_up_and_raises_when_nothing_bootable_was_ex
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda p, d: None)
 
     with pytest.raises(RuntimeError, match="no eboot.bin"):
-        shadps4._extract_and_cache_pkg(pkg)
+        shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     assert not (cache_dir / shadps4._cache_key(pkg)).exists()
+
+
+def test_a_partial_extraction_never_appears_at_the_cache_key(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing is written under the cache key until a boot target is confirmed.
+
+    A process killed mid-extraction must not leave a truncated eboot.bin
+    where the next launch would take it for a finished cache entry, so the
+    game dir may only appear once, complete, by rename.
+    """
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"pkg")
+    game_dir = cache_dir / shadps4._cache_key(pkg)
+    seen = []
+
+    def fake_extract(pkg_: Path, dest: Path) -> None:
+        # Mid-extraction: whatever pkg_extractor has written so far is not
+        # yet reachable under the cache key.
+        seen.append(game_dir.exists())
+        _touch(dest / "CUSA23079" / "eboot.bin")
+
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_extract)
+
+    shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+    assert seen == [False]
+    assert (game_dir / "CUSA23079" / "eboot.bin").is_file()
+
+
+def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scratch left by a dead process is removed before eviction, not evicted around.
+
+    Scratch is exempt from eviction but still counts toward CACHE_MAX_GB, so
+    leaving an orphan in place would make eviction delete real cache entries
+    to make room for space that is already garbage.
+    """
+    orphan = _touch(cache_dir / shadps4._SCRATCH_DIR_NAME / "dead-run" / "huge.pkg").parent
+    scratch_at_eviction = []
+    monkeypatch.setattr(
+        shadps4,
+        "_evict_lru",
+        lambda needed, keep: scratch_at_eviction.append(orphan.exists()),
+    )
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda p, d: _touch(d / "T" / "eboot.bin"))
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"pkg")
+
+    shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+    assert scratch_at_eviction == [False]
 
 
 def test_extract_and_cache_pkg_reserves_more_headroom_for_an_archive_than_a_pkg(
@@ -701,10 +1118,10 @@ def test_extract_and_cache_pkg_reserves_more_headroom_for_an_archive_than_a_pkg(
 
     pkg = tmp_path / "Game.pkg"
     pkg.write_bytes(b"x" * 1000)
-    shadps4._extract_and_cache_pkg(pkg)
+    shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
 
     archive = _make_zip(tmp_path / "Game.zip", {"Game.pkg": b"x" * 1000})
-    shadps4._extract_and_cache_pkg(archive)
+    shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
 
     assert seen_needed == [
         int(pkg.stat().st_size * 1.1),
@@ -715,8 +1132,10 @@ def test_extract_and_cache_pkg_reserves_more_headroom_for_an_archive_than_a_pkg(
 def test_sweep_stale_extractions_removes_orphaned_scratch_dirs_but_keeps_real_ones(
     cache_dir: Path,
 ) -> None:
-    """Sweep stale extractions removes leftover archive scratch dirs but keeps real cache entries."""
-    scratch = _touch(cache_dir / "Game-abc123-archive-xyz987" / "leftover.pkg").parent
+    """Sweep stale extractions empties the scratch subtree but keeps real cache entries."""
+    scratch = _touch(
+        cache_dir / shadps4._SCRATCH_DIR_NAME / "Game-abc123-xyz987" / "leftover.pkg"
+    ).parent
     game_dir = _touch(cache_dir / "Game-abc123" / "eboot.bin").parent
 
     shadps4.sweep_stale_extractions()
@@ -725,39 +1144,58 @@ def test_sweep_stale_extractions_removes_orphaned_scratch_dirs_but_keeps_real_on
     assert game_dir.exists()
 
 
-def test_sweep_stale_extractions_spares_a_cache_dir_whose_own_name_collides(
+def test_sweep_stale_extractions_spares_a_cache_dir_whose_own_name_looks_like_scratch(
     cache_dir: Path,
 ) -> None:
-    """A real, already-booted cache dir whose ROM stem itself contains '-archive-' survives the sweep.
+    """A real cache dir survives the sweep no matter what its ROM's filename contained.
 
     `_cache_key` names a cache dir `<rom stem>-<digest>`, so a ROM like
-    "Uncharted-archive-Edition.pkg" produces a dir whose name matches the
-    scratch-dir substring by coincidence. Only the last-accessed marker
-    and boot target, both written solely to a real game_dir, tell them apart.
+    "Uncharted-archive-Edition.pkg" once produced a dir the name-matching
+    sweep mistook for scratch. Scratch dirs now live in their own subtree,
+    so the name carries no weight either way.
     """
     collider = cache_dir / "Uncharted-archive-Edition-a1b2c3d4e5f6"
     _touch(collider / "CUSA23079" / "eboot.bin")
-    _touch(collider / shadps4._LAST_ACCESSED_MARKER)
 
     shadps4.sweep_stale_extractions()
 
     assert collider.exists()
 
 
-def test_sweep_stale_extractions_spares_a_collider_with_a_boot_target_but_no_marker_yet(
+def test_sweep_stale_extractions_keeps_a_real_cache_dir_with_no_marker_yet(
     cache_dir: Path,
 ) -> None:
-    """A colliding cache dir survives on a bootable eboot.bin alone, even before it is marked touched.
+    """A fully extracted cache dir survives even before its last-accessed marker exists.
 
-    Covers the process being killed between finding the boot target and
-    writing the last-accessed marker in `_extract_and_cache_pkg`.
+    Covers the process being killed between pkg_extractor finishing and
+    `_touch_last_accessed` running, and the marker write simply failing:
+    re-extracting a multi-GB title because a zero-byte marker is missing
+    would be a very expensive false positive.
     """
-    collider = cache_dir / "Uncharted-archive-Edition-a1b2c3d4e5f6"
-    _touch(collider / "CUSA23079" / "eboot.bin")
+    game_dir = _touch(cache_dir / "Game-abc123" / "CUSA23079" / "eboot.bin").parent.parent
+    assert not (game_dir / shadps4._LAST_ACCESSED_MARKER).exists()
 
     shadps4.sweep_stale_extractions()
 
-    assert collider.exists()
+    assert game_dir.exists()
+
+
+def test_sweep_stale_extractions_removes_a_scratch_dir_whose_archive_held_an_eboot_decoy(
+    cache_dir: Path,
+) -> None:
+    """An orphaned scratch dir is swept even when its archive held a file named eboot.bin.
+
+    A scratch dir holds an archive's raw, unpacked contents, so a
+    bootable-looking file under it proves nothing; living under the scratch
+    subtree is what makes it scratch.
+    """
+    scratch = _touch(
+        cache_dir / shadps4._SCRATCH_DIR_NAME / "Game-abc123" / "bonus" / "eboot.bin"
+    ).parent.parent
+
+    shadps4.sweep_stale_extractions()
+
+    assert not scratch.exists()
 
 
 def test_sweep_stale_extractions_is_a_noop_without_a_cache_dir(cache_dir: Path) -> None:
@@ -792,11 +1230,15 @@ def test_extract_and_cache_pkg_serializes_a_second_call_racing_the_same_pkg(
 
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_run_pkg_extractor)
 
-    first = threading.Thread(target=shadps4._extract_and_cache_pkg, args=(pkg,))
+    first = threading.Thread(
+        target=shadps4._extract_and_cache_pkg, args=(pkg, shadps4.Shadps4())
+    )
     first.start()
     assert entered.wait(timeout=5)
 
-    second = threading.Thread(target=shadps4._extract_and_cache_pkg, args=(pkg,))
+    second = threading.Thread(
+        target=shadps4._extract_and_cache_pkg, args=(pkg, shadps4.Shadps4())
+    )
     second.start()
     time.sleep(0.2)
     # Still 1: the second call is blocked on _CACHE_LOCK, not free to run its
@@ -1000,14 +1442,42 @@ def test_extract_and_cache_pkg_extracts_an_archive_and_returns_the_boot_target(
 
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_run_pkg_extractor)
 
-    boot = shadps4._extract_and_cache_pkg(archive)
+    boot = shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
 
     assert boot.name == "eboot.bin"
     assert seen_pkgs == ["CUSA23079.pkg"]
     # Only pkg_extractor's own output survives; the scratch archive
-    # extraction (a sibling of game_dir under cache_dir) is discarded.
+    # extraction under CACHE_DIR/.scratch is discarded.
     remaining_top_level = {p.name for p in cache_dir.iterdir()}
-    assert remaining_top_level == {shadps4._cache_key(archive)}
+    assert remaining_top_level == {shadps4._cache_key(archive), shadps4._SCRATCH_DIR_NAME}
+    assert not list((cache_dir / shadps4._SCRATCH_DIR_NAME).iterdir())
+
+
+def test_extract_and_cache_pkg_moves_through_archive_then_pkg_phases(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive reports extracting_archive, then extracting_pkg, then clears the phase."""
+    archive = _make_zip(tmp_path / "Game.zip", {"CUSA23079.pkg": b"pkg data"})
+    emulator = shadps4.Shadps4()
+    seen_phase = []
+
+    real_extract_archive = shadps4._extract_archive
+
+    def spying_extract_archive(archive_: Path, dest: Path) -> None:
+        seen_phase.append(emulator.extraction_phase)
+        real_extract_archive(archive_, dest)
+
+    def fake_run_pkg_extractor(pkg: Path, dest: Path) -> None:
+        seen_phase.append(emulator.extraction_phase)
+        _touch(dest / "CUSA23079" / "eboot.bin")
+
+    monkeypatch.setattr(shadps4, "_extract_archive", spying_extract_archive)
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", fake_run_pkg_extractor)
+
+    shadps4._extract_and_cache_pkg(archive, emulator)
+
+    assert seen_phase == ["extracting_archive", "extracting_pkg"]
+    assert emulator.extraction_phase is None
 
 
 def test_extract_and_cache_pkg_reuses_a_cached_archive_extraction(
@@ -1020,7 +1490,7 @@ def test_extract_and_cache_pkg_reuses_a_cached_archive_extraction(
     called = []
     monkeypatch.setattr(shadps4, "_extract_archive", lambda *a: called.append(a))
 
-    boot = shadps4._extract_and_cache_pkg(archive)
+    boot = shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
 
     assert boot == eboot
     assert called == []
@@ -1033,7 +1503,7 @@ def test_extract_and_cache_pkg_raises_when_the_archive_holds_no_pkg(
     archive = _make_zip(tmp_path / "Game.zip", {"readme.txt": b"nothing bootable"})
 
     with pytest.raises(RuntimeError, match=r"held no \.pkg"):
-        shadps4._extract_and_cache_pkg(archive)
+        shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
 
     assert not (cache_dir / shadps4._cache_key(archive)).exists()
 
@@ -1054,7 +1524,9 @@ def test_launch_extracts_and_boots_from_a_zip_archive(
 
     monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
     extracted_boot = _touch(tmp_path / "extracted" / "CUSA23079" / "eboot.bin")
-    monkeypatch.setattr(shadps4, "_extract_and_cache_pkg", lambda rom: extracted_boot)
+    monkeypatch.setattr(
+        shadps4, "_extract_and_cache_pkg", lambda rom, emulator: extracted_boot
+    )
     rom = rom_root / "game.zip"
     rom.write_bytes(b"")
     emu = shadps4.Shadps4()
@@ -1062,7 +1534,6 @@ def test_launch_extracts_and_boots_from_a_zip_archive(
     emu.launch(rom, resume_slot=None)
 
     assert spawned["cmd"] == [str(binary), "-f", "true", "-g", str(extracted_boot)]
-    assert emu._extracted_dir == shadps4.CACHE_DIR / shadps4._cache_key(rom)
 
 
 def test_launch_extracts_and_boots_from_a_pkg_rom(
@@ -1081,7 +1552,9 @@ def test_launch_extracts_and_boots_from_a_pkg_rom(
 
     monkeypatch.setattr(shadps4.Shadps4, "_spawn", fake_spawn)
     extracted_boot = _touch(tmp_path / "extracted" / "CUSA23079" / "eboot.bin")
-    monkeypatch.setattr(shadps4, "_extract_and_cache_pkg", lambda pkg: extracted_boot)
+    monkeypatch.setattr(
+        shadps4, "_extract_and_cache_pkg", lambda pkg, emulator: extracted_boot
+    )
     rom = rom_root / "game.pkg"
     rom.write_bytes(b"")
     emu = shadps4.Shadps4()
@@ -1089,40 +1562,22 @@ def test_launch_extracts_and_boots_from_a_pkg_rom(
     emu.launch(rom, resume_slot=None)
 
     assert spawned["cmd"] == [str(binary), "-f", "true", "-g", str(extracted_boot)]
-    assert emu._extracted_dir == shadps4.CACHE_DIR / shadps4._cache_key(rom)
 
 
-def test_stop_removes_the_pkg_extraction_when_the_cache_is_disabled(
+def test_stop_keeps_the_pkg_extraction_for_the_next_launch(
     monkeypatch: pytest.MonkeyPatch, cache_dir: Path, versions_dir: Path, rom_root: Path
 ) -> None:
-    """Stop removes the pkg extraction when the cache is disabled."""
+    """Stop leaves the cached extraction alone so the next launch reuses it."""
     _make_release(versions_dir, "v0.17.0 - Only Release")
     monkeypatch.setattr(shadps4.Shadps4, "_spawn", lambda self, cmd, env, stdin_pipe=False: None)
     rom = rom_root / "game.pkg"
     rom.write_bytes(b"")
     game_dir = cache_dir / shadps4._cache_key(rom)
-    monkeypatch.setattr(shadps4, "_extract_and_cache_pkg", lambda pkg: _touch(game_dir / "eboot.bin"))
-
-    emu = shadps4.Shadps4()
-    emu.launch(rom, resume_slot=None)
-    assert game_dir.exists()
-
-    emu.stop()
-
-    assert not game_dir.exists()
-
-
-def test_stop_keeps_the_pkg_extraction_when_the_cache_is_enabled(
-    monkeypatch: pytest.MonkeyPatch, cache_dir: Path, versions_dir: Path, rom_root: Path
-) -> None:
-    """Stop keeps the pkg extraction when the cache is enabled."""
-    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
-    _make_release(versions_dir, "v0.17.0 - Only Release")
-    monkeypatch.setattr(shadps4.Shadps4, "_spawn", lambda self, cmd, env, stdin_pipe=False: None)
-    rom = rom_root / "game.pkg"
-    rom.write_bytes(b"")
-    game_dir = cache_dir / shadps4._cache_key(rom)
-    monkeypatch.setattr(shadps4, "_extract_and_cache_pkg", lambda pkg: _touch(game_dir / "eboot.bin"))
+    monkeypatch.setattr(
+        shadps4,
+        "_extract_and_cache_pkg",
+        lambda pkg, emulator: _touch(game_dir / "eboot.bin"),
+    )
 
     emu = shadps4.Shadps4()
     emu.launch(rom, resume_slot=None)
