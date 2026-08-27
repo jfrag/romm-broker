@@ -57,6 +57,6 @@ iframes the selkies stream and connects to the broker's websocket at
 `<SUBFOLDER>/ws/room`. It bootstraps from `GET /api/session/context?token=...`,
 which tells it who the token belongs to, what it may do, and the current
 roster. Over the websocket the room carries chat, webcam and microphone
-fanout, resolution changes, gamepad and mouse/keyboard reassignment, and the
-exit button. The wire format is documented on the
+fanout, resolution changes, and gamepad and mouse/keyboard reassignment. The
+wire format is documented on the
 [`room` module](/docs/developer/reference/room) in the Python reference.
