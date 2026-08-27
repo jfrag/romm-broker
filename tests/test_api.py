@@ -21,7 +21,7 @@ from webstation_broker import session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, rpcs3, shadps4
 
-from .conftest import PREFIX, FakeEmulator
+from .conftest import PREFIX, SLEEPER_CMD, FakeEmulator
 
 API = f"{PREFIX}/api"
 
@@ -685,7 +685,7 @@ def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
     """
     monkeypatch.setattr(settings, "PREFIX", prefix)
     proc = sleeper()
-    base._record_pid("fake", proc.pid, ["/usr/bin/sleep", "60"])
+    base._record_pid("fake", proc.pid, SLEEPER_CMD)
 
     with TestClient(create_app()):
         pass

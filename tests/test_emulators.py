@@ -17,6 +17,8 @@ import pytest
 from webstation_broker import emulators
 from webstation_broker.emulators import base
 
+from .conftest import SLEEPER_CMD
+
 
 def test_an_unknown_name_resolves_to_nothing() -> None:
     """An unknown name resolves to nothing."""
@@ -112,7 +114,7 @@ def test_reaping_kills_an_emulator_an_earlier_broker_left_running(
     only way it ever gets killed.
     """
     proc = sleeper()
-    base._record_pid("fake", proc.pid, ["/usr/bin/sleep", "60"])
+    base._record_pid("fake", proc.pid, SLEEPER_CMD)
 
     killed = base.reap_orphan()
 
@@ -212,7 +214,7 @@ def test_stopping_clears_the_record_so_the_next_launch_reaps_nothing(
     """
     emu = emulators.Emulator()
     emu._proc = sleeper()
-    base._record_pid("fake", emu._proc.pid, ["/usr/bin/sleep", "60"])
+    base._record_pid("fake", emu._proc.pid, SLEEPER_CMD)
 
     emu.stop()
 
