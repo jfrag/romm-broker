@@ -107,6 +107,10 @@ def new_session(payload: dict[str, Any], emulator_obj: "Emulator", rom_file: str
         "multiplayer": bool(payload.get("multiplayer")),
         "controller_token": secrets.token_urlsafe(16),
         "viewers": [],
+        # Reusable invite tokens by permission, minted on first request. One
+        # link per role is what a host hands round; each arrival on it takes
+        # its own seat.
+        "invites": {},
         # The controller starts with gamepad 1.
         "controller_slot": 1,
         "mk_owner_token": None,
@@ -148,6 +152,42 @@ def find_viewer(token: str) -> Optional[dict[str, Any]]:
     if SESSION is None:
         return None
     return next((v for v in SESSION.get("viewers", []) if v["token"] == token), None)
+
+
+def invite_token(permission: str) -> str:
+    """Return the session's shareable invite token for a permission, minting it on first use.
+
+    The token identifies the session and the permission, not a person: every
+    arrival on it is seated separately by `add_viewer`, so the same link can go
+    to any number of friends and stays valid until the session ends.
+
+    Args:
+        permission: The permission the link grants, `participant` or `readonly`.
+
+    Returns:
+        The invite token for that permission.
+    """
+    invites = SESSION.setdefault("invites", {})
+    if permission not in invites:
+        invites[permission] = secrets.token_urlsafe(16)
+    return invites[permission]
+
+
+def find_invite(token: str) -> Optional[str]:
+    """Resolve an invite token to the permission it grants.
+
+    Args:
+        token: The `invite` query parameter from a landing URL.
+
+    Returns:
+        The permission, or None when no session is active or the token is unknown.
+    """
+    if SESSION is None:
+        return None
+    for permission, minted in SESSION.get("invites", {}).items():
+        if secrets.compare_digest(minted, token):
+            return permission
+    return None
 
 
 def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[str, Any]:

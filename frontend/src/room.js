@@ -24,6 +24,32 @@ import { getTranslator } from './translation.js';
 const hasWindowTrackProcessor = (typeof MediaStreamTrackProcessor !== 'undefined');
 const hasWindowTrackGenerator = (typeof MediaStreamTrackGenerator !== 'undefined');
 
+// ---------------------------------------------------------------------------
+// Camera orientation. Nothing downstream re-orients a frame (the receiver
+// paints whatever arrives), so the sender has to hand the encoder upright
+// pixels. Chromium stamps each VideoFrame with rotation/flip and applies them
+// in drawImage. Mobile WebKit delivers sensor-fixed frames with no metadata
+// at all, and the only thing that says which way is up is the window
+// orientation relative to the one the sensor is upright in.
+// ---------------------------------------------------------------------------
+
+const hasFrameOrientation = typeof VideoFrame !== 'undefined'
+    && typeof VideoFrame.prototype === 'object'
+    && 'rotation' in VideoFrame.prototype;
+
+// The window orientation at which the camera sensor delivers upright frames
+// on the engines that hand its own orientation over.
+const SENSOR_UPRIGHT_ORIENTATION = -90;
+
+// Only mobile WebKit derives orientation: no frame metadata, but a numeric
+// window.orientation to derive it from.
+const canDeriveOrientation = () =>
+    !hasFrameOrientation && typeof window.orientation === 'number';
+
+// Clockwise degrees that make a sensor-orientation frame upright right now.
+const deriveRotation = () =>
+    ((window.orientation - SENSOR_UPRIGHT_ORIENTATION) % 360 + 360) % 360;
+
 // Frames a worker-hosted generator may be behind before new ones are dropped, and
 // the consecutive-drop count after which a generator is considered stalled for good.
 const SINK_MAX_IN_FLIGHT = 3;
@@ -724,13 +750,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     const t = translator.t;
     document.title = t('pageTitle');
 
-    // Bootstrap: resolve the arriving ?token= into our role/personal token.
-    const arrivalToken = new URLSearchParams(window.location.search).get('token');
+    // Bootstrap: resolve the arrival into our role and personal token. A
+    // ?token= is a seat we already hold. An ?invite= is a shared link that
+    // seats us on first use; the seat it hands back is kept for this tab so
+    // a reload lands in the same seat instead of taking another.
+    const params = new URLSearchParams(window.location.search);
+    const arrivalToken = params.get('token');
+    const inviteToken = params.get('invite');
+    const seatKey = inviteToken ? `collab_seat_${inviteToken}` : null;
+    const query = new URLSearchParams();
+    if (arrivalToken) {
+        query.set('token', arrivalToken);
+    } else if (seatKey && sessionStorage.getItem(seatKey)) {
+        query.set('token', sessionStorage.getItem(seatKey));
+    } else if (inviteToken) {
+        query.set('invite', inviteToken);
+    }
     let COLLAB_DATA;
     try {
-        const resp = await fetch(`api/session/context${arrivalToken ? `?token=${encodeURIComponent(arrivalToken)}` : ''}`);
+        const queryString = query.toString();
+        const resp = await fetch(`api/session/context${queryString ? `?${queryString}` : ''}`);
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || `HTTP ${resp.status}`);
         COLLAB_DATA = await resp.json();
+        if (seatKey) sessionStorage.setItem(seatKey, COLLAB_DATA.userToken);
     } catch (err) {
         console.error('Session context unavailable:', err);
         document.getElementById('disconnection-overlay').classList.remove('hidden');
@@ -746,12 +788,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The flag only sets the baseline. Presence can reveal the comms surface
     // but never hide it, so someone arriving on an invite link into a session
     // launched as singleplayer still lands somewhere they can talk.
+    // Solo, the only chrome left is the invite tile in the corner of the
+    // stream. It shows itself for a moment on entering solo mode so people
+    // know it is there, then stays hidden until the corner is hovered.
+    const SOLO_INVITE_PEEK_MS = 4000;
+    let soloPeekTimer = null;
     const applyCommsVisibility = (viewers) => {
         const onlineCount = Array.isArray(viewers)
             ? viewers.filter((u) => u.online).length
             : 0;
         const visible = Boolean(COLLAB_DATA.multiplayer) || onlineCount > 1;
+        const wasSolo = document.body.classList.contains('solo-mode');
         document.body.classList.toggle('solo-mode', !visible);
+        if (!visible && !wasSolo) {
+            document.body.classList.add('solo-peek');
+            clearTimeout(soloPeekTimer);
+            soloPeekTimer = setTimeout(() => document.body.classList.remove('solo-peek'), SOLO_INVITE_PEEK_MS);
+        }
     };
     applyCommsVisibility(null);
 
@@ -784,6 +837,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let preferredCamId = localStorage.getItem('collab_preferredCamId') || null;
     let localAudioAnalyser = null;
     let animationFrameId = null;
+    // Matches the tile size in room.css and the remote canvas below.
+    const WEBCAM_WIDTH = 240;
+    const WEBCAM_HEIGHT = 180;
     let lastKnownVolume = parseFloat(localStorage.getItem('collab_iframe_volume')) || 1.0;
     let isIframeMuted = false;
 
@@ -796,21 +852,10 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    // RomM's control bar sits outside this frame and cannot reach the stream
-    // across origins, so its volume and mute arrive here as messages and take
-    // the same path as the sidebar's own controls. Announcing on load is how
-    // the parent learns it has somewhere to send them.
-    const syncAudioControls = () => {
-        if (iframeMuteBtn) {
-            iframeMuteBtn.querySelector('i').className = isIframeMuted
-                ? 'fas fa-volume-mute'
-                : 'fas fa-volume-up';
-        }
-        if (iframeVolumeSlider) {
-            iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        }
-    };
-
+    // RomM's control bar owns game volume: it sits outside this frame and
+    // cannot reach the stream across origins, so its volume and mute arrive
+    // here as messages and are relayed on. Announcing on load is how the
+    // parent learns it has somewhere to send them.
     window.addEventListener('message', (event) => {
         if (event.source !== window.parent) return;
         const data = event.data;
@@ -826,7 +871,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             return;
         }
-        syncAudioControls();
         sendVolumeToIframe();
     });
 
@@ -853,12 +897,17 @@ document.addEventListener('DOMContentLoaded', async () => {
         username = COLLAB_DATA.username;
         sessionStorage.setItem('collab_hasJoined_' + COLLAB_DATA.sessionId, 'true');
     }
-    let isSidebarVisible = false;
+    let isChatOpen = false;
     let messageStore = {};
     // A long-lived room otherwise grows messageStore and the chat DOM
     // forever -- both are pruned to this many most-recent entries.
     const MAX_STORED_MESSAGES = 200;
     let replyingTo = null;
+    // How long a peeked message stays up, how many stack before the oldest
+    // goes, and how long an invite button shows its copied/failed text.
+    const PEEK_LIFETIME_MS = 6000;
+    const MAX_PEEK_BUBBLES = 3;
+    const INVITE_FLASH_MS = 1200;
     let notificationAudioCtx;
     let gamepadIcons = {};
     let mkIcon = null;
@@ -893,21 +942,31 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const sidebarEl = document.getElementById('sidebar');
-    const toggleHandle = document.getElementById('sidebar-toggle-handle');
     const videoToggleHandle = document.getElementById('video-toggle-handle');
     let isVideoGridVisible = true;
     const settingsModalOverlay = document.getElementById('settings-modal-overlay');
     const settingsModalCloseBtn = document.getElementById('settings-modal-close');
+    const usernameModalOverlay = document.getElementById('username-modal-overlay');
     const audioInputSelect = document.getElementById('audio-input-select');
     const videoInputSelect = document.getElementById('video-input-select');
+    const reloadStreamBtn = document.getElementById('reload-stream-btn');
     const videoGrid = document.getElementById('video-grid');
+    const videoStrip = document.getElementById('video-strip');
     const videoGridContent = document.getElementById('video-grid-content');
     const localVideo = document.getElementById('local-video');
     const localContainer = document.getElementById('local-user-container');
-    const toastContainer = document.getElementById('toast-container');
-    let toggleMicBtn, toggleVideoBtn, iframeMuteBtn, iframeVolumeSlider; 
-    
+    const toggleMicBtn = document.getElementById('toggle-mic-btn');
+    const toggleVideoBtn = document.getElementById('toggle-video-btn');
+    const settingsBtn = document.getElementById('settings-btn');
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const chatDock = document.getElementById('chat-dock');
+    const chatTab = document.getElementById('chat-tab');
+    const chatScroll = document.getElementById('chat-messages-scroll');
+    const chatPeek = document.getElementById('chat-peek');
+    const inviteTile = document.getElementById('invite-tile');
+    const inviteBtn = document.getElementById('invite-btn');
+
     localContainer.dataset.userToken = COLLAB_DATA.userToken;
 
     const MSG_TYPE = {
@@ -1015,10 +1074,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 channelCount: 1,
             };
 
+            // Tiles render at 240x180, so capturing and encoding anything
+            // larger is bandwidth and CPU spent on pixels nobody sees.
             const videoConstraints = {
                 deviceId: preferredCamId ? { exact: preferredCamId } : undefined,
-                width: 320,
-                height: 240,
+                width: WEBCAM_WIDTH,
+                height: WEBCAM_HEIGHT,
                 frameRate: 30
             };
 
@@ -1124,6 +1185,38 @@ document.addEventListener('DOMContentLoaded', async () => {
         mediaInitialized = false;
     };
 
+    // Every camera frame is drawn onto this canvas before it is encoded:
+    // rotated upright where the engine does not do that itself, and fitted
+    // inside the tile's aspect with black bars rather than stretched, so a
+    // portrait phone camera arrives pillarboxed instead of smeared across
+    // the tile. The encoder then only ever sees WEBCAM_WIDTH x WEBCAM_HEIGHT,
+    // whatever size the camera actually settled on.
+    const composeCanvas = typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(WEBCAM_WIDTH, WEBCAM_HEIGHT)
+        : Object.assign(document.createElement('canvas'), { width: WEBCAM_WIDTH, height: WEBCAM_HEIGHT });
+    const composeCtx = composeCanvas.getContext('2d', { alpha: false, desynchronized: true });
+    let composeFailed = false;
+
+    const composeFrame = (frame) => {
+        const dw = frame.displayWidth || frame.codedWidth;
+        const dh = frame.displayHeight || frame.codedHeight;
+        const turn = canDeriveOrientation() ? deriveRotation() : 0;
+        const sideways = turn % 180 === 90;
+        const uprightW = sideways ? dh : dw;
+        const uprightH = sideways ? dw : dh;
+        const scale = Math.min(WEBCAM_WIDTH / uprightW, WEBCAM_HEIGHT / uprightH);
+        composeCtx.fillStyle = '#000';
+        composeCtx.fillRect(0, 0, WEBCAM_WIDTH, WEBCAM_HEIGHT);
+        composeCtx.save();
+        composeCtx.translate(WEBCAM_WIDTH / 2, WEBCAM_HEIGHT / 2);
+        if (turn) composeCtx.rotate((turn * Math.PI) / 180);
+        // Drawn at the frame's own proportions about the centre; the rotation
+        // above is what turns a sideways box into the upright one measured.
+        composeCtx.drawImage(frame, (-dw * scale) / 2, (-dh * scale) / 2, dw * scale, dh * scale);
+        composeCtx.restore();
+        return new VideoFrame(composeCanvas, { timestamp: frame.timestamp });
+    };
+
     const setupVideoEncoder = async () => {
         const [videoTrack] = localStream.getVideoTracks();
         if (!videoTrack) return;
@@ -1167,8 +1260,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         videoEncoder.configure({
             codec: 'vp8',
-            width: 320,
-            height: 240,
+            width: WEBCAM_WIDTH,
+            height: WEBCAM_HEIGHT,
             bitrate: 1_000_000,
             framerate: 30,
             latencyMode: 'realtime',
@@ -1180,10 +1273,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                 
                 if (videoEncoder.state === 'configured' && isWebcamOn) {
                     const needsKeyFrame = (frameCounter % 120 === 0);
-                    videoEncoder.encode(frame, { keyFrame: needsKeyFrame });
+                    let upright = frame;
+                    if (!composeFailed) {
+                        try {
+                            upright = composeFrame(frame);
+                        } catch (e) {
+                            // Raw frames still stream, just as the camera delivered them.
+                            composeFailed = true;
+                            logMediaPath(`webcam compose: canvas path unavailable (${e.message}); encoding raw frames.`);
+                        }
+                    }
+                    videoEncoder.encode(upright, { keyFrame: needsKeyFrame });
+                    if (upright !== frame) upright.close();
                     frameCounter++;
                 }
-                
+
                 frame.close();
                 readFrame();
             }).catch(e => console.error("[Encoder] Video reader error", e));
@@ -1416,14 +1520,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         container.className = 'video-container reorderable';
         container.id = `container-${token}`;
         container.dataset.userToken = token;
-        container.draggable = true;
         
         const canvas = document.createElement('canvas');
-        canvas.width = 240;
-        canvas.height = 180;
+        canvas.width = WEBCAM_WIDTH;
+        canvas.height = WEBCAM_HEIGHT;
         const ctx = canvas.getContext('2d', { desynchronized: true });
         ctx.fillStyle = '#222';
-        ctx.fillRect(0, 0, 240, 180);
+        ctx.fillRect(0, 0, WEBCAM_WIDTH, WEBCAM_HEIGHT);
 
         // Overlays the canvas, and is only shown once a track generator is feeding it.
         const video = document.createElement('video');
@@ -1455,7 +1558,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         container.appendChild(canvas);
         container.appendChild(video);
         container.appendChild(overlay);
-        videoGridContent.appendChild(container);
+        // The invite tile stays the last thing in the row.
+        videoGridContent.insertBefore(container, inviteTile);
 
         const stream = {
             username, container, canvas, ctx, video,
@@ -1630,29 +1734,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         animationFrameId = requestAnimationFrame(updateSpeakingIndicators);
     };
 
-    const initTheme = () => {
-        const savedTheme = localStorage.getItem('theme') || 'dark';
-        document.documentElement.setAttribute('data-theme', savedTheme);
-        const themeToggle = sidebarEl.querySelector('.theme-toggle');
-        if (themeToggle) {
-            themeToggle.classList.toggle('light', savedTheme === 'light');
-        }
-    };
-
-    const toggleTheme = () => {
-        const currentTheme = document.documentElement.getAttribute('data-theme');
-        const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-theme', newTheme);
-        localStorage.setItem('theme', newTheme);
-        initTheme();
-    };
-    
-    const toggleSidebar = () => {
-        isSidebarVisible = !isSidebarVisible;
-        sidebarEl.classList.toggle('visible', isSidebarVisible);
-        document.querySelector('.content').classList.toggle('sidebar-visible', isSidebarVisible);
-    };
-
     const toggleVideoGrid = () => {
         isVideoGridVisible = !isVideoGridVisible;
 
@@ -1683,35 +1764,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     const initGestures = () => {
-        let sbTouchStartX = 0;
-        let sbTouchStartY = 0;
-        
-        sidebarEl.addEventListener('touchstart', (e) => {
-            sbTouchStartX = e.changedTouches[0].screenX;
-            sbTouchStartY = e.changedTouches[0].screenY;
-        }, { passive: true });
-
-        sidebarEl.addEventListener('touchend', (e) => {
-            const sbTouchEndX = e.changedTouches[0].screenX;
-            const sbTouchEndY = e.changedTouches[0].screenY;
-            
-            const deltaX = sbTouchEndX - sbTouchStartX;
-            const deltaY = Math.abs(sbTouchEndY - sbTouchStartY);
-
-            if (deltaX > 50 && deltaY < 50) { 
-                if (isSidebarVisible) toggleSidebar();
-            }
-        }, { passive: true });
-
         let vbTouchStartX = 0;
         let vbTouchStartY = 0;
 
-        videoGrid.addEventListener('touchstart', (e) => {
+        videoStrip.addEventListener('touchstart', (e) => {
             vbTouchStartX = e.changedTouches[0].screenX;
             vbTouchStartY = e.changedTouches[0].screenY;
         }, { passive: true });
 
-        videoGrid.addEventListener('touchend', (e) => {
+        videoStrip.addEventListener('touchend', (e) => {
             const vbTouchEndX = e.changedTouches[0].screenX;
             const vbTouchEndY = e.changedTouches[0].screenY;
 
@@ -1730,16 +1791,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const currentTime = new Date().getTime();
                 const tapLength = currentTime - lastTapTime;
                 if (tapLength < 300 && tapLength > 0) {
-                    e.preventDefault(); 
-                    
-                    const anyVisible = isSidebarVisible || isVideoGridVisible;
-                    if (anyVisible) {
-                        if (isSidebarVisible) toggleSidebar();
-                        if (isVideoGridVisible) toggleVideoGrid();
-                    } else {
-                        if (!isSidebarVisible) toggleSidebar();
-                        if (!isVideoGridVisible) toggleVideoGrid();
-                    }
+                    e.preventDefault();
+                    toggleVideoGrid();
                 }
                 lastTapTime = currentTime;
             });
@@ -1848,17 +1901,6 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                     const mkOwnerUser = data.viewers.find(u => u.has_mk);
                     const newMkOwner = mkOwnerUser ? mkOwnerUser.token : COLLAB_DATA.userToken;
-                    
-                    const gamingModeBtn = document.getElementById('gaming-mode-btn');
-                    if (gamingModeBtn) {
-                        const isController = COLLAB_DATA.userRole === 'controller';
-                        const iHaveMk = (mkOwnerUser && mkOwnerUser.token === COLLAB_DATA.userToken) || (!mkOwnerUser && isController);
-                        if (iHaveMk) {
-                            gamingModeBtn.classList.remove('hidden');
-                        } else {
-                            gamingModeBtn.classList.add('hidden');
-                        }
-                    }
 
                     if (COLLAB_DATA.userRole === 'controller' && currentMkOwner !== newMkOwner) {
                         currentMkOwner = newMkOwner;
@@ -1951,25 +1993,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
     };
 
-    // Show the exit report on top of the session-ended overlay.
-    const showExitReport = (report) => {
-        handleControllerDisconnect();
-        const detail = document.getElementById('disconnection-detail');
-        const pre = document.getElementById('exit-report');
-        if (detail) {
-            const dump = report.save_dump || {};
-            detail.textContent = t('exit.summary', {
-                state: report.state_saved ? `slot ${report.state_slot}` : 'no',
-                files: (dump.files || []).length,
-                bytes: dump.total_bytes || 0,
-            });
-        }
-        if (pre) {
-            pre.textContent = JSON.stringify(report, null, 2);
-            pre.classList.remove('hidden');
-        }
-    };
-    
     const handleControlMessage = (payload) => {
         const { action, sender_token, state } = payload;
         
@@ -1997,36 +2020,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const renderSidebar = () => {
+    const renderRoom = () => {
         const hasJoined = sessionStorage.getItem('collab_hasJoined_' + COLLAB_DATA.sessionId);
         if (COLLAB_DATA.userRole === 'viewer' && !hasJoined) {
-            renderUsernamePrompt();
+            showUsernamePrompt();
         } else {
-            renderMainSidebar();
+            renderMainRoom();
         }
-        initTheme();
     };
-    
-    const renderUsernamePrompt = () => {
-        sidebarEl.innerHTML = `
-            <div class="sidebar-content">
-                <div class="username-prompt">
-                    <h3>${t('usernamePrompt.title')}</h3>
-                    <p>${t('usernamePrompt.description')}</p>
-                    <form id="username-form">
-                        <input type="text" id="username-input" placeholder="${t('usernamePrompt.placeholder')}" maxlength="25" required>
-                        <button type="submit">${t('usernamePrompt.joinButton')}</button>
-                    </form>
-                </div>
-            </div>`;
+
+    const showUsernamePrompt = () => {
         const usernameInput = document.getElementById('username-input');
         if (username) {
             usernameInput.value = username;
         }
-        document.getElementById('username-form').addEventListener('submit', handleUsernameSubmit);
+        usernameModalOverlay.classList.remove('hidden');
+        usernameInput.focus();
     };
 
-    const renderMainSidebar = () => {
+    // The dock and the self view are static markup wired up once at
+    // bootstrap; this only fills in what depends on who is looking: the
+    // local tile's label and controller-only buttons, the invite button,
+    // and the gamepad tray.
+    const renderMainRoom = () => {
+        usernameModalOverlay.classList.add('hidden');
         const isController = COLLAB_DATA.userRole === 'controller';
         const isParticipant = COLLAB_DATA.userRole === 'viewer' && COLLAB_DATA.userPermission === 'participant';
 
@@ -2038,140 +2055,114 @@ document.addEventListener('DOMContentLoaded', async () => {
                 <button class="remote-control-btn designate-speaker" data-token="${COLLAB_DATA.userToken}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
-        document.querySelector('#local-user-container .video-overlay').innerHTML = `
+        localContainer.querySelector('.video-overlay').innerHTML = `
             <span class="username">${isController ? 'Controller' : (username || 'You')}</span>
             <div class="remote-controls">${localControls}</div>`;
 
-        sidebarEl.innerHTML = `
-            <div class="sidebar-header">
-                <h2 id="sidebar-app-title">${escapeHTML(COLLAB_DATA.gameName || t('sidebar.title'))}</h2>
-                <div class="header-controls">
-                    <button id="gaming-mode-btn" class="settings-button hidden" title="${t('tooltips.gamingMode')}">
-                        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" width="18" height="18">
-                            <circle cx="12" cy="12" r="1.5" fill="currentColor" />
-                            <path d="M12 5V9M12 15V19M5 12H9M15 12H19" stroke-linecap="round" />
-                        </svg>
-                    </button>
-                    <div class="theme-toggle">
-                        <div class="icon sun-icon"><svg viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.106a.75.75 0 010 1.06l-1.591 1.59a.75.75 0 11-1.06-1.06l1.59-1.59a.75.75 0 011.06 0zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5h2.25a.75.75 0 01.75.75zM17.836 17.836a.75.75 0 01-1.06 0l-1.59-1.591a.75.75 0 111.06-1.06l1.59 1.59a.75.75 0 010 1.061zM12 21.75a.75.75 0 01-.75-.75v-2.25a.75.75 0 011.5 0v2.25a.75.75 0 01-.75-.75zM5.636 17.836a.75.75 0 010-1.06l1.591-1.59a.75.75 0 111.06 1.06l-1.59 1.59a.75.75 0 01-1.06 0zM3.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H4.5a.75.75 0 01-.75-.75zM6.106 6.106a.75.75 0 011.06 0l1.59 1.591a.75.75 0 11-1.06 1.06l-1.59-1.59a.75.75 0 010-1.06z"/></svg></div>
-                        <div class="icon moon-icon"><svg viewBox="0 0 24 24"><path d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21c3.73 0 7.01-1.939 8.71-4.922.482-.97.74-2.053.742-3.176z"/></svg></div>
-                    </div>
-                    <button id="reload-stream-btn" class="settings-button" title="${t('tooltips.reloadStream')}"><i class="fas fa-sync"></i></button>
-                    <button id="settings-btn" class="settings-button"><i class="fas fa-cog"></i></button>
-                    ${isController ? `<button id="invite-btn" class="settings-button" title="${t('tooltips.invite')}"><i class="fas fa-user-plus"></i></button>` : ''}
-                    ${isController ? `<button id="exit-session-btn" class="settings-button exit-button" title="${t('tooltips.exitSession')}"><i class="fas fa-power-off"></i></button>` : ''}
-                </div>
-            </div>
-            <div class="sidebar-media-controls">
-                <button id="toggle-mic-btn" class="control-btn" title="${t('tooltips.toggleLocalMic')}">
-                    <i class="fas fa-microphone"></i>
-                </button>
-                <button id="toggle-video-btn" class="control-btn" title="${t('tooltips.toggleLocalWebcam')}">
-                    <i class="fas fa-video"></i>
-                </button>
-                <div class="iframe-audio-controls">
-                    <button id="iframe-mute-btn" class="control-btn" title="${t('tooltips.toggleSessionAudio')}">
-                        <i class="fas fa-volume-up"></i>
-                    </button>
-                    <input type="range" id="iframe-volume-slider" min="0" max="1" step="0.01" value="1" title="${t('tooltips.sessionVolume')}">
-                </div>
-            </div>
-            ${isController ? `
-            <div id="invite-section" class="sidebar-invite-section hidden">
-                <h3>${t('inviteLinks.heading')}</h3>
-                <button class="control-btn invite-copy" data-permission="participant">${t('inviteLinks.participant')}</button>
-                <button class="control-btn invite-copy" data-permission="readonly">${t('inviteLinks.readonly')}</button>
-            </div>` : ''}
-            <div id="sidebar-main-content" class="sidebar-content"></div>
-            <div id="chat-reply-banner"></div>
-            <div id="chat-form-container">
-                <form id="chat-form">
-                    <input type="text" id="chat-input" placeholder="${t('chat.inputPlaceholder')}" autocomplete="off" maxlength="500">
-                    <button type="submit"><i class="fas fa-paper-plane"></i></button>
-                </form>
-            </div>`;
-        
-        applyTranslations(sidebarEl, t);
-
-        if (isController) {
+        if (isController || isParticipant) {
             initGamepadControls();
-        } else if (isParticipant) {
-             initGamepadControls();
         }
-
-        if (COLLAB_DATA.userPermission === 'readonly') {
-            const mediaControls = document.querySelector('.sidebar-media-controls');
-            if (mediaControls) {
-                mediaControls.classList.add('readonly-view');
-                mediaControls.querySelector('#toggle-mic-btn').style.display = 'none';
-                mediaControls.querySelector('#toggle-video-btn').style.display = 'none';
-            }
-            const settingsBtn = document.querySelector('#settings-btn');
-            if (settingsBtn) {
-                settingsBtn.style.display = 'none';
-            }
-        }
-
-        toggleMicBtn = document.getElementById('toggle-mic-btn');
-        toggleVideoBtn = document.getElementById('toggle-video-btn');
-        iframeMuteBtn = document.getElementById('iframe-mute-btn');
-        iframeVolumeSlider = document.getElementById('iframe-volume-slider');
-        toggleMicBtn.addEventListener('click', () => handleMediaToggle('mic'));
-        toggleVideoBtn.addEventListener('click', () => handleMediaToggle('video'));
+        inviteTile.classList.toggle('hidden', !isController);
         updateMediaButtonUI();
+    };
 
-        const gameIframe = document.getElementById('session-frame');
-        iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        if (isIframeMuted) iframeMuteBtn.querySelector('i').className = 'fas fa-volume-mute';
+    // --- chat: the bar's chat column grows up over the play space while it has focus ---
+    const scrollChatToBottom = () => {
+        chatScroll.scrollTop = chatScroll.scrollHeight;
+    };
 
-        if (gameIframe) {
-            gameIframe.addEventListener('load', sendVolumeToIframe);
-        }
+    const openChat = () => {
+        if (isChatOpen) return;
+        isChatOpen = true;
+        chatTab.classList.remove('unread');
+        chatDock.classList.add('open');
+        // The height transition has to land before the bottom is the bottom.
+        chatDock.addEventListener('transitionend', scrollChatToBottom, { once: true });
+        scrollChatToBottom();
+    };
 
-        iframeMuteBtn.addEventListener('click', () => {
-            isIframeMuted = !isIframeMuted;
-            sendVolumeToIframe();
-            iframeMuteBtn.querySelector('i').className = isIframeMuted ? 'fas fa-volume-mute' : 'fas fa-volume-up';
-            iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        });
+    const closeChat = () => {
+        if (!isChatOpen) return;
+        isChatOpen = false;
+        chatDock.classList.remove('open');
+        chatDock.addEventListener('transitionend', scrollChatToBottom, { once: true });
+        if (document.activeElement === chatInput) chatInput.blur();
+    };
 
-        iframeVolumeSlider.addEventListener('input', (e) => {
-            const newVolume = parseFloat(e.target.value);
+    // --- invite: the blank tile at the end of the row flips to the link buttons ---
+    const isInviteOpen = () => inviteTile.classList.contains('open');
+    const openInvite = () => inviteTile.classList.add('open');
+    const closeInvite = () => inviteTile.classList.remove('open');
 
-            if (newVolume > 0) {
-                lastKnownVolume = newVolume;
-                localStorage.setItem(`collab_iframe_volume`, lastKnownVolume);
-                isIframeMuted = false;
-                iframeMuteBtn.querySelector('i').className = 'fas fa-volume-up';
-            } else {
-                isIframeMuted = true;
-                iframeMuteBtn.querySelector('i').className = 'fas fa-volume-mute';
-            }
-            sendVolumeToIframe();
-        });
-
-        const gamingModeBtn = sidebarEl.querySelector('#gaming-mode-btn');
-        if (gamingModeBtn) {
-            gamingModeBtn.addEventListener('click', () => {
-                if (document.fullscreenElement) {
-                    if (document.exitFullscreen) {
-                        document.exitFullscreen().catch(err => console.error(err));
+    const initInviteControls = () => {
+        inviteBtn.addEventListener('click', openInvite);
+        // The broker hands back the same link for a permission all session,
+        // so one fetch per permission is all that is ever needed.
+        const inviteUrls = {};
+        inviteTile.querySelectorAll('.invite-copy').forEach((button) => {
+            let resetTimer = null;
+            const flash = (text) => {
+                const label = button.textContent;
+                button.textContent = text;
+                clearTimeout(resetTimer);
+                resetTimer = setTimeout(() => {
+                    button.textContent = label;
+                }, INVITE_FLASH_MS);
+            };
+            button.addEventListener('click', async () => {
+                const permission = button.dataset.permission;
+                try {
+                    if (!inviteUrls[permission]) {
+                        const resp = await fetch(
+                            `api/session/invite?token=${encodeURIComponent(COLLAB_DATA.userToken)}`,
+                            {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ permission }),
+                            }
+                        );
+                        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                        const invited = await resp.json();
+                        inviteUrls[permission] = new URL(invited.url, window.location.href).href;
                     }
-                } else {
-                    const iframe = document.getElementById('session-frame');
-                    if (iframe && iframe.contentWindow) {
-                        iframe.contentWindow.postMessage({ type: 'requestFullscreen' }, window.location.origin);
-                        iframe.focus(); 
-                    }
-                    if (COLLAB_DATA.userRole !== 'controller' && ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ action: 'force_cursor_render', state: 1 }));
-                    }
+                    await navigator.clipboard.writeText(inviteUrls[permission]);
+                    flash(t('inviteLinks.copied'));
+                    // Long enough to read the confirmation before the panel goes.
+                    setTimeout(closeInvite, INVITE_FLASH_MS);
+                } catch (err) {
+                    console.error('[Invite] failed:', err);
+                    flash(t('inviteLinks.failed'));
                 }
             });
-        }
+        });
+    };
 
-        sidebarEl.querySelector('.theme-toggle').addEventListener('click', toggleTheme);
-        sidebarEl.querySelector('#reload-stream-btn').addEventListener('click', () => {
+    const initDock = () => {
+        toggleMicBtn.addEventListener('click', () => handleMediaToggle('mic'));
+        toggleVideoBtn.addEventListener('click', () => handleMediaToggle('video'));
+        settingsBtn.addEventListener('click', () => {
+            unlockAllAudio();
+            populateDeviceLists();
+            settingsModalOverlay.classList.remove('hidden');
+        });
+        // Touch has no hover, so a tap on the tile itself is what surfaces the
+        // self-view controls; a tap anywhere else puts them away again.
+        localContainer.addEventListener('click', (e) => {
+            if (e.target.closest('button, .gamepad-icon')) return;
+            localContainer.classList.toggle('controls-shown');
+        });
+
+        chatForm.addEventListener('submit', handleChatSubmit);
+        chatInput.addEventListener('focus', openChat);
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeChat();
+        });
+        chatScroll.addEventListener('click', handleChatAreaClick);
+        document.getElementById('username-form').addEventListener('submit', handleUsernameSubmit);
+
+        initInviteControls();
+
+        reloadStreamBtn.addEventListener('click', () => {
             const iframe = document.getElementById('session-frame');
             if (iframe) {
                 if (iframe.getAttribute('src') === 'about:blank' && iframe.dataset.src) {
@@ -2182,80 +2173,49 @@ document.addEventListener('DOMContentLoaded', async () => {
                     iframe.src = currentSrc.toString();
                 }
             }
+            closeModal();
         });
-        sidebarEl.querySelector('#settings-btn').addEventListener('click', () => {
-            unlockAllAudio();
-            populateDeviceLists();
-            settingsModalOverlay.classList.remove('hidden')
+
+        // The open chat, the invite tile and the self-view controls all
+        // minimize the same way: interacting anywhere outside them. Captured
+        // so it runs before a target's own handler can re-open what it just
+        // closed.
+        document.addEventListener('pointerdown', (e) => {
+            if (isChatOpen && !e.target.closest('#chat-dock')) closeChat();
+            if (isInviteOpen() && !e.target.closest('#invite-tile')) closeInvite();
+            if (!e.target.closest('#local-user-container')) localContainer.classList.remove('controls-shown');
+        }, true);
+        // The chat column is fixed rather than in the bar's flow, so its
+        // closed height tracks whatever the bar is currently laid out at.
+        // The same pass decides whether the tiles are bumping into it: when
+        // the tiles plus a full-width column would not fit the bar, the
+        // column folds to a tab at the right edge and gives the strip the
+        // room. Measured against the full column width, not the slot's
+        // current one, so folding cannot un-crowd the bar and unfold itself.
+        const updateBarLayout = () => {
+            document.documentElement.style.setProperty('--bar-height', `${videoGrid.offsetHeight}px`);
+            const styles = getComputedStyle(videoGrid);
+            const gap = parseFloat(styles.columnGap) || 0;
+            const padding = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+            const fullDock = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--chat-dock-width')) || 0;
+            const needed = videoGridContent.scrollWidth + gap + fullDock + padding;
+            document.body.classList.toggle('chat-crowded', needed > videoGrid.clientWidth);
+        };
+        const barObserver = new ResizeObserver(updateBarLayout);
+        barObserver.observe(videoGrid);
+        barObserver.observe(videoGridContent);
+        chatTab.addEventListener('click', () => {
+            openChat();
+            chatInput.focus();
         });
-        const inviteBtn = sidebarEl.querySelector('#invite-btn');
-        const inviteSection = sidebarEl.querySelector('#invite-section');
-        if (inviteBtn && inviteSection) {
-            inviteBtn.addEventListener('click', () => {
-                inviteSection.classList.toggle('hidden');
-            });
-            // Each mint is a real seat in the session and the backend cannot
-            // dedup a user-less invite, so cache per permission rather than
-            // minting again on every click and leaving a trail of offline
-            // users behind.
-            const inviteUrls = {};
-            inviteSection.querySelectorAll('.invite-copy').forEach((button) => {
-                const label = button.textContent;
-                let resetTimer = null;
-                const flash = (text) => {
-                    button.textContent = text;
-                    clearTimeout(resetTimer);
-                    resetTimer = setTimeout(() => {
-                        button.textContent = label;
-                    }, 2000);
-                };
-                button.addEventListener('click', async () => {
-                    const permission = button.dataset.permission;
-                    try {
-                        if (!inviteUrls[permission]) {
-                            const resp = await fetch(
-                                `api/session/invite?token=${encodeURIComponent(COLLAB_DATA.userToken)}`,
-                                {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ permission }),
-                                }
-                            );
-                            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                            const invited = await resp.json();
-                            inviteUrls[permission] = new URL(invited.url, window.location.href).href;
-                        }
-                        await navigator.clipboard.writeText(inviteUrls[permission]);
-                        flash(t('inviteLinks.copied'));
-                    } catch (err) {
-                        console.error('[Invite] failed:', err);
-                        flash(t('inviteLinks.failed'));
-                    }
-                });
-            });
-        }
-        const exitBtn = sidebarEl.querySelector('#exit-session-btn');
-        if (exitBtn) {
-            exitBtn.addEventListener('click', async () => {
-                if (!confirm(t('exit.confirm'))) return;
-                exitBtn.disabled = true;
-                try {
-                    const resp = await fetch(`api/session/exit?token=${encodeURIComponent(COLLAB_DATA.userToken)}`, { method: 'POST' });
-                    const report = await resp.json();
-                    console.log('[Exit] save dump report:', report);
-                    showExitReport(report);
-                } catch (err) {
-                    console.error('[Exit] failed:', err);
-                    alert(t('exit.failed', { message: err.message }));
-                    exitBtn.disabled = false;
-                }
-            });
-        }
-        sidebarEl.querySelector('#chat-form').addEventListener('submit', handleChatSubmit);
-        document.getElementById('sidebar-main-content').innerHTML = '<div id="chat-messages"></div>';
-        document.getElementById('sidebar-main-content').addEventListener('click', handleChatAreaClick);
+        // Clicking into the game stream never reaches this document as a
+        // pointer event; the window losing focus is the only signal.
+        window.addEventListener('blur', () => {
+            closeChat();
+            closeInvite();
+        });
     };
-   
+
     const escapeHTML = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 
     const linkify = (text) => {
@@ -2305,10 +2265,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         const messagesContainer = document.getElementById('chat-messages');
         if (!messagesContainer) return;
 
-        const scrollContainer = document.getElementById('sidebar-main-content');
-        if (!scrollContainer) return;
-
-        const isScrolledToBottom = scrollContainer.scrollHeight - scrollContainer.clientHeight <= scrollContainer.scrollTop + 50;
+        const isScrolledToBottom = chatScroll.scrollHeight - chatScroll.clientHeight <= chatScroll.scrollTop + 50;
 
         const msgEl = document.createElement('div');
         let isOwnMessage = false;
@@ -2335,13 +2292,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         if (isScrolledToBottom) {
-            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            scrollChatToBottom();
         }
 
         if (type === 'chat' && !isOwnMessage) {
             playNotificationSound();
-            if (!isSidebarVisible) {
-                showToast(data);
+            if (!isChatOpen) {
+                showChatPeek(data);
             }
         }
     };
@@ -2356,7 +2313,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             localStorage.setItem('collab_username', username);
             sessionStorage.setItem('collab_hasJoined_' + COLLAB_DATA.sessionId, 'true');
             ws.send(JSON.stringify({ action: 'set_username', username: username }));
-            renderSidebar();
+            renderRoom();
 
             if (!mediaInitialized) {
                 await startMedia();
@@ -2376,24 +2333,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                 sendControlMessage('video_state', true);
             }
             updateMediaButtonUI();
-
-            toggleSidebar();
         }
     };
 
     const handleChatSubmit = (e) => {
         e.preventDefault();
-        const input = document.getElementById('chat-input');
-        if (input.value.trim()) {
-            const payload = { 
-                action: 'send_chat_message', 
-                message: input.value.trim() 
+        if (chatInput.value.trim()) {
+            const payload = {
+                action: 'send_chat_message',
+                message: chatInput.value.trim()
             };
             if (replyingTo) {
                 payload.replyTo = replyingTo.messageId;
             }
             ws.send(JSON.stringify(payload));
-            input.value = '';
+            chatInput.value = '';
             cancelReply();
         }
     };
@@ -2406,6 +2360,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (messageStore[messageId]) {
                 replyingTo = messageStore[messageId];
                 renderReplyBanner();
+                chatInput.focus();
             }
         }
     };
@@ -2459,25 +2414,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         oscillator.stop(notificationAudioCtx.currentTime + 0.1);
     };
 
-    const showToast = (data) => {
-        const toast = document.createElement('div');
-        toast.className = 'toast';
-        toast.innerHTML = `
-            <div class="toast-sender">${escapeHTML(data.sender)}</div>
-            <div class="toast-message">${linkify(escapeHTML(data.message))}</div>
+    // A closed chat still shows what just arrived: the message surfaces as a
+    // bubble above the dock's input and clears itself, and tapping it opens
+    // the full history.
+    const showChatPeek = (data) => {
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-peek-bubble';
+        bubble.innerHTML = `
+            <div class="chat-peek-sender">${escapeHTML(data.sender)}</div>
+            <div class="chat-peek-message">${linkify(escapeHTML(data.message))}</div>
         `;
-        toast.addEventListener('click', () => {
-            if (!isSidebarVisible) {
-                toggleSidebar();
-            }
-            toast.classList.add('closing');
+        bubble.addEventListener('click', () => {
+            openChat();
+            chatInput.focus();
         });
-        toastContainer.appendChild(toast);
+        chatTab.classList.add('unread');
+        chatPeek.appendChild(bubble);
+        while (chatPeek.children.length > MAX_PEEK_BUBBLES) {
+            chatPeek.removeChild(chatPeek.firstChild);
+        }
 
         setTimeout(() => {
-            toast.classList.add('closing');
-            toast.addEventListener('animationend', () => toast.remove());
-        }, 5000);
+            bubble.classList.add('closing');
+            bubble.addEventListener('animationend', () => bubble.remove());
+        }, PEEK_LIFETIME_MS);
     };
 
     const initGamepadControls = () => {
@@ -2492,12 +2452,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         mkIcon.className = 'gamepad-icon mk-icon';
         if (COLLAB_DATA.userRole === 'controller') {
             mkIcon.classList.add('draggable');
-            mkIcon.draggable = true;
         }
         mkIcon.innerHTML = `<i class="fas fa-keyboard"></i><i class="fas fa-mouse" style="margin-left: 3px; font-size: 0.8em;"></i>`;
 
         if (COLLAB_DATA.userRole === 'controller') {
-            document.getElementById('local-user-container').appendChild(mkIcon);
+            localContainer.appendChild(mkIcon);
         } else {
             sourceBox.appendChild(mkIcon);
         }
@@ -2508,7 +2467,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             icon.className = 'gamepad-icon';
             if (COLLAB_DATA.userRole === 'controller') {
                 icon.classList.add('draggable');
-                icon.draggable = true;
             }
             icon.dataset.gamepadId = i;
             icon.innerHTML = `<i class="fas fa-gamepad"></i><span class="gamepad-number">${i}</span>`;
@@ -2567,109 +2525,137 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    let draggedElement = null;
+    // Gamepad/MK handoff and tile reordering are pointer-event drags with an
+    // in-page ghost rather than native HTML5 drag-and-drop: the native drag
+    // image is drawn by the OS outside the page and does not show over a
+    // fullscreen element, and native DnD never worked on touch at all.
+    const DRAG_START_PX = 5;
+    let drag = null;
 
-    videoGrid.addEventListener('dragstart', (e) => {
-        const target = e.target.closest('.draggable, .reorderable');
-        if (!target) {
-            e.preventDefault();
+    const dragTargets = () => Array.from(document.querySelectorAll('.video-container')).filter((container) => {
+        const user = currentUserState.find(u => u.token === container.dataset.userToken);
+        return container.id === 'gamepad-source-box' || user;
+    });
+
+    const beginDrag = (pending) => {
+        const { source, pointerId } = pending;
+        const ghost = source.cloneNode(true);
+        ghost.classList.add('drag-ghost');
+        ghost.removeAttribute('id');
+        const rect = source.getBoundingClientRect();
+        ghost.style.width = `${rect.width}px`;
+        ghost.style.height = `${rect.height}px`;
+        document.body.appendChild(ghost);
+
+        drag = { ...pending, ghost, offsetX: pending.startX - rect.left, offsetY: pending.startY - rect.top, over: null };
+        source.setPointerCapture(pointerId);
+
+        if (drag.kind === 'stream') {
+            document.body.classList.add('dragging-stream');
+            source.classList.add('reordering');
+        } else {
+            document.body.classList.add(drag.kind === 'mk' ? 'dragging-mk' : 'dragging-gamepad');
+            source.classList.add('dragging');
+            dragTargets().forEach(c => c.classList.add('can-drop-gamepad'));
+        }
+    };
+
+    const moveGhost = (e) => {
+        drag.ghost.style.transform = `translate(${e.clientX - drag.offsetX}px, ${e.clientY - drag.offsetY}px)`;
+    };
+
+    const containerUnder = (e) => {
+        // The ghost ignores pointer events, so this sees through it.
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        return el ? el.closest('.video-container') : null;
+    };
+
+    const endDrag = (dropped) => {
+        if (!drag) return;
+        const { source, kind, ghost, over } = drag;
+        drag = null;
+        ghost.remove();
+        document.body.classList.remove('dragging-gamepad', 'dragging-mk', 'dragging-stream');
+        source.classList.remove('dragging', 'reordering');
+        document.querySelectorAll('.can-drop-gamepad, .drop-target').forEach(el => el.classList.remove('can-drop-gamepad', 'drop-target'));
+        if (!dropped || kind === 'stream' || !over) return;
+
+        if (kind === 'mk') {
+            const tokenToAssign = (over.id === 'gamepad-source-box') ? COLLAB_DATA.userToken : over.dataset.userToken;
+            ws.send(JSON.stringify({ action: 'assign_mk', token: tokenToAssign }));
             return;
         }
-        draggedElement = target;
-
-        if (target.classList.contains('gamepad-icon')) {
-            if (target.classList.contains('mk-icon')) {
-                document.body.classList.add('dragging-mk');
-                e.dataTransfer.setData('type', 'mk');
-            } else {
-                document.body.classList.add('dragging-gamepad');
-                e.dataTransfer.setData('type', 'gamepad');
-                e.dataTransfer.setData('text/plain', target.dataset.gamepadId);
+        const gamepadId = parseInt(source.dataset.gamepadId, 10);
+        if (over.id === 'gamepad-source-box') {
+            const parentContainer = source.parentElement;
+            if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
+                const userToken = parentContainer.dataset.userToken;
+                if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: null }));
             }
-            e.dataTransfer.effectAllowed = 'move';
-            
-            setTimeout(() => target.classList.add('dragging'), 0);
-            
-            document.querySelectorAll('.video-container').forEach(container => {
-                const userToken = container.dataset.userToken;
-                const user = currentUserState.find(u => u.token === userToken);
-                if (container.id === 'gamepad-source-box' || user) {
-                    container.classList.add('can-drop-gamepad');
-                }
-            });
-        } else if (target.classList.contains('reorderable')) {
-            document.body.classList.add('dragging-stream');
-            e.dataTransfer.setData('text/plain', target.id);
-            e.dataTransfer.effectAllowed = 'move';
-            setTimeout(() => target.classList.add('reordering'), 0);
-        }
-    });
-
-    videoGrid.addEventListener('dragend', (e) => {
-        document.body.className = '';
-        draggedElement?.classList.remove('dragging', 'reordering');
-        document.querySelectorAll('.can-drop-gamepad').forEach(el => el.classList.remove('can-drop-gamepad'));
-        draggedElement = null;
-    });
-
-    videoGrid.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        const dropTarget = e.target.closest('.video-container');
-
-        if (document.body.classList.contains('dragging-gamepad') || document.body.classList.contains('dragging-mk')) {
-            if (dropTarget && dropTarget.classList.contains('can-drop-gamepad')) {
-                e.dataTransfer.dropEffect = 'move';
-            } else {
-                e.dataTransfer.dropEffect = 'none';
-            }
-        } else if (document.body.classList.contains('dragging-stream')) {
-            if (dropTarget && !dropTarget.classList.contains('pinned') && dropTarget !== draggedElement) {
-                const rect = dropTarget.getBoundingClientRect();
-                const offsetX = e.clientX - rect.left;
-                if (offsetX < rect.width / 2) {
-                    dropTarget.parentNode.insertBefore(draggedElement, dropTarget);
-                } else {
-                    dropTarget.parentNode.insertBefore(draggedElement, dropTarget.nextSibling);
-                }
-            }
-        }
-    });
-
-    videoGrid.addEventListener('drop', (e) => {
-        e.preventDefault();
-        const isGamepad = document.body.classList.contains('dragging-gamepad');
-        const isMk = document.body.classList.contains('dragging-mk');
-
-        if (!isGamepad && !isMk) return;
-
-        const dropTarget = e.target.closest('.video-container.can-drop-gamepad');
-        if (!dropTarget) return;
-
-        if (isMk) {
-            const userToken = dropTarget.dataset.userToken;
-            const tokenToAssign = (dropTarget.id === 'gamepad-source-box') ? COLLAB_DATA.userToken : userToken;
-            ws.send(JSON.stringify({ action: 'assign_mk', token: tokenToAssign }));
         } else {
-            const gamepadId = parseInt(e.dataTransfer.getData('text/plain'), 10);
-            const draggedIcon = document.getElementById(`gamepad-icon-${gamepadId}`);
-            if (dropTarget.id === 'gamepad-source-box') {
-                const parentContainer = draggedIcon.parentElement;
-                if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
-                    const userToken = parentContainer.dataset.userToken;
-                    if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: null }));
-                }
-            } else {
-                const userToken = dropTarget.dataset.userToken;
-                if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: gamepadId }));
-            }
+            const userToken = over.dataset.userToken;
+            if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: gamepadId }));
         }
+    };
+
+    videoStrip.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 || drag) return;
+        const icon = e.target.closest('.gamepad-icon.draggable');
+        const tile = e.target.closest('.video-container.reorderable');
+        let source, kind;
+        if (icon) {
+            source = icon;
+            kind = icon.classList.contains('mk-icon') ? 'mk' : 'gamepad';
+        } else if (tile && e.pointerType === 'mouse' && !e.target.closest('button')) {
+            // Touch on a tile has to stay a scroll of the strip.
+            source = tile;
+            kind = 'stream';
+        } else {
+            return;
+        }
+        // Nothing moves until the pointer has travelled a little, so a plain
+        // click on an icon or tile still behaves like one.
+        const pending = { source, kind, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY };
+        const onMove = (ev) => {
+            if (ev.pointerId !== pending.pointerId) return;
+            if (!drag) {
+                if (Math.hypot(ev.clientX - pending.startX, ev.clientY - pending.startY) < DRAG_START_PX) return;
+                beginDrag(pending);
+            }
+            moveGhost(ev);
+            const over = containerUnder(ev);
+            if (drag.kind === 'stream') {
+                if (over && !over.classList.contains('pinned') && over !== drag.source) {
+                    const rect = over.getBoundingClientRect();
+                    const before = ev.clientX - rect.left < rect.width / 2;
+                    over.parentNode.insertBefore(drag.source, before ? over : over.nextSibling);
+                }
+                return;
+            }
+            const target = over && over.classList.contains('can-drop-gamepad') ? over : null;
+            if (target !== drag.over) {
+                drag.over?.classList.remove('drop-target');
+                target?.classList.add('drop-target');
+                drag.over = target;
+            }
+        };
+        const onEnd = (ev) => {
+            if (ev.pointerId !== pending.pointerId) return;
+            source.removeEventListener('pointermove', onMove);
+            source.removeEventListener('pointerup', onEnd);
+            source.removeEventListener('pointercancel', onEnd);
+            endDrag(ev.type === 'pointerup');
+        };
+        source.addEventListener('pointermove', onMove);
+        source.addEventListener('pointerup', onEnd);
+        source.addEventListener('pointercancel', onEnd);
     });
 
     let isBouncing = false;
-    videoGrid.addEventListener('wheel', e => {
-        if (videoGrid.scrollWidth > videoGrid.clientWidth) {
+    videoStrip.addEventListener('wheel', e => {
+        if (videoStrip.scrollWidth > videoStrip.clientWidth) {
             e.preventDefault();
-            videoGrid.scrollLeft += e.deltaY;
+            videoStrip.scrollLeft += e.deltaY;
         } else {
             if (isBouncing || Math.abs(e.deltaY) < 5) return;
             e.preventDefault();
@@ -2685,8 +2671,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             }, 150);
         }
     });
-
-    toggleHandle.addEventListener('click', toggleSidebar);
 
     if (videoToggleHandle) {
         videoToggleHandle.addEventListener('click', toggleVideoGrid);
@@ -2710,7 +2694,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if(mediaInitialized) startMedia();
     });
     
-    videoGrid.addEventListener('click', (e) => {
+    videoStrip.addEventListener('click', (e) => {
         const btn = e.target.closest('.remote-control-btn');
         if (!btn) return;
     
@@ -2771,13 +2755,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
 
     applyTranslations(document.body, t);
-    renderSidebar();
+    initDock();
+    renderRoom();
     connectWebSocket();
     updateSpeakingIndicators();
 
     document.body.addEventListener('click', initNotificationAudio, { once: true });
     document.body.addEventListener('keydown', initNotificationAudio, { once: true });
 
+    // A seat token is personal and comes out of the address bar; an invite
+    // token is the shared link and can stay, since reloading on it is what
+    // brings this tab back to its own seat.
     if (window.history.replaceState) {
         const url = new URL(window.location);
         url.searchParams.delete('token');
@@ -2801,6 +2789,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             }
         });
         resizeObserver.observe(iframeEl);
+        // Re-applied on every stream (re)load so a reload keeps RomM's volume.
+        iframeEl.addEventListener('load', sendVolumeToIframe);
     }
 
     document.addEventListener('fullscreenchange', () => {
@@ -2808,18 +2798,4 @@ document.addEventListener('DOMContentLoaded', async () => {
             ws.send(JSON.stringify({ action: 'force_cursor_render', state: 0 }));
         }
     });
-
-    setTimeout(toggleSidebar, 500);
-
-    // Show the chrome briefly, then retract it so the stream lands full-view.
-    // The sidebar always goes: it is a slide-over panel that would sit on top
-    // of the game. The video bar stays in a multiplayer room, because faces
-    // are the point of the mode and the handle that brings it back is easy to
-    // miss.
-    setTimeout(() => {
-        if (isSidebarVisible) toggleSidebar();
-        if (isVideoGridVisible && document.body.classList.contains('solo-mode')) {
-            toggleVideoGrid();
-        }
-    }, 2500);
 });

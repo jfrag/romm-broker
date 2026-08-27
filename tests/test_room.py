@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
-from webstation_broker import room
+from webstation_broker import room, session
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -160,3 +160,90 @@ def test_an_out_of_range_state_value_is_dropped(
         message = conn.receive_json()
 
         assert message["payload"]["state"] == 0
+
+
+def _invite(client: TestClient, controller_token: str, permission: str = "participant") -> str:
+    """Take a seat through the controller's invite link and return the seat token."""
+    response = client.post(
+        f"{API}/session/invite?token={controller_token}", json={"permission": permission}
+    )
+    invite = response.json()["url"].split("invite=")[1]
+    return client.get(f"{API}/session/context?invite={invite}").json()["userToken"]
+
+
+def _wait_for_state(conn: WebSocketTestSession, predicate) -> dict:  # noqa: ANN001
+    """Read room broadcasts until a state_update satisfies `predicate`, and return it."""
+    while True:
+        message = conn.receive_json()
+        if message["type"] == "state_update" and predicate(message):
+            return message
+
+
+def test_an_invite_link_stays_valid_after_its_viewer_disconnects(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An invite link stays valid after its viewer disconnects.
+
+    The seat is minted once and lives for the whole session: a reload, a closed tab or the room's
+    own reconnect must land back in the same seat rather than on a "session does not exist" page.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, viewer):
+        pass
+
+    assert session.find_viewer(viewer) is not None
+    assert client.get(f"{API}/session/context?token={viewer}").status_code == 200
+    with _connect(client, viewer) as conn:
+        conn.send_json({"action": "video_state", "state": 1})
+        assert conn.receive_json()["payload"]["state"] == 1
+
+
+def test_a_disconnecting_viewer_releases_its_gamepad_but_keeps_its_seat(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A disconnecting viewer releases its gamepad but keeps its seat.
+
+    A pad nobody is driving goes back to the tray so the host can hand it on, while the seat (and
+    the link to it) survives for when that person comes back.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "assign_slot", "viewer_token": viewer, "slot": 2})
+        _wait_for_state(
+            guest,
+            lambda m: any(u["token"] == viewer and u["slot"] == 2 for u in m["viewers"]),
+        )
+
+    seat = session.find_viewer(viewer)
+    assert seat is not None
+    assert seat["slot"] is None
+
+
+def test_a_new_connection_on_the_same_token_replaces_the_old_one(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A new connection on the same token replaces the old one.
+
+    The stale socket is closed and, since it was not the member leaving, it must not announce a
+    departure or release what the live socket now holds.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host:
+        with _connect(client, viewer) as first:
+            with _connect(client, viewer) as second:
+                with pytest.raises(WebSocketDisconnect):
+                    first.receive_json()
+                second.send_json({"action": "video_state", "state": 1})
+                assert second.receive_json()["payload"]["state"] == 1
+
+        # The host saw a join per socket but no departure from the replaced one.
+        seen = []
+        while not seen or seen[-1] != "control":
+            seen.append(host.receive_json()["type"])
+        assert seen.count("user_left") == 0

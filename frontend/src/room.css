@@ -1,59 +1,26 @@
 /* Palette lifted from RomM's design tokens (frontend/src/v2/styles/tokens.css
    and src/styles/themes.ts) so the room reads as part of RomM. */
 :root {
+  /* Native widgets (select popups, pickers, scrollbars) get their dark
+     variant instead of a white popup inheriting white text. */
+  color-scheme: dark;
   --font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, system-ui,
     "Inter", Roboto, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
-  --sidebar-width: 350px;
   --romm-primary: #8b74e8;
   --romm-primary-hover: #a18fff;
   --romm-red: #da3633;
   --romm-green: #3fb950;
   --romm-gold: #ffd700;
   --romm-danger: #ff5050;
-}
-
-html,
-html[data-theme="light"] {
-  --sidebar-bg: rgba(240, 240, 246, 0.98);
-  --sidebar-text: #111117;
-  --sidebar-header-color: #553e98;
-  --sidebar-border: rgba(17, 17, 23, 0.1);
-  --sidebar-shadow: rgba(0, 0, 0, 0.2);
-  --section-bg: rgba(0, 0, 0, 0.035);
-  --item-border: rgba(0, 0, 0, 0.22);
-  --input-bg: #ffffff;
-  --input-text: #111117;
-  --input-border: rgba(0, 0, 0, 0.22);
-  --button-bg: #553e98;
-  --button-text: #ffffff;
-  --button-hover-bg: #452788;
-  --text-muted: rgba(17, 17, 23, 0.58);
-  --color-success: #15a34a;
-  --color-speaker: #b8860b;
-  --icon-sun-color: #ca8a04;
-  --icon-moon-color: #553e98;
-  --control-btn-bg: #ffffff;
-  --control-btn-color: #111117;
-  --control-btn-hover-bg: rgba(0, 0, 0, 0.1);
-  --control-btn-inactive-bg: #dc2626;
-  --control-btn-inactive-color: #ffffff;
-  --chat-bubble-self-bg: #553e98;
-  --chat-bubble-self-text: #ffffff;
-  --chat-bubble-other-bg: rgba(0, 0, 0, 0.06);
-  --chat-bubble-other-text: #111117;
-  --chat-hover-bg: rgba(0, 0, 0, 0.06);
-  --reply-quote-bg: rgba(0, 0, 0, 0.05);
-  --reply-quote-border: #553e98;
-  --toast-bg: rgba(245, 245, 250, 0.95);
-  --toast-text: #111117;
-}
-
-html[data-theme="dark"] {
-  --sidebar-bg: rgba(16, 12, 28, 0.97);
-  --sidebar-text: rgba(255, 255, 255, 0.75);
-  --sidebar-header-color: #8b74e8;
-  --sidebar-border: rgba(255, 255, 255, 0.1);
-  --sidebar-shadow: rgba(0, 0, 0, 0.6);
+  --chat-dock-width: 300px;
+  --chat-tab-width: 36px;
+  --bar-height: 200px;
+  --bar-pad: 10px;
+  --panel-bg: rgba(16, 12, 28, 0.97);
+  --panel-text: rgba(255, 255, 255, 0.75);
+  --accent: #8b74e8;
+  --panel-border: rgba(255, 255, 255, 0.1);
+  --panel-shadow: rgba(0, 0, 0, 0.6);
   --section-bg: rgba(255, 255, 255, 0.07);
   --item-border: rgba(255, 255, 255, 0.15);
   --input-bg: rgba(255, 255, 255, 0.045);
@@ -65,8 +32,6 @@ html[data-theme="dark"] {
   --text-muted: rgba(255, 255, 255, 0.45);
   --color-success: #3fb950;
   --color-speaker: #ffd700;
-  --icon-sun-color: #ffd700;
-  --icon-moon-color: #a18fff;
   --control-btn-bg: rgba(255, 255, 255, 0.07);
   --control-btn-color: #ffffff;
   --control-btn-hover-bg: rgba(255, 255, 255, 0.12);
@@ -79,8 +44,8 @@ html[data-theme="dark"] {
   --chat-hover-bg: rgba(255, 255, 255, 0.05);
   --reply-quote-bg: rgba(255, 255, 255, 0.045);
   --reply-quote-border: #8b74e8;
-  --toast-bg: rgba(13, 17, 23, 0.92);
-  --toast-text: #ffffff;
+  --peek-bg: rgba(13, 17, 23, 0.92);
+  --peek-text: #ffffff;
 }
 
 .hidden {
@@ -102,7 +67,7 @@ body {
   overflow: hidden;
   font-family: var(--font-family);
   background-color: #000;
-  color: var(--sidebar-text);
+  color: var(--panel-text);
   display: flex;
   flex-direction: column;
 }
@@ -133,14 +98,9 @@ body {
 .content {
   flex-grow: 1;
   width: 100%;
-  transition: margin-right 0.3s ease-in-out;
   display: flex;
   flex-direction: column;
   position: relative;
-}
-
-.content.sidebar-visible {
-  margin-right: var(--sidebar-width);
 }
 
 #video-grid {
@@ -152,12 +112,30 @@ body {
   flex-shrink: 0;
   border-top: 1px solid #444;
   min-height: 200px;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow: hidden;
   flex-wrap: nowrap;
-  -webkit-overflow-scrolling: touch;
   transition: height 0.3s ease, padding 0.3s ease, opacity 0.3s ease,
     min-height 0.3s ease;
+}
+
+#video-strip {
+  flex: 1 1 auto;
+  min-width: 0;
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Holds the chat column's place in the bar. The column itself is fixed so it
+   can grow up over the play space without the bar clipping it. */
+#chat-dock-slot {
+  flex: 0 0 var(--chat-dock-width);
+  margin-left: auto;
+  align-self: stretch;
+  transition: flex-basis 0.2s ease;
 }
 
 #video-grid.hidden {
@@ -191,17 +169,58 @@ body {
 }
 
 @media (max-width: 768px), (max-height: 500px) {
+  :root {
+    --chat-dock-width: 170px;
+    --bar-pad: 5px;
+  }
+
   #video-grid {
     height: 20vh;
     min-height: 80px;
     max-height: 160px;
     padding: 5px;
-    align-items: stretch;
+    gap: 5px;
   }
-  
+
+  #video-strip,
   #video-grid-content {
     height: 100%;
     align-items: center;
+  }
+
+  .invite-btn {
+    width: 40px;
+    height: 40px;
+    font-size: 1.1rem;
+  }
+
+  .invite-links {
+    gap: 4px;
+    padding: 4px;
+  }
+
+  .invite-copy {
+    min-height: 28px;
+    padding: 2px 6px;
+    font-size: 0.65rem;
+  }
+
+  .chat-message {
+    padding: 0.25rem 0.5rem;
+  }
+
+  #chat-form {
+    padding: 0.3rem;
+  }
+
+  .self-controls {
+    padding: 6px 10px 22px;
+  }
+
+  .self-controls .control-btn {
+    width: 32px;
+    height: 32px;
+    font-size: 0.85rem;
   }
 
   .video-container {
@@ -267,8 +286,8 @@ body {
 }
 
 .can-drop-gamepad {
-  border-color: var(--sidebar-header-color) !important;
-  box-shadow: 0 0 10px var(--sidebar-header-color) !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 10px var(--accent) !important;
 }
 
 .video-container.speaking {
@@ -356,49 +375,6 @@ iframe {
   border: none;
 }
 
-.sidebar {
-  position: fixed;
-  top: 0;
-  right: 0;
-  width: var(--sidebar-width);
-  height: 100%;
-  background-color: var(--sidebar-bg);
-  border-left: 1px solid var(--sidebar-border);
-  transform: translateX(100%);
-  transition: transform 0.3s ease-in-out;
-  display: flex;
-  flex-direction: column;
-  z-index: 1010;
-}
-
-.sidebar.visible {
-  transform: translateX(0);
-}
-
-.sidebar-toggle-handle {
-  position: absolute;
-  top: 50%;
-  right: 0;
-  width: 15px;
-  height: 60px;
-  transform: translateY(-50%);
-  cursor: pointer;
-  z-index: 1020;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  background: none;
-  border: none;
-  box-shadow: none;
-}
-
-.toggle-indicator {
-  width: 5px;
-  height: 40px;
-  background-color: var(--sidebar-header-color);
-  border-radius: 3px;
-}
-
 .video-toggle-handle {
   position: fixed;
   bottom: 0;
@@ -424,199 +400,14 @@ iframe {
 .toggle-indicator-horizontal {
   width: 40px;
   height: 5px;
-  background-color: var(--sidebar-header-color);
+  background-color: var(--accent);
   border-radius: 2px;
-}
-
-.sidebar-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--sidebar-border);
-  flex-shrink: 0;
-  gap: 15px;
-}
-
-.sidebar-header h2 {
-  margin: 0;
-  font-size: 1.2rem;
-  color: var(--sidebar-header-color);
-  flex-shrink: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.link-group {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  background-color: var(--input-bg);
-  border: 1px solid var(--item-border);
-  border-radius: 8px;
-  padding: 12px;
-}
-
-.link-group > label {
-  font-size: 0.8rem;
-  font-weight: 500;
-  color: var(--text-muted);
-  padding-left: 2px;
-}
-
-.link-input-group {
-  display: flex;
-  align-items: center;
-  background: var(--section-bg);
-  border: 1px solid var(--sidebar-border);
-  border-radius: 6px;
-  padding: 5px 8px;
-  font-size: 0.8rem;
-  color: var(--sidebar-text);
-  overflow: hidden;
-}
-
-.link-input-group input {
-  background: transparent;
-  border: none;
-  color: inherit;
-  flex-grow: 1;
-  min-width: 0;
-  outline: none;
-}
-
-.link-input-group button {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  cursor: pointer;
-  margin-left: 5px;
-  padding: 3px;
-}
-
-.link-input-group button:hover {
-  color: var(--sidebar-header-color);
-}
-
-.header-controls {
-  display: flex;
-  align-items: center;
-  gap: 15px;
-  flex-shrink: 0;
-}
-
-.settings-button {
-  background: none;
-  border: none;
-  color: var(--text-muted);
-  font-size: 1.2rem;
-  cursor: pointer;
-  padding: 0;
-  transition: color 0.2s;
-}
-
-.settings-button:hover {
-  color: var(--sidebar-header-color);
-}
-
-.sidebar-invite-section {
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--sidebar-border);
-  background-color: var(--section-bg);
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.sidebar-invite-section h3 {
-  margin: 0;
-  font-size: 0.85rem;
-  color: var(--sidebar-header-color);
-}
-
-/* .control-btn is a fixed 45px circle sized for a single icon. These carry a
-   full label instead, in 18 languages, so drop the circular geometry and let
-   the button grow to whatever the text needs. */
-.sidebar-invite-section .invite-copy {
-  width: 100%;
-  height: auto;
-  min-height: 40px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 0.85rem;
-  text-align: center;
-}
-
-.theme-toggle {
-  width: 40px;
-  height: 20px;
-  border-radius: 10px;
-  background-color: var(--item-border);
-  position: relative;
-  cursor: pointer;
-  transition: background-color 0.3s ease;
-  display: flex;
-  align-items: center;
-  padding: 0 2px;
-  box-sizing: border-box;
-  overflow: hidden;
-}
-
-.theme-toggle .icon {
-  position: absolute;
-  width: 16px;
-  height: 16px;
-  top: 2px;
-  transition: transform 0.3s ease, opacity 0.3s ease;
-}
-
-.theme-toggle .icon path,
-.theme-toggle .icon circle,
-.theme-toggle .icon line {
-  fill: currentColor;
-  stroke: currentColor;
-}
-
-.theme-toggle .moon-icon {
-  left: 2px;
-  opacity: 1;
-  transform: translateX(0);
-  color: var(--icon-moon-color);
-}
-
-.theme-toggle .sun-icon {
-  left: 2px;
-  opacity: 0;
-  transform: translateX(100%);
-  color: var(--icon-sun-color);
-}
-
-.theme-toggle.light .moon-icon {
-  opacity: 0;
-  transform: translateX(100%);
-}
-
-.theme-toggle.light .sun-icon {
-  opacity: 1;
-  left: auto;
-  right: 2px;
-  transform: translateX(0);
-}
-
-.sidebar-media-controls {
-  display: flex;
-  justify-content: center;
-  gap: 1rem;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--sidebar-border);
-  background-color: var(--section-bg);
 }
 
 .control-btn {
   background-color: var(--control-btn-bg);
   color: var(--control-btn-color);
-  border: 1px solid var(--sidebar-border);
+  border: 1px solid var(--panel-border);
   width: 45px;
   height: 45px;
   border-radius: 50%;
@@ -633,115 +424,10 @@ iframe {
   background-color: var(--control-btn-hover-bg);
 }
 
-.control-btn.inactive {
-  background-color: var(--control-btn-inactive-bg);
-  color: var(--control-btn-inactive-color);
-  border-color: var(--control-btn-inactive-bg);
-}
-
-.iframe-audio-controls {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding-left: 1rem;
-  margin-left: 1rem;
-  border-left: 1px solid var(--sidebar-border);
-}
-
-#iframe-volume-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100px;
-  height: 8px;
-  background: var(--input-bg);
-  border-radius: 4px;
-  outline: none;
-  cursor: pointer;
-  transition: background-color 0.2s;
-}
-
-#iframe-volume-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 18px;
-  height: 18px;
-  background: var(--button-bg);
-  border-radius: 50%;
-  border: 2px solid var(--sidebar-bg);
-  transition: background-color 0.2s;
-}
-
-#iframe-volume-slider::-moz-range-thumb {
-  width: 14px;
-  height: 14px;
-  background: var(--button-bg);
-  border-radius: 50%;
-  border: 2px solid var(--sidebar-bg);
-  transition: background-color 0.2s;
-}
-
-.sidebar-content {
-  flex-grow: 1;
-  overflow-y: auto;
-  padding: 0 1rem;
-  display: flex;
-  flex-direction: column;
-}
-
-.sidebar-footer {
-  padding: 1rem 1.5rem;
-  border-top: 1px solid var(--sidebar-border);
-  flex-shrink: 0;
-  background-color: var(--sidebar-bg);
-}
-
-.username-prompt {
-  padding: 1.5rem;
-}
-
-.username-prompt h3 {
-  margin-top: 0;
-  color: var(--sidebar-header-color);
-}
-
-.username-prompt p {
-  color: var(--text-muted);
-  font-size: 0.9rem;
-  margin-bottom: 1rem;
-}
-
-.username-prompt input {
-  width: 100%;
-  padding: 0.75rem;
-  font-size: 1rem;
-  background-color: var(--input-bg);
-  border: 1px solid var(--input-border);
-  border-radius: 6px;
-  color: var(--input-text);
-  margin-bottom: 1rem;
-}
-
-.username-prompt button {
-  width: 100%;
-  padding: 0.75rem 1.5rem;
-  font-size: 1rem;
-  font-weight: 500;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  background-color: var(--button-bg);
-  color: var(--button-text);
-}
-
-.username-prompt button:hover {
-  background-color: var(--button-hover-bg);
-}
-
 #chat-messages {
-  flex-grow: 1;
   display: flex;
   flex-direction: column;
-  padding: 1rem 0;
+  padding: 0.5rem 0;
 }
 
 .chat-message {
@@ -767,7 +453,7 @@ iframe {
 .sender {
   font-weight: 600;
   font-size: 0.9rem;
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .chat-message.self .sender {
@@ -782,11 +468,11 @@ iframe {
 .bubble {
   line-height: 1.4;
   word-wrap: break-word;
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .bubble a {
-  color: var(--sidebar-header-color);
+  color: var(--accent);
   text-decoration: none;
 }
 
@@ -798,8 +484,8 @@ iframe {
   position: absolute;
   top: -12px;
   right: 0;
-  background-color: var(--sidebar-bg);
-  border: 1px solid var(--sidebar-border);
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
   border-radius: 6px;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   opacity: 0;
@@ -825,7 +511,7 @@ iframe {
 }
 
 .reply-btn:hover {
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .reply-quote {
@@ -843,7 +529,7 @@ iframe {
 
 .reply-sender {
   font-weight: bold;
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .system-message {
@@ -862,12 +548,12 @@ iframe {
   left: 1rem;
   right: 1rem;
   height: 1px;
-  background-color: var(--sidebar-border);
+  background-color: var(--panel-border);
   z-index: -1;
 }
 
 .system-message span {
-  background-color: var(--sidebar-bg);
+  background-color: var(--panel-bg);
   padding: 0 0.5rem;
 }
 
@@ -879,8 +565,8 @@ iframe {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  border-top: 1px solid var(--sidebar-border);
-  border-bottom: 1px solid var(--sidebar-border);
+  border-top: 1px solid var(--panel-border);
+  border-bottom: 1px solid var(--panel-border);
   margin-bottom: -1px;
 }
 
@@ -891,7 +577,7 @@ iframe {
 }
 
 #chat-reply-banner .reply-target-text b {
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 #cancel-reply-btn {
@@ -903,16 +589,12 @@ iframe {
   padding: 0 0.5rem;
 }
 
-#chat-form-container {
-  padding: 1rem 1.5rem;
-  background-color: var(--sidebar-bg);
-}
-
 #chat-form {
   display: flex;
   gap: 0.5rem;
+  flex-shrink: 0;
   background-color: var(--input-bg);
-  border-radius: 8px;
+  border-top: 1px solid var(--panel-border);
   padding: 0.5rem;
 }
 
@@ -941,44 +623,6 @@ iframe {
   color: var(--button-hover-bg);
 }
 
-.controller-tabs {
-  display: flex;
-  border-bottom: 1px solid var(--sidebar-border);
-  margin: 0 -1rem;
-  padding: 0 1rem;
-}
-
-.tab-btn {
-  flex: 1;
-  padding: 1rem;
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 0.9rem;
-  font-weight: 500;
-  color: var(--text-muted);
-  border-bottom: 3px solid transparent;
-}
-
-.tab-btn.active {
-  color: var(--sidebar-header-color);
-  border-bottom-color: var(--sidebar-header-color);
-}
-
-.tab-content {
-  display: none;
-}
-
-.tab-content.active {
-  display: flex;
-  flex-direction: column;
-  flex-grow: 1;
-}
-
-#tab-users {
-  padding-top: 1rem;
-}
-
 .modal-overlay {
   position: fixed;
   top: 0;
@@ -1001,10 +645,10 @@ iframe {
 }
 
 .modal-content {
-  background-color: var(--sidebar-bg);
-  color: var(--sidebar-text);
+  background-color: var(--panel-bg);
+  color: var(--panel-text);
   border-radius: 8px;
-  box-shadow: 0 5px 15px var(--sidebar-shadow);
+  box-shadow: 0 5px 15px var(--panel-shadow);
   width: 90%;
   max-width: 500px;
   transform: scale(0.95);
@@ -1020,13 +664,13 @@ iframe {
   justify-content: space-between;
   align-items: center;
   padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--sidebar-border);
+  border-bottom: 1px solid var(--panel-border);
 }
 
 .modal-header h2 {
   margin: 0;
   font-size: 1.2rem;
-  color: var(--sidebar-header-color);
+  color: var(--accent);
 }
 
 .modal-close-button {
@@ -1040,7 +684,7 @@ iframe {
 }
 
 .modal-close-button:hover {
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .modal-body {
@@ -1055,7 +699,7 @@ iframe {
   display: block;
   margin-bottom: 0.5rem;
   font-weight: 500;
-  color: var(--sidebar-text);
+  color: var(--panel-text);
 }
 
 .modal-body select {
@@ -1066,64 +710,20 @@ iframe {
   border: 1px solid var(--input-border);
   border-radius: 6px;
   color: var(--input-text);
-}
-
-#toast-container {
-  position: fixed;
-  bottom: 20px;
-  right: 20px;
-  z-index: 2000;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.toast {
-  background-color: var(--toast-bg);
-  color: var(--toast-text);
-  padding: 12px 18px;
-  border-radius: 8px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  animation: toast-in 0.3s ease-out forwards;
-  max-width: 320px;
   cursor: pointer;
 }
 
-.toast.closing {
-  animation: toast-out 0.3s ease-in forwards;
+.modal-body select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
-.toast-sender {
-  font-weight: bold;
-}
-
-.toast-message {
-  word-break: break-word;
-}
-
-@keyframes toast-in {
-  from {
-    opacity: 0;
-    transform: translateX(100%);
-  }
-  to {
-    opacity: 1;
-    transform: translateX(0);
-  }
-}
-
-@keyframes toast-out {
-  from {
-    opacity: 1;
-    transform: translateX(0);
-  }
-  to {
-    opacity: 0;
-    transform: translateX(100%);
-  }
+/* The popup list is drawn by the browser, not the page; these are what it
+   honours. Opaque so the panel behind never bleeds through. */
+.modal-body select option {
+  background-color: #16121f;
+  color: var(--input-text);
+  padding: 0.5rem;
 }
 
 #gamepad-source-box {
@@ -1141,9 +741,9 @@ iframe {
 .gamepad-icon {
   height: 100%;
   aspect-ratio: 1 / 1;
-  background-color: var(--sidebar-bg);
-  border: 1px solid var(--sidebar-border);
-  color: var(--sidebar-text);
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  color: var(--panel-text);
   border-radius: 6px;
   display: flex;
   align-items: center;
@@ -1168,6 +768,27 @@ iframe {
 
 .gamepad-icon.draggable {
   cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Follows the pointer during a drag, drawn by the page so it shows over a
+   fullscreen element where the native drag image would not. */
+.drag-ghost {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 3000;
+  pointer-events: none;
+  opacity: 0.85;
+  transform: translate(-9999px, -9999px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
+}
+
+.video-container.drop-target {
+  border-color: var(--color-success) !important;
+  box-shadow: 0 0 14px var(--color-success) !important;
 }
 
 .gamepad-icon.dragging {
@@ -1239,34 +860,19 @@ iframe {
 .disconnection-message h2 {
   font-size: 2rem;
   margin-bottom: 1rem;
-  color: var(--sidebar-header-color);
+  color: var(--accent);
 }
 
 .disconnection-message p {
   font-size: 1.1rem;
-  color: var(--sidebar-text);
-}
-
-.sidebar-media-controls.readonly-view {
-  justify-content: stretch;
-}
-
-.sidebar-media-controls.readonly-view .iframe-audio-controls {
-  flex-grow: 1;
-  border-left: none;
-  margin-left: 0;
-  padding-left: 0;
-}
-
-.sidebar-media-controls.readonly-view #iframe-volume-slider {
-  width: 100%;
+  color: var(--panel-text);
 }
 
 #start-menu-btn {
   width: 60px;
   min-width: 60px;
-  background-color: var(--sidebar-bg);
-  border-color: var(--sidebar-border);
+  background-color: var(--panel-bg);
+  border-color: var(--panel-border);
   cursor: pointer;
   display: flex;
   flex-direction: column;
@@ -1276,7 +882,7 @@ iframe {
 
 #start-menu-btn:hover {
   background-color: var(--section-bg);
-  border-color: var(--sidebar-header-color);
+  border-color: var(--accent);
 }
 
 .start-btn-inner {
@@ -1284,7 +890,7 @@ iframe {
   flex-direction: column;
   align-items: center;
   gap: 8px;
-  color: var(--sidebar-header-color);
+  color: var(--accent);
 }
 
 .start-btn-inner i {
@@ -1306,8 +912,8 @@ iframe {
   z-index: 2000;
   width: 380px;
   height: 450px;
-  background-color: var(--sidebar-bg);
-  border: 1px solid var(--sidebar-border);
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
   border-radius: 8px;
   box-shadow: 0 5px 20px rgba(0, 0, 0, 0.4);
   display: flex;
@@ -1329,7 +935,7 @@ iframe {
 
 .start-menu-tabs {
   display: flex;
-  border-bottom: 1px solid var(--sidebar-border);
+  border-bottom: 1px solid var(--panel-border);
   background-color: var(--section-bg);
 }
 
@@ -1345,9 +951,9 @@ iframe {
 }
 
 .sm-tab-btn.active {
-  color: var(--sidebar-header-color);
-  border-bottom-color: var(--sidebar-header-color);
-  background-color: var(--sidebar-bg);
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  background-color: var(--panel-bg);
 }
 
 .sm-view {
@@ -1407,8 +1013,8 @@ iframe {
 }
 
 .sm-app-card.active {
-  box-shadow: 0 0 12px var(--sidebar-header-color);
-  border-color: var(--sidebar-header-color);
+  box-shadow: 0 0 12px var(--accent);
+  border-color: var(--accent);
   cursor: default;
 }
 
@@ -1447,7 +1053,7 @@ iframe {
   display: flex;
   align-items: center;
   padding: 10px;
-  border-bottom: 1px solid var(--sidebar-border);
+  border-bottom: 1px solid var(--panel-border);
   gap: 10px;
 }
 .sm-session-item img {
@@ -1506,7 +1112,7 @@ iframe {
 .spinner {
   border: 3px solid rgba(0, 0, 0, 0.1);
   border-radius: 50%;
-  border-top: 3px solid var(--sidebar-header-color);
+  border-top: 3px solid var(--accent);
   width: 20px;
   height: 20px;
   animation: spin 1s linear infinite;
@@ -1568,13 +1174,13 @@ iframe {
 .waiting-message h2 {
   margin-top: 20px;
   font-size: 1.5rem;
-  color: var(--sidebar-header-color);
+  color: var(--accent);
 }
 
 .spinner-large {
   border: 4px solid rgba(255, 255, 255, 0.1);
   border-radius: 50%;
-  border-top: 4px solid var(--sidebar-header-color);
+  border-top: 4px solid var(--accent);
   width: 50px;
   height: 50px;
   animation: spin 1s linear infinite;
@@ -1596,45 +1202,391 @@ iframe {
   color: #ff4444;
 }
 
-/* ── Webstation broker additions ─────────────────────────────────────────── */
-.exit-button i {
-    color: var(--romm-danger);
-}
-.exit-button:hover i {
-    color: #f87171;
-}
-#exit-report {
-    margin-top: 16px;
-    max-height: 45vh;
-    max-width: 80vw;
-    overflow: auto;
-    text-align: left;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 11.5px;
-    line-height: 1.4;
-    background: rgba(16, 12, 28, 0.97);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 8px;
-    padding: 12px;
-    color: rgba(255, 255, 255, 0.85);
-}
-#exit-report.hidden {
-    display: none;
+
+/* ── Self view ───────────────────────────────────────────────────────────── */
+/* Mic, camera and settings sit over the local tile in a triangle (mic and
+   camera on top, the cog under them) and only surface while the tile is
+   hovered, focused, or tapped, so the feed itself is what shows by default. */
+.self-controls {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  place-items: center;
+  padding: 14px 24px 34px;
+  background: rgba(0, 0, 0, 0.35);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
 }
 
-/* Solo sessions: the room is one person, so chat, webcam and mic are noise.
-   Game volume and the session controls stay. Presence reveals these again the
-   moment a second person connects.
-   The whole video bar goes, gamepad assignment box included. That box only
-   exists to drag pads onto other people, and the lone host already holds
-   gamepad 1 from new_session, so solo it assigns nothing. Keeping the bar for
-   it would cost 200px of game view (#video-grid is min-height 200px and
-   flex-shrink 0) with no toggle handle left to collapse it. */
-body.solo-mode #toggle-mic-btn,
-body.solo-mode #toggle-video-btn,
-body.solo-mode #chat-form-container,
-body.solo-mode #sidebar-main-content,
-body.solo-mode #video-grid,
+.self-controls .control-btn:nth-child(3) {
+  grid-column: 1 / span 2;
+}
+
+.self-controls .control-btn {
+  width: 40px;
+  height: 40px;
+  font-size: 1rem;
+  background-color: rgba(0, 0, 0, 0.55);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.self-controls .control-btn:hover {
+  background-color: rgba(255, 255, 255, 0.2);
+}
+
+.control-btn.inactive,
+.self-controls .control-btn.inactive {
+  background-color: var(--control-btn-inactive-bg);
+  color: var(--control-btn-inactive-color);
+  border-color: var(--control-btn-inactive-bg);
+}
+
+/* The dim layer never takes the pointer itself, only its three buttons do,
+   so the tile's bottom-row buttons (resolution lock, resize, speaker) and
+   the gamepad icons stay clickable underneath it. */
+#local-user-container:hover .self-controls,
+#local-user-container:focus-within .self-controls,
+#local-user-container.controls-shown .self-controls {
+  opacity: 1;
+}
+
+#local-user-container:hover .self-controls .control-btn,
+#local-user-container:focus-within .self-controls .control-btn,
+#local-user-container.controls-shown .self-controls .control-btn {
+  pointer-events: auto;
+}
+
+/* ── Invite ──────────────────────────────────────────────────────────────── */
+/* A blank "user" at the end of the tile row: a dashed tile with a plus in the
+   middle that swaps to the two invite-link buttons in place when opened. */
+#invite-tile {
+  border-style: dashed;
+  background-color: transparent;
+  perspective: 600px;
+}
+
+/* Two faces on a card that flips on its vertical axis: the plus on the
+   front, the link buttons on the back. */
+.invite-card {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  transform-style: preserve-3d;
+  transition: transform 0.45s cubic-bezier(0.4, 0.2, 0.2, 1);
+}
+
+#invite-tile.open .invite-card {
+  transform: rotateY(180deg);
+}
+
+.invite-face {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  backface-visibility: hidden;
+  -webkit-backface-visibility: hidden;
+}
+
+.invite-back {
+  transform: rotateY(180deg);
+}
+
+.invite-btn {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  background-color: var(--button-bg);
+  color: var(--button-text);
+  font-size: 1.5rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  transition: background-color 0.2s;
+}
+
+.invite-btn:hover {
+  background-color: var(--button-hover-bg);
+}
+
+.invite-links {
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+
+/* The back face is not clickable until it is facing out, so a stray tap
+   during the flip cannot mint a link. */
+#invite-tile:not(.open) .invite-links {
+  pointer-events: none;
+}
+
+/* Full labels in 18 languages, so these grow to the text rather than
+   sharing the circular .control-btn geometry. */
+.invite-copy {
+  width: 100%;
+  min-height: 40px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: none;
+  background-color: var(--button-bg);
+  color: var(--button-text);
+  font-size: 0.8rem;
+  font-weight: 500;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+  transition: background-color 0.2s;
+}
+
+.invite-copy:hover {
+  background-color: var(--button-hover-bg);
+}
+
+/* ── Chat ────────────────────────────────────────────────────────────────── */
+/* The chat column: history on top, input at the bottom, sitting in the slot
+   the bar leaves for it. Closed, it is exactly the bar's height; open, it
+   grows up over the bottom half of the play space and over any peeked
+   bubbles. room.js keeps --bar-height in step with the bar. */
+#chat-dock {
+  position: fixed;
+  right: var(--bar-pad);
+  bottom: var(--bar-pad);
+  z-index: 650;
+  width: var(--chat-dock-width);
+  height: calc(var(--bar-height) - 2 * var(--bar-pad));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  transition: height 0.2s ease, width 0.2s ease, border-color 0.2s ease;
+}
+
+#chat-dock.open {
+  height: calc(50vh + var(--bar-height) / 2 - var(--bar-pad));
+  border-color: var(--accent);
+  box-shadow: 0 -4px 16px var(--panel-shadow);
+}
+
+#video-grid.hidden ~ #chat-dock {
+  display: none;
+}
+
+/* Tiles need the room: the column folds to a tab on the right edge until it
+   is pulled open, and unfolds to its full width over the strip while open. */
+#chat-tab {
+  display: none;
+  flex-grow: 1;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  border: none;
+  background: none;
+  color: var(--accent);
+  font-size: 1.1rem;
+  cursor: pointer;
+}
+
+#chat-tab.unread::after {
+  content: "";
+  position: absolute;
+  top: 8px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--romm-danger);
+}
+
+body.chat-crowded #chat-dock-slot {
+  flex-basis: var(--chat-tab-width);
+}
+
+body.chat-crowded #chat-dock:not(.open) {
+  width: var(--chat-tab-width);
+}
+
+body.chat-crowded #chat-dock:not(.open) #chat-tab {
+  display: flex;
+}
+
+body.chat-crowded #chat-dock:not(.open) #chat-messages-scroll,
+body.chat-crowded #chat-dock:not(.open) #chat-reply-banner,
+body.chat-crowded #chat-dock:not(.open) #chat-form {
+  display: none;
+}
+
+#chat-messages-scroll {
+  flex-grow: 1;
+  overflow-y: auto;
+}
+
+/* Recent messages surface here as bubbles while the panel is closed, stacked
+   above the dock's input, and clear themselves after a few seconds. */
+#chat-peek {
+  position: absolute;
+  bottom: 10px;
+  right: var(--bar-pad);
+  z-index: 600;
+  width: var(--chat-dock-width);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.chat-peek-bubble {
+  pointer-events: auto;
+  background-color: var(--peek-bg);
+  color: var(--peek-text);
+  padding: 8px 12px;
+  border-radius: 12px 12px 4px 12px;
+  border: 1px solid var(--panel-border);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+  cursor: pointer;
+  animation: peek-in 0.25s ease-out forwards;
+  font-size: 0.85rem;
+}
+
+.chat-peek-bubble.closing {
+  animation: peek-out 0.25s ease-in forwards;
+}
+
+.chat-peek-sender {
+  font-weight: bold;
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+
+.chat-peek-message {
+  word-break: break-word;
+}
+
+.chat-peek-message a {
+  color: var(--accent);
+}
+
+@keyframes peek-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes peek-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+/* ── Username prompt and settings ───────────────────────────────────────── */
+.username-prompt {
+  padding: 1.5rem;
+}
+
+.username-prompt h3 {
+  margin-top: 0;
+  color: var(--accent);
+}
+
+.username-prompt p {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+
+.username-prompt input {
+  width: 100%;
+  padding: 0.75rem;
+  font-size: 1rem;
+  background-color: var(--input-bg);
+  border: 1px solid var(--input-border);
+  border-radius: 6px;
+  color: var(--input-text);
+  margin-bottom: 1rem;
+}
+
+.username-prompt button,
+.settings-action {
+  width: 100%;
+  padding: 0.75rem 1.5rem;
+  font-size: 1rem;
+  font-weight: 500;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  background-color: var(--button-bg);
+  color: var(--button-text);
+}
+
+.username-prompt button:hover,
+.settings-action:hover {
+  background-color: var(--button-hover-bg);
+}
+
+.settings-action i {
+  margin-right: 0.5rem;
+}
+
+/* ── Solo sessions ──────────────────────────────────────────────────────── */
+/* One person in the room, so tiles, chat and the gamepad tray are noise: the
+   tray only exists to drag pads onto other people, and the lone host already
+   holds gamepad 1 from new_session. The bar collapses to just a small invite
+   tile floated over the corner of the stream so it costs no game view, until
+   presence brings a second person in and the full bar comes back. */
+body.solo-mode #video-grid {
+  position: fixed;
+  right: 8px;
+  bottom: 8px;
+  min-height: 0;
+  height: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  z-index: 550;
+}
+
+body.solo-mode #video-strip {
+  overflow: visible;
+}
+
+/* Nobody wants a tile parked over their game: it fades out after the
+   arrival peek and comes back while the corner it lives in is hovered. */
+body.solo-mode #invite-tile {
+  width: 160px;
+  min-width: 160px;
+  height: 120px;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+body.solo-mode #video-grid:hover #invite-tile,
+body.solo-mode.solo-peek #invite-tile,
+body.solo-mode #invite-tile.open {
+  opacity: 1;
+}
+
+body.solo-mode #gamepad-source-box,
+body.solo-mode #local-user-container,
+body.solo-mode #chat-dock-slot,
+body.solo-mode #chat-dock,
+body.solo-mode #chat-peek,
 body.solo-mode #video-toggle-handle {
   display: none;
 }
