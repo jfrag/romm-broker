@@ -143,6 +143,24 @@ def test_activate_refuses_a_second_session_over_a_running_one(
     assert _activate(client, broker_dirs).status_code == 409
 
 
+def test_activate_retires_the_session_when_launch_fails(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch failure retires the session instead of leaving every retry stuck on 409."""
+    monkeypatch.setattr(FakeEmulator, "launch_fails", True)
+
+    with pytest.raises(RuntimeError):
+        _activate(client, broker_dirs)
+
+    assert session.SESSION is None
+
+    monkeypatch.setattr(FakeEmulator, "launch_fails", False)
+    assert _activate(client, broker_dirs).status_code == 200
+
+
 def test_activate_refuses_an_emulator_that_is_not_installed(
     client: TestClient, broker_dirs: dict[str, Path]
 ) -> None:

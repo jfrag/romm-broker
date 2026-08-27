@@ -160,6 +160,7 @@ class FakeEmulator(Emulator):
         state_file: The path state_path and state_target answer with.
         swapped_discs: Every path passed to swap_disc, in order.
         swap_ok: What swap_disc answers.
+        launch_fails: Whether launch raises instead of recording the call.
     """
 
     name = "fake"
@@ -168,6 +169,7 @@ class FakeEmulator(Emulator):
     supports_states = True
     supports_disc_swap = True
     state_slot = 3
+    launch_fails = False
 
     def __init__(self) -> None:
         """Build the fake with nothing launched and every recorder empty."""
@@ -219,7 +221,12 @@ class FakeEmulator(Emulator):
         Args:
             rom_path: The ROM handed to the emulator.
             resume_slot: The state slot to resume from, or None.
+
+        Raises:
+            RuntimeError: When launch_fails is set, so a test can drive the failure path.
         """
+        if self.launch_fails:
+            raise RuntimeError("fake launch failure")
         self.launched = (rom_path, resume_slot)
 
     def save_state(self, slot: int) -> bool:

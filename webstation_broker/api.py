@@ -411,7 +411,14 @@ async def activate(
     )
 
     resume_slot = save.resume_slot if save else None
-    await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
+    try:
+        await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
+    except Exception:
+        # Otherwise the session stays marked active with no emulator behind
+        # it, and every retry 409s instead of reaching launch again.
+        log.error("session %s: launch failed, retiring the session", sess["id"], exc_info=True)
+        session.retire_session()
+        raise
     # Baseline after launch: the exit dump only ships files this session wrote.
     sess["save_baseline"] = time.time()
 
