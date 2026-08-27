@@ -7,6 +7,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import NoReturn, Optional
 
 import pytest
@@ -1107,6 +1108,70 @@ def test_a_partial_extraction_never_appears_at_the_cache_key(
     assert (game_dir / "CUSA23079" / "eboot.bin").is_file()
 
 
+def test_an_extraction_too_big_for_the_cap_is_refused_before_it_starts(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ROM whose extraction cannot fit under CACHE_MAX_GB is refused, not attempted anyway.
+
+    Eviction cannot help when there is nothing left to evict, and starting
+    regardless means filling the disk over the minutes the unpack takes
+    before failing on a write error.
+    """
+    monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 0.000001)
+    extracted = []
+    monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda p, d: extracted.append(p))
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"x" * 4096)
+
+    with pytest.raises(RuntimeError, match="SHADPS4_CACHE_MAX_GB"):
+        shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+    assert extracted == []
+    assert not (cache_dir / shadps4._cache_key(pkg)).exists()
+
+
+def test_the_cap_is_charged_for_what_an_archive_leaves_behind_not_its_peak(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive is judged against CACHE_MAX_GB by what it caches, not its transient peak.
+
+    Unpacking an archive holds the .pkg and pkg_extractor's output at once,
+    but only the output is kept. Charging the cap for the peak would refuse
+    titles that sit well under it once extracted.
+    """
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"x" * 4096)
+    # Between what the extraction keeps (1.1x) and what it peaks at (2.2x).
+    monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 6000 / shadps4._GB)
+    monkeypatch.setattr(shadps4, "_extract_archive", lambda a, d: _touch(d / "Game.pkg"))
+    monkeypatch.setattr(
+        shadps4, "_run_pkg_extractor", lambda p, d: _touch(d / "CUSA23079" / "eboot.bin")
+    )
+
+    boot = shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
+
+    assert boot == cache_dir / shadps4._cache_key(archive) / "CUSA23079" / "eboot.bin"
+
+
+def test_an_extraction_larger_than_the_free_disk_is_refused_before_it_starts(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ROM that would not fit on the filesystem is refused even when the cap allows it.
+
+    CACHE_MAX_GB bounds the cache's own contents, not the disk it shares
+    with the rest of /config, so the cap passing proves nothing about there
+    being room to write.
+    """
+    monkeypatch.setattr(
+        shadps4.shutil, "disk_usage", lambda p: SimpleNamespace(total=1, used=1, free=1)
+    )
+    pkg = tmp_path / "Game.pkg"
+    pkg.write_bytes(b"x" * 4096)
+
+    with pytest.raises(RuntimeError, match="is free on"):
+        shadps4._extract_and_cache_pkg(pkg, shadps4.Shadps4())
+
+
 def test_an_uncleared_cache_dir_fails_the_extraction_instead_of_silently_escaping(
     cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1158,9 +1223,16 @@ def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(
 def test_extract_and_cache_pkg_reserves_more_headroom_for_an_archive_than_a_pkg(
     cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An archive reserves headroom for both its scratch extraction and pkg_extractor's output."""
-    seen_needed = []
-    monkeypatch.setattr(shadps4, "_evict_lru", lambda needed, keep: seen_needed.append(needed))
+    """An archive reserves disk for its scratch extraction and pkg_extractor's output at once.
+
+    Only the output is kept either way, so the cache cap is charged the same
+    1.1x for both while the disk check carries the archive's higher peak.
+    """
+    seen = []
+    monkeypatch.setattr(shadps4, "_evict_lru", lambda needed, keep: None)
+    monkeypatch.setattr(
+        shadps4, "_require_room", lambda peak, kept, name: seen.append((peak, kept))
+    )
     monkeypatch.setattr(shadps4, "_run_pkg_extractor", lambda p, d: _touch(d / "T" / "eboot.bin"))
 
     pkg = tmp_path / "Game.pkg"
@@ -1170,9 +1242,10 @@ def test_extract_and_cache_pkg_reserves_more_headroom_for_an_archive_than_a_pkg(
     archive = _make_zip(tmp_path / "Game.zip", {"Game.pkg": b"x" * 1000})
     shadps4._extract_and_cache_pkg(archive, shadps4.Shadps4())
 
-    assert seen_needed == [
-        int(pkg.stat().st_size * 1.1),
-        int(archive.stat().st_size * 2.2),
+    pkg_size, archive_size = pkg.stat().st_size, archive.stat().st_size
+    assert seen == [
+        (int(pkg_size * 1.1), int(pkg_size * 1.1)),
+        (int(archive_size * 2.2), int(archive_size * 1.1)),
     ]
 
 

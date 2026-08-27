@@ -121,6 +121,9 @@ _MAX_GPU_DETECT_ATTEMPTS = 3
 rather than exits costs `_VULKANINFO_TIMEOUT` a few times instead of on every
 launch for the broker's lifetime."""
 
+_GB = 1024**3
+"""Bytes per GB, the unit CACHE_MAX_GB and the space checks are expressed in."""
+
 _ARCHIVE_EXTS = (".7z", ".zip", ".rar")
 """Archive formats that may hold a `.pkg`, extracted before pkg_extractor ever sees it."""
 
@@ -312,9 +315,7 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
                 mtime = 0.0
             candidates.append((mtime, game_dir))
         if not candidates:
-            log.warning(
-                "shadps4 cache: nothing left to evict, proceeding over the %.0f GB cap", CACHE_MAX_GB
-            )
+            log.warning("shadps4 cache: nothing left to evict under the %.0f GB cap", CACHE_MAX_GB)
             return
         candidates.sort(key=lambda c: c[0])
         victim = candidates[0][1]
@@ -326,6 +327,50 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
             log.warning("shadps4 cache: could not evict %s: %s", victim, exc)
             return
         current -= victim_size
+
+
+def _require_room(peak_bytes: int, kept_bytes: int, rom_name: str) -> None:
+    """Refuse an extraction that cannot fit before any of it is written.
+
+    Eviction leaves two ceilings standing: an empty cache still cannot hold a
+    title larger than CACHE_MAX_GB, and the cap counts only the cache's own
+    contents, not the free space on the filesystem it shares with the rest of
+    /config. Without this the unpack starts anyway, spends minutes filling the
+    disk, and dies on a write error from inside the extractor, having taken
+    the free space every other service on that filesystem needs with it.
+
+    The two ceilings take different numbers. An archive holds its unpacked
+    .pkg and pkg_extractor's output at once but keeps only the output, so
+    charging the cap for that transient peak would refuse titles that sit
+    well under it once extracted. The cap gets what survives; the disk gets
+    what is on it at the worst moment.
+
+    Args:
+        peak_bytes: Bytes on disk at the height of the extraction.
+        kept_bytes: Bytes the finished extraction leaves in the cache.
+        rom_name: The ROM being extracted, named in the error.
+
+    Raises:
+        RuntimeError: If the cache cap or the filesystem cannot hold it.
+    """
+    max_bytes = int(CACHE_MAX_GB * _GB)
+    current = _cache_size_bytes()
+    if current + kept_bytes > max_bytes:
+        raise RuntimeError(
+            f"{rom_name} would leave about {kept_bytes / _GB:.1f} GB cached, more than "
+            f"SHADPS4_CACHE_MAX_GB ({CACHE_MAX_GB:.0f} GB) allows with "
+            f"{current / _GB:.1f} GB already there"
+        )
+    try:
+        free = shutil.disk_usage(CACHE_DIR).free
+    except OSError as exc:
+        log.warning("shadps4 cache: could not read free space on %s: %s", CACHE_DIR, exc)
+        return
+    if free < peak_bytes:
+        raise RuntimeError(
+            f"{rom_name} needs about {peak_bytes / _GB:.1f} GB to extract, but only "
+            f"{free / _GB:.1f} GB is free on {CACHE_DIR}"
+        )
 
 
 def _cache_key(rom: Path) -> str:
@@ -530,9 +575,10 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
             returning or raising.
 
     Raises:
-        RuntimeError: If archive extraction or pkg_extractor fails, the
-            archive holds no .pkg, the extraction holds no eboot.bin, or the
-            finished extraction cannot be moved to its cache key.
+        RuntimeError: If the extraction cannot fit in the cache or on the
+            disk, archive extraction or pkg_extractor fails, the archive
+            holds no .pkg, the extraction holds no eboot.bin, or the finished
+            extraction cannot be moved to its cache key.
         OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _CACHE_LOCK:
@@ -559,15 +605,18 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
             except OSError:
                 size = 0
             # An archive needs its scratch extraction and pkg_extractor's
-            # staged output living under CACHE_DIR at the same time, not
-            # just the eventual cached copy alone.
-            needed = int(size * (2.2 if is_archive else 1.1))
+            # staged output living under CACHE_DIR at the same time; only the
+            # output survives, so the two figures differ for an archive and
+            # coincide for a bare .pkg.
+            kept = int(size * 1.1)
+            peak = int(size * 2.2) if is_archive else kept
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             # Orphaned scratch is un-evictable but still counts toward the
             # cap, so reclaim it before sizing the cache rather than letting
             # it push real entries out.
             _clear_scratch()
-            _evict_lru(needed, key)
+            _evict_lru(kept, key)
+            _require_room(peak, kept, rom.name)
 
             # Scratch lives under CACHE_DIR so the staged output shares a
             # filesystem with game_dir: the rename below is then atomic

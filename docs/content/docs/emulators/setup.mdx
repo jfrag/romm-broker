@@ -172,6 +172,13 @@ oldest extraction evicted first). The cache lives at
 bind mount or Docker volume at that path so it doesn't compete with the rest
 of `/config` for space.
 
+An archive is the expensive case: its unpacked `.pkg` and `pkg_extractor`'s
+output are both on disk at the peak, so it wants roughly twice the archive's
+size free even though only about the archive's size is kept afterward. A
+launch that doesn't fit, either under `SHADPS4_CACHE_MAX_GB` or in the free
+space actually on that filesystem, is refused when it is requested rather
+than filling the disk for several minutes and failing on a write error.
+
 Leave `SHADPS4_CACHE_ENABLED` off, its default, and a `.pkg`/archive ROM is
 refused outright rather than re-extracted and thrown away on every launch, so
 only natively bootable formats (a game folder, a bare `eboot.bin`, a `.zar`)
@@ -236,7 +243,10 @@ Adjust graphics settings as desired and run a game to confirm.
 > extraction evicted first). The cache lives at
 > `/config/.config/rpcs3/extracted`; if you enable it, point a dedicated
 > bind mount or Docker volume at that path so it doesn't compete with the
-> rest of `/config` for space.
+> rest of `/config` for space. A launch that doesn't fit, either under
+> `RPCS3_CACHE_MAX_GB` or in the free space actually on that filesystem, is
+> refused when it is requested rather than filling the disk for several
+> minutes and failing on a write error.
 >
 > Leave `RPCS3_CACHE_ENABLED` off, its default, and an archived ROM is
 > refused outright rather than re-extracted and thrown away on every launch,

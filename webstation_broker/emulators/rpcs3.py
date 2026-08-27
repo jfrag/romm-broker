@@ -100,6 +100,7 @@ _ROM_SEARCH_GLOBS = ("*", "*/*", "*/*/*")
 # rip (licenses, sdata) are not.
 _EBOOT_EXTS = (".bin", ".self", ".elf")
 _ARCHIVE_EXTS = (".7z", ".zip", ".rar")
+_GB = 1024**3
 
 
 def _truthy(value: str) -> bool:
@@ -432,6 +433,46 @@ def _touch_last_accessed(game_dir: Path) -> None:
         log.warning("rpcs3 cache: could not update last-accessed marker for %s: %s", game_dir, exc)
 
 
+def _require_room(needed_bytes: int, archive_name: str) -> None:
+    """Refuse an extraction that cannot fit before any of it is written.
+
+    Eviction leaves two ceilings standing: an empty cache still cannot hold a
+    title larger than CACHE_MAX_GB, and the cap counts only the cache's own
+    contents, not the free space on the filesystem it shares with the rest of
+    /config. Without this the unpack starts anyway, spends minutes filling the
+    disk, and dies on a write error from inside the extractor, having taken
+    the free space every other service on that filesystem needs with it.
+
+    One figure covers both ceilings here: the staged tree is renamed into
+    place rather than copied, so what is on disk at the peak is what stays.
+
+    Args:
+        needed_bytes: Bytes the finished extraction takes, on disk and in the cache.
+        archive_name: The archive being extracted, named in the error.
+
+    Raises:
+        RuntimeError: If the cache cap or the filesystem cannot hold it.
+    """
+    max_bytes = int(CACHE_MAX_GB * _GB)
+    current = _cache_size_bytes()
+    if current + needed_bytes > max_bytes:
+        raise RuntimeError(
+            f"{archive_name} would leave about {needed_bytes / _GB:.1f} GB cached, more than "
+            f"RPCS3_CACHE_MAX_GB ({CACHE_MAX_GB:.0f} GB) allows with "
+            f"{current / _GB:.1f} GB already there"
+        )
+    try:
+        free = shutil.disk_usage(CACHE_DIR).free
+    except OSError as exc:
+        log.warning("rpcs3 cache: could not read free space on %s: %s", CACHE_DIR, exc)
+        return
+    if free < needed_bytes:
+        raise RuntimeError(
+            f"{archive_name} needs about {needed_bytes / _GB:.1f} GB to extract, but only "
+            f"{free / _GB:.1f} GB is free on {CACHE_DIR}"
+        )
+
+
 def _clear_scratch() -> None:
     """Remove every staged extraction under CACHE_DIR. Callers must hold _CACHE_LOCK.
 
@@ -469,7 +510,7 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
     """
     if not CACHE_ENABLED or not CACHE_DIR.is_dir():
         return
-    max_bytes = int(CACHE_MAX_GB * 1024**3)
+    max_bytes = int(CACHE_MAX_GB * _GB)
     current = _cache_size_bytes()
     while current + needed_bytes > max_bytes:
         candidates = []
@@ -483,9 +524,7 @@ def _evict_lru(needed_bytes: int, keep: str) -> None:
                 mtime = 0.0
             candidates.append((mtime, game_dir))
         if not candidates:
-            log.warning(
-                "rpcs3 cache: nothing left to evict, proceeding over the %.0f GB cap", CACHE_MAX_GB
-            )
+            log.warning("rpcs3 cache: nothing left to evict under the %.0f GB cap", CACHE_MAX_GB)
             return
         candidates.sort(key=lambda c: c[0])
         victim = candidates[0][1]
@@ -676,9 +715,10 @@ def _extract_and_cache(archive: Path, emulator: Emulator) -> Path:
             returning or raising.
 
     Raises:
-        RuntimeError: If extraction fails, the extracted archive holds no
-            EBOOT.BIN or decrypted .iso to boot, or the finished extraction
-            cannot be moved to its cache key.
+        RuntimeError: If the extraction cannot fit in the cache or on the
+            disk, extraction fails, the extracted archive holds no EBOOT.BIN
+            or decrypted .iso to boot, or the finished extraction cannot be
+            moved to its cache key.
         OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
     with _CACHE_LOCK:
@@ -709,6 +749,7 @@ def _extract_and_cache(archive: Path, emulator: Emulator) -> Path:
             # it push real entries out.
             _clear_scratch()
             _evict_lru(needed, key)
+            _require_room(needed, archive.name)
 
             # Scratch lives under CACHE_DIR so the staged extraction shares
             # a filesystem with game_dir: the rename below is then atomic

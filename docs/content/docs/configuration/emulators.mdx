@@ -99,7 +99,7 @@ Timings are in seconds.
 | `SHADPS4_PKG_EXTRACT_TIMEOUT` | `1800` | Seconds a `pkg_extractor` (or archive extraction) run gets before it is considered hung. |
 | `SHADPS4_CACHE_ENABLED` | `false` | Whether `.pkg` and `.7z`/`.zip`/`.rar` ROMs boot at all. On, the first launch extracts one into `SHADPS4_CACHE_DIR` and every later launch reuses that extraction. Off, such a ROM is refused outright rather than re-extracted and thrown away on every launch; only natively bootable formats work. |
 | `SHADPS4_CACHE_DIR` | `/config/.local/share/shadPS4/extracted` | Where a kept extraction is cached, when `SHADPS4_CACHE_ENABLED` is on. |
-| `SHADPS4_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. |
+| `SHADPS4_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. A ROM that still doesn't fit once there is nothing left to evict, or that exceeds the free space on the filesystem, is refused at activate rather than extracted until the disk fills. |
 | `SHADPS4_CONFIG_PATH` | `<SHADPS4_DATA_DIR>/config.json` | shadPS4's own config file, read and rewritten before each launch to pin `Vulkan.gpu_id`. |
 | `SHADPS4_GPU_ID` | `auto` | Which Vulkan device shadPS4 renders on. shadPS4's own `-1` auto-select can land on a software rasterizer, which renders a black screen while the game otherwise runs. `auto` detects the best real GPU; an integer pins that device index directly; `-1` or `KEEP` leaves `config.json` alone. |
 | `SHADPS4_VULKANINFO_BIN` | `vulkaninfo` | The binary `SHADPS4_GPU_ID=auto` enumerates devices with. If it is missing or fails, no pin is written and shadPS4 keeps its own setting. |
@@ -148,7 +148,7 @@ Timings are in seconds.
 | `RPCS3_SAVE_STATE_KEY` | `ctrl+alt+1` | The save-state hotkey sent to trigger an exit-time save. RPCS3's four save-state shortcuts are equivalent and this one is GUI-rebindable, hence configurable here too. |
 | `RPCS3_CACHE_ENABLED` | `false` | Whether `.7z`/`.zip`/`.rar` ROMs boot at all. On, the first launch extracts one into `RPCS3_CACHE_DIR` and every later launch reuses that extraction. Off, an archive ROM is refused outright rather than re-extracted and thrown away on every launch. `.pkg` is unaffected either way: it always installs through its own always-on installer. |
 | `RPCS3_CACHE_DIR` | `/config/.config/rpcs3/extracted` | Where a kept extraction is cached, when `RPCS3_CACHE_ENABLED` is on. |
-| `RPCS3_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. |
+| `RPCS3_CACHE_MAX_GB` | `30` | Ceiling on the cache's total size; the oldest extraction is evicted first once a new one would exceed it. An archive that still doesn't fit once there is nothing left to evict, or that exceeds the free space on the filesystem, is refused at activate rather than extracted until the disk fills. |
 | `RPCS3_STOP_WAIT` | `2` | SIGTERM grace before SIGKILL (no SIGTERM handler, covers the AppImage wrapper teardown). |
 
 ## xemu

@@ -12,6 +12,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, NoReturn, Optional
 
 import pytest
@@ -1505,6 +1506,47 @@ def test_extraction_reclaims_orphaned_scratch_before_sizing_the_cache(
     rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
     assert scratch_at_eviction == [False]
+
+
+def test_an_extraction_too_big_for_the_cap_is_refused_before_it_starts(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive that cannot fit under CACHE_MAX_GB is refused, not attempted anyway.
+
+    Eviction cannot help when there is nothing left to evict, and starting
+    regardless means filling the disk over the minutes the unpack takes
+    before failing on a write error.
+    """
+    monkeypatch.setattr(rpcs3, "CACHE_MAX_GB", 0.000001)
+    extracted = []
+    monkeypatch.setattr(rpcs3, "_extract_archive", lambda a, d: extracted.append(a))
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"x" * 4096)
+
+    with pytest.raises(RuntimeError, match="RPCS3_CACHE_MAX_GB"):
+        rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
+
+    assert extracted == []
+    assert not (cache_dir / rpcs3._cache_key(archive)).exists()
+
+
+def test_an_extraction_larger_than_the_free_disk_is_refused_before_it_starts(
+    cache_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An archive that would not fit on the filesystem is refused even when the cap allows it.
+
+    CACHE_MAX_GB bounds the cache's own contents, not the disk it shares
+    with the rest of /config, so the cap passing proves nothing about there
+    being room to write.
+    """
+    monkeypatch.setattr(
+        rpcs3.shutil, "disk_usage", lambda p: SimpleNamespace(total=1, used=1, free=1)
+    )
+    archive = tmp_path / "Game.zip"
+    archive.write_bytes(b"x" * 4096)
+
+    with pytest.raises(RuntimeError, match="is free on"):
+        rpcs3._extract_and_cache(archive, rpcs3.Rpcs3())
 
 
 def test_an_uncleared_cache_dir_fails_the_extraction_instead_of_silently_escaping(
