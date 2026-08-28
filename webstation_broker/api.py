@@ -284,7 +284,7 @@ def _archive_subtrees(
     return tuple(s for s in emulator.save_subtrees if s != card), (card,)
 
 
-def _archive_identity(sess: dict, emulator: Emulator) -> dict:
+def _archive_identity(sess: dict[str, Any], emulator: Emulator) -> dict[str, Any]:
     """Session identity for the dump archive's manifest.
 
     Args:

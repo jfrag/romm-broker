@@ -477,6 +477,21 @@ def _write_broker_cfg(thumbnail: bool = True) -> Path:
     return BROKER_CFG
 
 
+def _state_suffix(slot: int) -> str:
+    """The slot suffix RetroArch appends to a state's content basename.
+
+    Args:
+        slot: The slot number; negative means the auto slot.
+
+    Returns:
+        `.state` for slot 0, `.state<n>` for slot n, `.state.auto` for the
+        auto slot.
+    """
+    if slot < 0:
+        return ".state.auto"
+    return ".state" if slot == 0 else f".state{slot}"
+
+
 def _state_name(base: str, slot: int) -> str:
     """RetroArch's state filename for a slot.
 
@@ -488,9 +503,7 @@ def _state_name(base: str, slot: int) -> str:
         `base.state` for slot 0, `base.state<n>` for slot n, and
         `base.state.auto` for the auto slot.
     """
-    if slot < 0:
-        return f"{base}.state.auto"
-    return base + (".state" if slot == 0 else f".state{slot}")
+    return base + _state_suffix(slot)
 
 
 _STATE_SUFFIX_RE = re.compile(r"\.state(?:\d{1,2}|\.auto)?$")
@@ -1087,10 +1100,17 @@ class Retroarch(Emulator):
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
-        if resume_slot is not None and self.supports_states:
-            threading.Thread(
-                target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
-            ).start()
+        if resume_slot is not None:
+            if self.supports_states:
+                threading.Thread(
+                    target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
+                ).start()
+            else:
+                log.warning(
+                    "retroarch: ignoring resume_slot=%s, platform %r has no savestate support",
+                    resume_slot,
+                    self.platform,
+                )
 
     def _deferred_load_state(self, slot: int, seq: int) -> None:
         """Load `slot` once RetroArch reports the content PLAYING.
@@ -1357,7 +1377,7 @@ class Retroarch(Emulator):
         """
         if not STATE_DIR.is_dir():
             return
-        suffix = _state_name("", STATE_SLOT)
+        suffix = _state_suffix(STATE_SLOT)
         try:
             stale_states = [p for p in STATE_DIR.rglob(f"*{suffix}") if p.is_file()]
         except OSError as exc:
@@ -1366,10 +1386,15 @@ class Retroarch(Emulator):
         for stale in stale_states:
             try:
                 stale.unlink()
-                stale.with_name(f"{stale.name}.png").unlink(missing_ok=True)
                 log.info("cleared stale state %s", stale.name)
             except OSError as exc:
                 log.warning("could not clear stale state %s: %s", stale.name, exc)
+                continue
+            shot = stale.with_name(f"{stale.name}.png")
+            try:
+                shot.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not clear stale state thumbnail %s: %s", shot.name, exc)
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
@@ -1415,6 +1440,11 @@ class Retroarch(Emulator):
         saved = False
         state_file = None
         if self.alive():
+            if slot is not None and not self.supports_states:
+                log.warning(
+                    "retroarch: not saving state on exit, platform %r has no savestate support",
+                    self.platform,
+                )
             if slot is not None and self.supports_states:
                 saved = self.save_state(slot)
                 if saved:

@@ -338,6 +338,18 @@ class TestResumeGate:
 
         assert _stub_launch == []
 
+    def test_a_core_without_states_logs_the_dropped_resume(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Dropping a resume request for a stateless core is logged, not silent."""
+        emu = retroarch.Retroarch()
+        emu.platform = "jaguar"
+
+        with caplog.at_level(logging.WARNING):
+            emu.launch(tmp_path / "game.j64", 0)
+
+        assert "ignoring resume_slot" in caplog.text
+
     def test_launching_a_playlist_records_it_and_starts_on_disc_zero(self, tmp_path: Path) -> None:
         """Launching a .m3u records the playlist and resets the disc index to zero."""
         emulator = retroarch.Retroarch()
@@ -790,6 +802,21 @@ class TestStateSupport:
             "state_file": None,
         }
 
+    def test_a_core_that_cannot_save_logs_the_skipped_state(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Skipping the exit-time state save for a stateless core is logged, not silent."""
+        emu = retroarch.Retroarch()
+        emu.platform = "jaguar"
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_send", lambda *a, **kw: None)
+        monkeypatch.setattr(emu, "_quit", lambda: None)
+
+        with caplog.at_level(logging.WARNING):
+            emu.save_and_exit(0)
+
+        assert "not saving state on exit" in caplog.text
+
     def test_the_running_core_is_named_for_the_archive(self) -> None:
         """The archive manifest names the core actually running the game."""
         emu = retroarch.Retroarch()
@@ -883,3 +910,31 @@ class TestClearWorkingSlot:
             retroarch.Retroarch().clear_working_slot()
 
         assert "could not clear stale state" in caplog.text
+
+    def test_a_thumbnail_that_cannot_be_removed_is_logged_as_a_thumbnail(
+        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A thumbnail left behind after the state itself was cleared gets its own message.
+
+        A generic OSError on the thumbnail unlink (not FileNotFoundError, which
+        missing_ok=True already swallows) must not read as a failure to clear
+        the state, which by then already succeeded.
+        """
+        (state_dir / "Game.state").write_bytes(b"s")
+        (state_dir / "Game.state.png").write_bytes(b"p")
+
+        real_unlink = Path.unlink
+
+        def flaky(self: Path, missing_ok: bool = False) -> None:
+            if self.name.endswith(".png"):
+                raise OSError("read-only")
+            real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", flaky)
+
+        with caplog.at_level(logging.WARNING):
+            retroarch.Retroarch().clear_working_slot()
+
+        assert not (state_dir / "Game.state").exists()
+        assert "could not clear stale state thumbnail" in caplog.text
+        assert "could not clear stale state Game.state:" not in caplog.text

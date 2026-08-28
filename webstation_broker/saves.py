@@ -179,17 +179,23 @@ def build_save_archive(
             )
             report["total_bytes"] += len(data)
         if report["files"] and identity is not None:
+            manifest_files = []
+            for f in report["files"]:
+                kind = "save"
+                if classify is not None:
+                    try:
+                        kind = classify(f["path"])
+                    except Exception as exc:
+                        # A save is already zipped by this point; losing the
+                        # manifest over a labelling bug should never cost the
+                        # player their save data too.
+                        log.warning("saves: could not classify %s: %s", f["path"], exc)
+                manifest_files.append({"path": f["path"], "kind": kind})
             manifest = {
                 "version": MANIFEST_VERSION,
                 "created_at": time.time(),
                 "session": identity,
-                "files": [
-                    {
-                        "path": f["path"],
-                        "kind": classify(f["path"]) if classify else "save",
-                    }
-                    for f in report["files"]
-                ],
+                "files": manifest_files,
             }
             zf.writestr(
                 zipfile.ZipInfo(MANIFEST_NAME, date_time=time.gmtime()[:6]),

@@ -6,6 +6,7 @@ writers.
 
 import io
 import json
+import logging
 import os
 import time
 import zipfile
@@ -345,3 +346,25 @@ def test_manifest_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
 
     assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
     assert (target / "GC" / "card.raw").read_bytes() == b"payload"
+
+
+def test_a_classifier_failure_logs_and_falls_back_to_save(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken classifier costs a manifest label, never the save data already zipped."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "card.raw", b"payload", mtime=NEW)
+
+    def broken(rel: str) -> str:
+        raise ValueError("boom")
+
+    with caplog.at_level(logging.WARNING):
+        report = saves.build_save_archive(
+            root, ("GC",), baseline=0, identity={"emulator": "dolphin"}, classify=broken
+        )
+
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        assert zf.read("GC/card.raw") == b"payload"
+        manifest = json.loads(zf.read(saves.MANIFEST_NAME))
+    assert manifest["files"] == [{"path": "GC/card.raw", "kind": "save"}]
+    assert "could not classify" in caplog.text
