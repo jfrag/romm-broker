@@ -914,7 +914,11 @@ def test_context_reports_a_solo_session_as_such(
 def test_the_controller_can_mint_an_invite_link(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:
-    """The controller can mint an invite link."""
+    """The controller can mint an invite link.
+
+    The link is the session's shareable one for that permission: the same on every call, and it
+    seats nobody until someone opens it.
+    """
     _activate(client, broker_dirs)
     token = session.SESSION["controller_token"]
 
@@ -923,9 +927,56 @@ def test_the_controller_can_mint_an_invite_link(
         params={"token": token},
         json={"permission": "participant"},
     ).json()
+    again = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "participant"},
+    ).json()
 
-    assert body["url"] != f"{PREFIX}/?token={token}"
-    assert len(session.SESSION["viewers"]) == 1
+    assert body["url"].startswith(f"{PREFIX}/?invite=")
+    assert token not in body["url"]
+    assert again["url"] == body["url"]
+    assert session.SESSION["viewers"] == []
+
+
+def test_each_arrival_on_an_invite_link_gets_its_own_seat(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Each arrival on an invite link gets its own seat.
+
+    One link goes to every friend; the context route is what seats each of them, with the link's
+    permission and a personal token of their own.
+    """
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+    url = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "readonly"},
+    ).json()["url"]
+    invite = url.split("invite=")[1]
+
+    first = client.get(f"{API}/session/context", params={"invite": invite}).json()
+    second = client.get(f"{API}/session/context", params={"invite": invite}).json()
+
+    assert first["userRole"] == "viewer"
+    assert first["userPermission"] == "readonly"
+    assert first["userToken"] != second["userToken"]
+    assert len(session.SESSION["viewers"]) == 2
+    # The seat token handed back is a real seat from then on.
+    assert client.get(f"{API}/session/context", params={"token": first["userToken"]}).status_code == 200
+
+
+def test_an_unknown_invite_token_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An unknown invite token is refused."""
+    _activate(client, broker_dirs)
+
+    response = client.get(f"{API}/session/context", params={"invite": "nope"})
+
+    assert response.status_code == 401
+    assert session.SESSION["viewers"] == []
 
 
 def test_an_invite_works_on_a_solo_session(

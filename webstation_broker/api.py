@@ -90,7 +90,7 @@ class JoinIn(BaseModel):
 
 
 class InviteIn(BaseModel):
-    """A seat the controller is minting for an invite link.
+    """The permission an invite link grants to everyone who opens it.
 
     Attributes:
         permission: Either `participant` or `readonly`.
@@ -522,19 +522,23 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
 
 @router.post("/api/session/invite")
 async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
-    """Mint a seat for someone the controller will send a link to.
+    """Return the session's shareable invite link for a permission.
 
-    The room frontend does not hold the broker secret, so this is gated on the
-    controller token the same way the exit route is. The session's multiplayer
-    flag is deliberately not consulted: a link the host went out of their way
-    to copy should work whichever way they set the switch.
+    The link is the same on every call for the session and seats no one by
+    itself: each person who opens it is given their own seat by the context
+    route, so the host sends one link to everyone rather than juggling one per
+    friend. The room frontend does not hold the broker secret, so this is
+    gated on the controller token the same way the exit route is. The
+    session's multiplayer flag is deliberately not consulted: a link the host
+    went out of their way to copy should work whichever way they set the
+    switch.
 
     Args:
-        body: The permission the invited seat gets.
+        body: The permission everyone arriving on the link gets.
         token: The controller token, passed as a query parameter.
 
     Returns:
-        A dict with `status`, `session_id`, `permission`, `username` and the seat's landing `url`.
+        A dict with `status`, `session_id`, `permission` and the link's `url`.
 
     Raises:
         HTTPException: 409 when no session is active; 403 when the token is not
@@ -545,14 +549,16 @@ async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="no active session")
     if not _ct_eq(token, sess["controller_token"]):
         raise HTTPException(status_code=403, detail="controller token required")
+    if body.permission not in ("participant", "readonly"):
+        raise HTTPException(
+            status_code=422, detail="permission must be participant or readonly"
+        )
 
-    viewer = await _mint_viewer(body.permission, None)
     return {
         "status": "invited",
         "session_id": sess["id"],
         "permission": body.permission,
-        "username": viewer["username"],
-        "url": _landing_url(viewer["token"]),
+        "url": f"{settings.PREFIX}/?invite={session.invite_token(body.permission)}",
     }
 
 
@@ -1399,11 +1405,21 @@ async def delete_export(
 
 
 @router.get("/api/session/context")
-async def context(token: Optional[str] = Query(default=None)) -> dict[str, Any]:
+async def context(
+    token: Optional[str] = Query(default=None),
+    invite: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
     """Resolve an arriving token into the caller's role, for the frontend bootstrap.
 
+    A seat token identifies someone already in the session. An invite token
+    identifies a shareable link instead: the arrival is seated on the spot and
+    handed the new seat's token as `userToken`, which is what the room keeps
+    for the rest of its stay (and across its own reloads) so one person does
+    not take a seat per visit.
+
     Args:
-        token: The seat token from the landing URL.
+        token: The seat token from the landing URL, if the caller has one.
+        invite: The invite token from a shared link, used when `token` is absent.
 
     Returns:
         The room's bootstrap context: `sessionId`, `userRole` (`controller` or
@@ -1411,11 +1427,18 @@ async def context(token: Optional[str] = Query(default=None)) -> dict[str, Any]:
         `controllerName`, `multiplayer` and the stream `iframeSrc`.
 
     Raises:
-        HTTPException: 409 when no session is active; 401 when the token is missing or unknown.
+        HTTPException: 409 when no session is active; 401 when neither token is
+            given or the one given is unknown.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         raise HTTPException(status_code=409, detail="no active session")
+    if not token and invite:
+        permission = session.find_invite(invite)
+        if permission is None:
+            raise HTTPException(status_code=401, detail="invalid invite")
+        token = (await _mint_viewer(permission, None))["token"]
+        log.info("seated an arrival from the %s invite link", permission)
     if not token:
         raise HTTPException(status_code=401, detail="missing token")
 

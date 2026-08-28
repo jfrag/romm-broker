@@ -56,7 +56,7 @@ out into its library. See [Save states](/docs/api/state).
 <Step>
 ### Exit
 
-The exit button (or RomM) calls `/api/session/exit`. The broker saves a final
+RomM's stop button calls `/api/session/exit`. The broker saves a final
 state, stops the emulator, zips everything under the emulator's save subtrees
 that changed since launch, and uploads the archive to the callback origin.
 The room is torn down and every streaming token is revoked. See

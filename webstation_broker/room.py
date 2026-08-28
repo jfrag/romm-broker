@@ -48,8 +48,11 @@ async def room_websocket(websocket: WebSocket) -> None:
     from anyone but the designated speaker while one is set.
 
     On disconnect the member is removed from the room; a departing viewer also
-    loses its slot, mouse/keyboard ownership and speaker role, is dropped from
-    the session, and the token map is pushed to selkies.
+    loses its slot, mouse/keyboard ownership and speaker role, and the token
+    map is pushed to selkies when it held either. The seat itself stays in
+    the session, so its token (and the invite link carrying it) keeps working
+    until the session ends; a new connection on a token that is already
+    connected replaces the old socket.
 
     Args:
         websocket: The incoming room connection.
@@ -85,7 +88,16 @@ async def room_websocket(websocket: WebSocket) -> None:
     if is_controller:
         session.ROOM["controller"] = connection_info
     else:
+        # A seat lives for the whole session, so the same token can come back
+        # after a reload or from another device. The earlier socket, if any,
+        # is a leftover of that and is closed rather than left to share the seat.
+        previous = session.ROOM["viewers"].get(token)
         session.ROOM["viewers"][token] = connection_info
+        if previous is not None:
+            try:
+                await previous["websocket"].close(code=1000)
+            except Exception:
+                log.debug("stale room socket for %s was already gone", username)
     await session.broadcast_to_room(
         {"type": "user_joined", "username": username, "timestamp": int(time.time() * 1000)}
     )
@@ -213,16 +225,30 @@ async def room_websocket(websocket: WebSocket) -> None:
         log.exception("unhandled room websocket error for %s", username)
     finally:
         current_username = connection_info.get("username")
+        # A socket that was replaced by a newer one on the same token is not
+        # the member leaving, so it neither cleans up nor announces a departure.
+        was_live = (
+            session.ROOM.get("controller") is connection_info
+            if is_controller
+            else session.ROOM["viewers"].get(token) is connection_info
+        )
         if is_controller:
-            if session.ROOM.get("controller") is connection_info:
+            if was_live:
                 session.ROOM["controller"] = None
-        else:
+        elif was_live:
+            # Only the live connection for the seat cleans up; a socket that
+            # was replaced by a newer one on the same token must not release
+            # what the newer one now holds. The seat itself stays: its invite
+            # link is valid for the life of the session, and it only gives up
+            # the input it was holding, since a pad nobody is driving should
+            # go back to the tray.
             session.ROOM["viewers"].pop(token, None)
             sess = session.SESSION
             if sess is not None:
                 if sess.get("designated_speaker") == token:
                     sess["designated_speaker"] = None
                 disconnected = session.find_viewer(token)
+                input_released = False
                 if disconnected:
                     if disconnected.get("slot"):
                         await session.broadcast_to_room(
@@ -233,8 +259,12 @@ async def room_websocket(websocket: WebSocket) -> None:
                                 "timestamp": int(time.time() * 1000),
                             }
                         )
+                        disconnected["slot"] = None
+                        input_released = True
                     if sess.get("mk_owner_token") == token:
                         sess["mk_owner_token"] = None
+                        disconnected["mk_control"] = False
+                        input_released = True
                         await session.broadcast_to_room(
                             {
                                 "type": "mk_change",
@@ -243,12 +273,12 @@ async def room_websocket(websocket: WebSocket) -> None:
                                 "timestamp": int(time.time() * 1000),
                             }
                         )
-                sess["viewers"] = [v for v in sess.get("viewers", []) if v["token"] != token]
-                from . import selkies
+                if input_released:
+                    from . import selkies
 
-                await selkies.push_tokens(sess)
+                    await selkies.push_tokens(sess)
 
-        if connection_info.get("has_joined"):
+        if was_live and connection_info.get("has_joined"):
             await session.broadcast_to_room(
                 {
                     "type": "user_left",
