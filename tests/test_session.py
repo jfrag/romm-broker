@@ -131,7 +131,7 @@ def test_an_anonymous_viewer_still_gets_a_name() -> None:
 
 
 def test_a_seat_past_the_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A seat past the cap is refused."""
+    """A seat past the cap is refused when nothing is reclaimable."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
     session.add_viewer("participant", {"id": 7, "username": "ana"})
@@ -140,6 +140,45 @@ def test_a_seat_past_the_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert refused is None
     assert len(session.SESSION["viewers"]) == 1
+
+
+def test_a_disconnected_anonymous_seat_is_reclaimed_at_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A disconnected anonymous seat is reclaimed to seat a new arrival at the cap."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    ghost = session.add_viewer("participant", None)
+
+    arrival = session.add_viewer("participant", None)
+
+    assert arrival is not None
+    assert arrival["token"] != ghost["token"]
+    assert len(session.SESSION["viewers"]) == 1
+    assert session.find_viewer(ghost["token"]) is None
+
+
+def test_a_connected_anonymous_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connected anonymous seat is not reclaimed even at the cap."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    online = session.add_viewer("participant", None)
+    session.ROOM["viewers"][online["token"]] = {"websocket": object()}
+
+    refused = session.add_viewer("participant", None)
+
+    assert refused is None
+    assert session.find_viewer(online["token"]) is not None
+
+
+def test_a_named_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A named user's seat is never reclaimed, even disconnected and at the cap."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    named = session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    refused = session.add_viewer("participant", None)
+
+    assert refused is None
+    assert session.find_viewer(named["token"]) is not None
 
 
 def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:

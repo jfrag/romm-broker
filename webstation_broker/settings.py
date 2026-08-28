@@ -123,6 +123,6 @@ MAX_ROOM_VIEWERS = int(os.environ.get("BROKER_MAX_ROOM_VIEWERS", "32"))
 
 An invite link is reusable and unauthenticated past the token itself, and each
 anonymous arrival on one mints a new seat with nothing to de-duplicate
-against. Without a ceiling, repeated requests on a single link grow the
-roster, and the room broadcast that follows every mint, without bound.
+against. At the ceiling, a disconnected anonymous seat is reclaimed for the
+new arrival; a named user's seat is never reclaimed.
 """

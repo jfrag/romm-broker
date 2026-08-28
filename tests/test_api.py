@@ -967,13 +967,13 @@ def test_each_arrival_on_an_invite_link_gets_its_own_seat(
     assert client.get(f"{API}/session/context", params={"token": first["userToken"]}).status_code == 200
 
 
-def test_an_arrival_past_the_room_cap_gets_a_429(
+def test_a_disconnected_arrival_is_reclaimed_at_the_room_cap(
     client: TestClient,
     broker_dirs: dict[str, Path],
     fake_emulator: list[FakeEmulator],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An arrival past the room cap gets a 429, and does not get seated."""
+    """An arrival at the room cap reclaims a disconnected anonymous seat rather than piling up."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate(client, broker_dirs)
     token = session.SESSION["controller_token"]
@@ -983,28 +983,33 @@ def test_an_arrival_past_the_room_cap_gets_a_429(
         json={"permission": "readonly"},
     ).json()["url"]
     invite = url.split("invite=")[1]
-    client.get(f"{API}/session/context", params={"invite": invite})
+    first = client.get(f"{API}/session/context", params={"invite": invite}).json()
 
     response = client.get(f"{API}/session/context", params={"invite": invite})
 
-    assert response.status_code == 429
+    assert response.status_code == 200
+    assert response.json()["userToken"] != first["userToken"]
     assert len(session.SESSION["viewers"]) == 1
 
 
-def test_joining_past_the_room_cap_gets_a_429(
+def test_an_arrival_past_the_room_cap_gets_a_429_when_nothing_is_reclaimable(
     client: TestClient,
     broker_dirs: dict[str, Path],
     fake_emulator: list[FakeEmulator],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Joining past the room cap gets a 429."""
+    """An arrival past the room cap gets a 429 when the seat holding it is a named user."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate(client, broker_dirs)
-    client.post(f"{API}/session/join", json={"permission": "participant"})
+    client.post(
+        f"{API}/session/join",
+        json={"permission": "participant", "user": {"id": 7, "username": "ana"}},
+    )
 
     response = client.post(f"{API}/session/join", json={"permission": "participant"})
 
     assert response.status_code == 429
+    assert len(session.SESSION["viewers"]) == 1
 
 
 def test_an_unknown_invite_token_is_refused(

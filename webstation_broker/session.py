@@ -203,10 +203,10 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
 
     Returns:
         The new viewer dict: `{"token", "user_id", "slot", "mk_control",
-        "username", "permission"}`. None when the session already holds
-        `settings.MAX_ROOM_VIEWERS` seats: an anonymous viewer has no identity
-        to de-duplicate against, so an invite link would otherwise grow the
-        roster without bound.
+        "username", "permission"}`. None when the session is at
+        `settings.MAX_ROOM_VIEWERS` seats and none of them can be reclaimed:
+        every seat is either a named user or an anonymous seat that is still
+        connected.
     """
     import random
 
@@ -222,11 +222,27 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
     SESSION["viewers"] = [v for v in SESSION.get("viewers", []) if not _same_user(v)]
 
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
-        log.warning(
-            "session: refusing new viewer, room is at its %d-seat cap",
-            settings.MAX_ROOM_VIEWERS,
+        # A seat lives for the whole session by design (its invite link stays
+        # valid after the tab closes), so an anonymous arrival never frees its
+        # own slot on disconnect. Reclaim the oldest anonymous seat with no
+        # live socket rather than treat every seat ever minted as permanent.
+        online_tokens = set(ROOM.get("viewers", {}).keys())
+        stale = next(
+            (
+                v
+                for v in SESSION["viewers"]
+                if v.get("user_id") is None and v["token"] not in online_tokens
+            ),
+            None,
         )
-        return None
+        if stale is None:
+            log.warning(
+                "session: refusing new viewer, room is at its %d-seat cap",
+                settings.MAX_ROOM_VIEWERS,
+            )
+            return None
+        log.info("session: reclaiming disconnected anonymous seat %s for a new arrival", stale["token"])
+        SESSION["viewers"].remove(stale)
 
     viewer = {
         "token": secrets.token_urlsafe(16),
