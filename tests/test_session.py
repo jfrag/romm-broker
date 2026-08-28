@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 import pytest
 
-from webstation_broker import selkies, session
+from webstation_broker import selkies, session, settings
 
 from .conftest import FakeEmulator
 
@@ -128,6 +128,30 @@ def test_an_anonymous_viewer_still_gets_a_name() -> None:
     viewer = session.add_viewer("participant", None)
 
     assert viewer["username"].startswith("User-")
+
+
+def test_a_seat_past_the_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A seat past the cap is refused."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    refused = session.add_viewer("participant", {"id": 8, "username": "bo"})
+
+    assert refused is None
+    assert len(session.SESSION["viewers"]) == 1
+
+
+def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A rejoin at the cap still replaces its own seat, since it frees the seat it re-takes."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    second = session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    assert second is not None
+    assert second["token"] != first["token"]
 
 
 def test_the_controller_holds_mouse_and_keyboard_until_it_is_handed_over() -> None:

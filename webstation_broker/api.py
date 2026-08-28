@@ -472,7 +472,8 @@ async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[
         The viewer record, including its `token` and `username`.
 
     Raises:
-        HTTPException: 409 when no session is active; 422 for an unknown permission.
+        HTTPException: 409 when no session is active; 422 for an unknown
+            permission; 429 when the room is already at its seat cap.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
@@ -484,6 +485,8 @@ async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[
         )
 
     viewer = session.add_viewer(permission, user)
+    if viewer is None:
+        raise HTTPException(status_code=429, detail="room is full")
     await selkies.push_tokens(sess)
     await session.broadcast_state()
     return viewer
@@ -505,7 +508,8 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when no session is active; 422
-            for an unknown permission.
+            for an unknown permission; 429 when the room is already at its
+            seat cap.
     """
     _check_secret(x_broker_secret)
 
@@ -1428,7 +1432,8 @@ async def context(
 
     Raises:
         HTTPException: 409 when no session is active; 401 when neither token is
-            given or the one given is unknown.
+            given or the one given is unknown; 429 when an invite arrival finds
+            the room already at its seat cap.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):

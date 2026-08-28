@@ -117,3 +117,12 @@ DEV_MODE = os.environ.get("BROKER_DEV_MODE", "").lower() == "true"
 
 GAMEPAD_SLOTS = int(os.environ.get("BROKER_GAMEPAD_SLOTS", "4"))
 """Number of virtual gamepad slots, from `BROKER_GAMEPAD_SLOTS` (default `4`)."""
+
+MAX_ROOM_VIEWERS = int(os.environ.get("BROKER_MAX_ROOM_VIEWERS", "32"))
+"""Ceiling on concurrent viewer seats in one session, from `BROKER_MAX_ROOM_VIEWERS` (default 32).
+
+An invite link is reusable and unauthenticated past the token itself, and each
+anonymous arrival on one mints a new seat with nothing to de-duplicate
+against. Without a ceiling, repeated requests on a single link grow the
+roster, and the room broadcast that follows every mint, without bound.
+"""

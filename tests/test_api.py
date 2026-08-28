@@ -967,6 +967,46 @@ def test_each_arrival_on_an_invite_link_gets_its_own_seat(
     assert client.get(f"{API}/session/context", params={"token": first["userToken"]}).status_code == 200
 
 
+def test_an_arrival_past_the_room_cap_gets_a_429(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An arrival past the room cap gets a 429, and does not get seated."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate(client, broker_dirs)
+    token = session.SESSION["controller_token"]
+    url = client.post(
+        f"{API}/session/invite",
+        params={"token": token},
+        json={"permission": "readonly"},
+    ).json()["url"]
+    invite = url.split("invite=")[1]
+    client.get(f"{API}/session/context", params={"invite": invite})
+
+    response = client.get(f"{API}/session/context", params={"invite": invite})
+
+    assert response.status_code == 429
+    assert len(session.SESSION["viewers"]) == 1
+
+
+def test_joining_past_the_room_cap_gets_a_429(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Joining past the room cap gets a 429."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate(client, broker_dirs)
+    client.post(f"{API}/session/join", json={"permission": "participant"})
+
+    response = client.post(f"{API}/session/join", json={"permission": "participant"})
+
+    assert response.status_code == 429
+
+
 def test_an_unknown_invite_token_is_refused(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:

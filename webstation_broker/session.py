@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 from starlette.websockets import WebSocket, WebSocketState
 
-from . import selkies
+from . import selkies, settings
 
 if TYPE_CHECKING:
     from .emulators.base import Emulator
@@ -190,7 +190,7 @@ def find_invite(token: str) -> Optional[str]:
     return None
 
 
-def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """Mint a viewer token and add the viewer to the active session.
 
     A re-join by the same user (matched by id, else username) replaces the old
@@ -203,7 +203,10 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[s
 
     Returns:
         The new viewer dict: `{"token", "user_id", "slot", "mk_control",
-        "username", "permission"}`.
+        "username", "permission"}`. None when the session already holds
+        `settings.MAX_ROOM_VIEWERS` seats: an anonymous viewer has no identity
+        to de-duplicate against, so an invite link would otherwise grow the
+        roster without bound.
     """
     import random
 
@@ -217,6 +220,13 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> dict[s
         return bool(username) and v.get("username") == username
 
     SESSION["viewers"] = [v for v in SESSION.get("viewers", []) if not _same_user(v)]
+
+    if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
+        log.warning(
+            "session: refusing new viewer, room is at its %d-seat cap",
+            settings.MAX_ROOM_VIEWERS,
+        )
+        return None
 
     viewer = {
         "token": secrets.token_urlsafe(16),
