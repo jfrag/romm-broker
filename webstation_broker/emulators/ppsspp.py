@@ -390,6 +390,7 @@ class Ppsspp(Emulator):
     display_name = "PPSSPP"
     save_root = PSP_DIR
     save_subtrees = ("SAVEDATA", "PPSSPP_STATE")
+    state_subtrees = ("PPSSPP_STATE",)
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT

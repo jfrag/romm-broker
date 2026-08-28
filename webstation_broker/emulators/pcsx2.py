@@ -535,6 +535,7 @@ class Pcsx2(Emulator):
     display_name = "PCSX2"
     save_root = Path("/config/.config/PCSX2")
     save_subtrees = ("memcards", "sstates")
+    state_subtrees = ("sstates",)
     memory_card_subtree = "memcards"
     memory_card_marker = SLOT1_MARKER
     rom_extensions = ROM_EXTENSIONS

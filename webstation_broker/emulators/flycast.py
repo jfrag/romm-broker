@@ -151,6 +151,20 @@ class Flycast(Emulator):
         super().__init__()
         self._rom_path: Optional[Path] = None
 
+    def save_file_kind(self, rel: str) -> str:
+        """Classify an archive member for the manifest.
+
+        Flycast keeps the savestate loose beside the VMU images, so the
+        subtree-based default cannot split them; the `.state` suffix can.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            `state` for the savestate, `save` for everything else.
+        """
+        return "state" if rel.lower().endswith(".state") else "save"
+
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a ROM path to a single playable disc image or file.
 

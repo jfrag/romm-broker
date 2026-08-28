@@ -1014,6 +1014,8 @@ class Rpcs3(Emulator):
     name = "rpcs3"
     display_name = "RPCS3"
     save_root = DEV_HDD0
+    state_subtrees = ("savestates",)
+    """States land under the symlinked `savestates` dir; see `_link_savestates`."""
     _restoring = False
     _session_serial: Optional[str] = None
     _session_start = 0.0

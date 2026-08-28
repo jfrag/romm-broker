@@ -360,6 +360,7 @@ class Dolphin(Emulator):
     Wii has no physical card, so its NAND only ever moves through the save
     archive.
     """
+    state_subtrees = ("StateSaves",)
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT

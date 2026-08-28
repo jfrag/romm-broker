@@ -43,14 +43,14 @@ loads a state once the VM is up. Both are optional and independent. Like the
 state routes, `resume_slot` resolves to the emulator's working slot rather than
 being honoured literally, so any value loads whatever that slot holds.
 
-PCSX2 empties its working slot at the start of activate, before the archive is
-restored. A `.p2s` is named for the disc it was taken from and the serial only
-comes off the running disc, so a file left over from an earlier session cannot
-be told apart from the current game's; RomM already holds those states, and
-clearing them is what stops the last player's save being served as this one's.
-Both the restore and the later resume push land afterwards, so neither is
-touched. The other emulators name a state after the loaded content and can tell
-a stale one apart on sight, so they need no equivalent.
+Most launchers empty their working slot at the start of activate, before the
+archive is restored: PCSX2, PPSSPP, Dolphin, DuckStation, Flycast, RPCS3 and
+RetroArch all do. A state file is named for the content it was taken from,
+which says which game it belongs to but never which session, so a leftover
+from the last player of the same game cannot be told apart from this player's
+own. RomM already holds those states, and clearing them is what stops the last
+player's save being served as this one's. Both the restore and the later
+resume push land afterwards, so neither is touched.
 
 ```bash
 curl -k -X POST https://localhost:3001/streaming/api/session/activate \

@@ -292,6 +292,7 @@ class Duckstation(Emulator):
     display_name = "DuckStation"
     save_root = DATA_DIR
     save_subtrees = ("memcards", "savestates")
+    state_subtrees = ("savestates",)
     rom_extensions = ROM_EXTENSIONS
     log_path = DUCKSTATION_LOG_PATH
     term_timeout = float(os.environ.get("DUCKSTATION_STOP_WAIT", "30"))

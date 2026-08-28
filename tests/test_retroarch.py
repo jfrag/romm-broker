@@ -328,6 +328,16 @@ class TestResumeGate:
 
         assert _stub_launch == []
 
+    def test_a_core_without_states_defers_nothing(
+        self, tmp_path: Path, _stub_launch: list[tuple[Any, ...]]
+    ) -> None:
+        """A resume request for a core that cannot load states starts no deferred load."""
+        emu = retroarch.Retroarch()
+        emu.platform = "jaguar"
+        emu.launch(tmp_path / "game.j64", 0)
+
+        assert _stub_launch == []
+
     def test_launching_a_playlist_records_it_and_starts_on_disc_zero(self, tmp_path: Path) -> None:
         """Launching a .m3u records the playlist and resets the disc index to zero."""
         emulator = retroarch.Retroarch()
@@ -736,3 +746,140 @@ class TestSwapDisc:
 
         release_resume.set()
         t.join(timeout=2)
+
+
+class TestStateSupport:
+    """Whether the loaded platform's core claims savestates, and which core it is."""
+
+    def test_a_mapped_platform_supports_states(self) -> None:
+        """A platform whose entry says nothing about states supports them."""
+        emu = retroarch.Retroarch()
+        emu.platform = "snes"
+
+        assert emu.supports_states is True
+
+    def test_a_platform_that_opts_out_reports_no_state_support(self) -> None:
+        """A platform whose core stubs out serialization reports no state support."""
+        emu = retroarch.Retroarch()
+        emu.platform = "jaguar"
+
+        assert emu.supports_states is False
+
+    def test_an_unmapped_platform_still_claims_states(self) -> None:
+        """With no platform mapped there is nothing to opt out, so states stay claimed."""
+        assert retroarch.Retroarch().supports_states is True
+
+    def test_a_core_that_cannot_save_is_not_asked_to_on_exit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A core that cannot save states is not asked to on the way out."""
+        emu = retroarch.Retroarch()
+        emu.platform = "jaguar"
+        monkeypatch.setattr(emu, "alive", lambda: True)
+        monkeypatch.setattr(emu, "_send", lambda *a, **kw: None)
+        monkeypatch.setattr(emu, "_quit", lambda: None)
+
+        def refuse(slot: int) -> bool:
+            raise AssertionError("save_state should not run for a core without states")
+
+        monkeypatch.setattr(emu, "save_state", refuse)
+
+        assert emu.save_and_exit(0) == {
+            "state_saved": False,
+            "state_slot": 0,
+            "state_file": None,
+        }
+
+    def test_the_running_core_is_named_for_the_archive(self) -> None:
+        """The archive manifest names the core actually running the game."""
+        emu = retroarch.Retroarch()
+        emu.platform = "psp"
+
+        assert emu.archive_core() == "ppsspp"
+
+    def test_an_unmapped_platform_names_no_core(self) -> None:
+        """With no platform mapped there is no core to name."""
+        assert retroarch.Retroarch().archive_core() is None
+
+
+class TestClearWorkingSlot:
+    """Clearing the broker's slot so one player's state never resumes for the next."""
+
+    @pytest.fixture
+    def state_dir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """Point STATE_DIR at a throwaway directory in the broker's slot 0.
+
+        Args:
+            tmp_path: The per-test temporary directory.
+            monkeypatch: The pytest monkeypatch fixture.
+
+        Returns:
+            The directory STATE_DIR now names.
+        """
+        states = tmp_path / "states"
+        states.mkdir()
+        monkeypatch.setattr(retroarch, "STATE_DIR", states)
+        monkeypatch.setattr(retroarch, "STATE_SLOT", 0)
+        return states
+
+    def test_a_state_in_the_slot_goes_with_its_thumbnail(self, state_dir: Path) -> None:
+        """A state in the broker's slot is dropped along with its thumbnail."""
+        (state_dir / "Game.state").write_bytes(b"s")
+        (state_dir / "Game.state.png").write_bytes(b"p")
+
+        retroarch.Retroarch().clear_working_slot()
+
+        assert not (state_dir / "Game.state").exists()
+        assert not (state_dir / "Game.state.png").exists()
+
+    def test_a_state_a_core_redirected_into_its_own_dir_goes_too(self, state_dir: Path) -> None:
+        """A state a core redirected into its own subdir is cleared as well."""
+        nested = state_dir / "dolphin-emu"
+        nested.mkdir()
+        (nested / "Game.state").write_bytes(b"s")
+
+        retroarch.Retroarch().clear_working_slot()
+
+        assert not (nested / "Game.state").exists()
+
+    def test_another_slot_is_left_alone(self, state_dir: Path) -> None:
+        """States outside the broker's slot are not the broker's to drop."""
+        (state_dir / "Game.state3").write_bytes(b"s")
+        (state_dir / "Game.state.auto").write_bytes(b"a")
+
+        retroarch.Retroarch().clear_working_slot()
+
+        assert (state_dir / "Game.state3").exists()
+        assert (state_dir / "Game.state.auto").exists()
+
+    def test_save_data_is_left_alone(self, state_dir: Path) -> None:
+        """Nothing but a state file is touched."""
+        (state_dir / "Game.srm").write_bytes(b"v")
+
+        retroarch.Retroarch().clear_working_slot()
+
+        assert (state_dir / "Game.srm").exists()
+
+    def test_a_missing_state_dir_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Clearing before RetroArch has ever run is a no-op, not a failure."""
+        monkeypatch.setattr(retroarch, "STATE_DIR", tmp_path / "absent")
+
+        retroarch.Retroarch().clear_working_slot()
+
+    def test_a_state_that_cannot_be_removed_is_logged(
+        self, state_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A state that cannot be removed is logged rather than failing the activate."""
+        (state_dir / "Game.state").write_bytes(b"s")
+
+        def refuse(self: Path, missing_ok: bool = False) -> None:
+            raise OSError("read-only")
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+
+        with caplog.at_level(logging.WARNING):
+            retroarch.Retroarch().clear_working_slot()
+
+        assert "could not clear stale state" in caplog.text

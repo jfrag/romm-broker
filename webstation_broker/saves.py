@@ -6,12 +6,13 @@ zips every save file modified since launch.
 
 import calendar
 import io
+import json
 import logging
 import os
 import time
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import settings
 
@@ -19,6 +20,14 @@ log = logging.getLogger(__name__)
 
 SAVE_FILE_MAX_BYTES = int(os.environ.get("SAVE_FILE_MAX_BYTES", str(256 * 1024 * 1024)))
 """Env-tunable guard against runaway dumps, from `SAVE_FILE_MAX_BYTES` (default 256 MiB)."""
+MANIFEST_NAME = ".broker-manifest.json"
+"""Index the broker adds to a dump archive, labelling each member for the parent.
+
+Dot-prefixed so `_iter_save_files` skips it if it ever lands in a save tree,
+and so a restore can tell the broker's own index from real save data.
+"""
+MANIFEST_VERSION = 1
+"""Schema version of the archive manifest, for a parent reading old archives."""
 _SAVE_MTIME_SLACK = 2.0
 """Seconds of slack on the newer-file guard.
 
@@ -96,7 +105,11 @@ def _read_file_stable(p: Path, retries: int = 4, settle: float = 0.5) -> Optiona
 
 
 def build_save_archive(
-    root: Path, subtrees: tuple[str, ...], baseline: float
+    root: Path,
+    subtrees: tuple[str, ...],
+    baseline: float,
+    identity: Optional[dict[str, Any]] = None,
+    classify: Optional[Callable[[str], str]] = None,
 ) -> dict[str, Any]:
     """Zip every save file modified since `baseline` (the launch timestamp).
 
@@ -104,10 +117,19 @@ def build_save_archive(
     sides, so a timezone difference between the dump and a later restore never
     shifts them past the newer-file guard.
 
+    When `identity` is given the archive also carries `MANIFEST_NAME`, which
+    labels each member and names the session it came from. Every emulator lays
+    its save directories out differently, so the manifest is what lets the
+    parent sort states from saves without a table of those layouts.
+
     Args:
         root: The emulator's save data root.
         subtrees: Subdirectory names under `root` that hold save data.
         baseline: Unix timestamp; files with an mtime at or after it are included.
+        identity: Session identity to record in the manifest, or None to leave
+            the manifest out entirely.
+        classify: Maps a member path to its kind, usually
+            `Emulator.save_file_kind`; members go in unlabelled without it.
 
     Returns:
         A report dict of the shape
@@ -156,6 +178,24 @@ def build_save_archive(
                 {"path": p.relative_to(root).as_posix(), "size": len(data), "mtime": mtime}
             )
             report["total_bytes"] += len(data)
+        if report["files"] and identity is not None:
+            manifest = {
+                "version": MANIFEST_VERSION,
+                "created_at": time.time(),
+                "session": identity,
+                "files": [
+                    {
+                        "path": f["path"],
+                        "kind": classify(f["path"]) if classify else "save",
+                    }
+                    for f in report["files"]
+                ],
+            }
+            zf.writestr(
+                zipfile.ZipInfo(MANIFEST_NAME, date_time=time.gmtime()[:6]),
+                json.dumps(manifest, indent=2),
+                zipfile.ZIP_DEFLATED,
+            )
     if report["files"]:
         report["zip_bytes"] = buf.getvalue()
     return report
@@ -193,6 +233,9 @@ def extract_save_archive(
     can never roll back saves made since the archive was taken. Each file is
     written through a temp file and renamed into place.
 
+    An archive's `MANIFEST_NAME` is dropped: it describes the archive for the
+    parent and is not save data.
+
     Args:
         content: The zip archive body.
         root: The emulator's save data root.
@@ -225,6 +268,10 @@ def extract_save_archive(
             if member.is_absolute() or ".." in member.parts:
                 result["error"] = f"archive member escapes save dir: {info.filename}"
                 return result
+            if info.filename == MANIFEST_NAME:
+                # The broker's own index, not save data: it sits outside every
+                # subtree, so it has to be dropped before the subtree check.
+                continue
             if _under(member, excluded):
                 result["excluded"] += 1
                 continue

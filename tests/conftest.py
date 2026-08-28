@@ -340,12 +340,14 @@ def fake_emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[FakeE
     built = []
     root = tmp_path / "fakeconfig"
     (root / "saves").mkdir(parents=True)
+    (root / "states").mkdir(parents=True)
 
     class Tracked(FakeEmulator):
         """A FakeEmulator rooted in tmp_path that appends each instance to the shared list."""
 
         save_root = root
-        save_subtrees = ("saves",)
+        save_subtrees = ("saves", "states")
+        state_subtrees = ("states",)
 
         def __init__(self) -> None:
             """Build the fake and append it to the shared list."""

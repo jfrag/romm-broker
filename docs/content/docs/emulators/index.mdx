@@ -10,7 +10,7 @@ state on demand.
 
 | `emulator` | System | Save states | Disc swap | Save subtrees shipped in the archive |
 | --- | --- | --- | --- | --- |
-| `retroarch` | anything with a libretro core | yes | yes | `states/`, `saves/` under `RETROARCH_DATA_DIR` |
+| `retroarch` | anything with a libretro core | yes, unless the platform's core opts out | yes | `states/`, `saves/` under `RETROARCH_DATA_DIR` |
 | `pcsx2` | PlayStation 2 | yes | no | `memcards/`, `sstates/` |
 | `duckstation` | PlayStation | no (a resume state is written at exit) | no | `memcards/`, `savestates/` |
 | `dolphin` | GameCube, Wii | yes | no | `StateSaves/`, `GC/`, `Wii/` |
@@ -50,6 +50,12 @@ own hotkeys. The first save of a session costs about 3 s, the rest under 1 s.
 Loads use `LOAD_STATE_SLOT`, which is already absolute. Tunables:
 `RETROARCH_SLOT_STEP_DELAY` (0.1 s between presses) and
 `RETROARCH_SLOT_HOME_STEPS` (24 presses to reach the floor).
+
+Not every core serializes, so a platform whose core does not can set
+`"savestate": false` in the table. `supports_states` then reports `false` for
+that platform, the state routes answer `400`, `resume_slot` is ignored and
+exit saves no state. RetroArch also empties its working slot at activate, the
+same as PCSX2 below.
 
 Multi-disc games: `rom.path` may point at an `.m3u` playlist or a folder
 holding one, and the broker prefers the playlist on disc platforms. A running
@@ -98,6 +104,13 @@ archive can carry.
 
 Hotkey driven like Dolphin, working in slot 1. Save data and states live under
 `PSP/` in the config root.
+
+For PSP the RetroArch `ppsspp` core is the better option. It is the same
+emulator core underneath, but it comes with RetroArch's controller handling
+and its real save-state interface, where the standalone is driven by hotkeys
+into its own GUI and has the flakier pad support of the two. PSP is not
+demanding enough for RetroArch's overhead to matter. The standalone stays
+supported for anyone who wants PPSSPP's own UI and settings.
 
 ## Cemu
 

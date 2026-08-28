@@ -5,6 +5,7 @@ exports, context, exit and disc swap.
 """
 
 import io
+import json
 import os
 import signal
 import subprocess
@@ -17,7 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from webstation_broker import session, settings
+from webstation_broker import saves, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, rpcs3, shadps4
 
@@ -587,6 +588,39 @@ def test_exit_dumps_the_save_delta_and_retires_the_session(
     assert body["upload"]["mode"] == "report-only"
     assert fake_emulator[0].running is False
     assert session.SESSION is None
+
+
+def test_the_exit_archive_carries_a_manifest_romm_can_sort_by(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exit archive carries a manifest naming the session and each member's kind."""
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    _activate(client, broker_dirs)
+    root = fake_emulator[0].save_root
+    _write_save_after_launch(root / "saves" / "card.bin", b"played")
+    _write_save_after_launch(root / "states" / "game.p2s", b"state")
+
+    body = client.post(f"{API}/session/exit").json()
+    archive = Path(body["upload"]["would_send"]["archive_path"])
+    with zipfile.ZipFile(archive) as zf:
+        manifest = json.loads(zf.read(saves.MANIFEST_NAME))
+
+    assert manifest["session"] == {
+        "emulator": "fake",
+        "core": None,
+        "platform": "ps2",
+        "rom_id": 5,
+        "rom": "Game",
+        "rom_file": str(_rom(broker_dirs)),
+        "state_slot": 3,
+    }
+    assert {f["path"]: f["kind"] for f in manifest["files"]} == {
+        "saves/card.bin": "save",
+        "states/game.p2s": "state",
+    }
 
 
 def test_exit_leaves_the_state_readable_for_the_pull_that_follows(

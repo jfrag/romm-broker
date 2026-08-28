@@ -284,6 +284,30 @@ def _archive_subtrees(
     return tuple(s for s in emulator.save_subtrees if s != card), (card,)
 
 
+def _archive_identity(sess: dict, emulator: Emulator) -> dict:
+    """Session identity for the dump archive's manifest.
+
+    Args:
+        sess: The active session record.
+        emulator: The emulator that just exited.
+
+    Returns:
+        The emulator, its core (for a launcher that fronts many), the platform,
+        the ROM's RomM id, name and file, and the state slot the archive was
+        taken in.
+    """
+    rom = sess.get("rom") or {}
+    return {
+        "emulator": emulator.name,
+        "core": emulator.archive_core(),
+        "platform": rom.get("platform"),
+        "rom_id": rom.get("id"),
+        "rom": rom.get("name"),
+        "rom_file": sess.get("rom_file"),
+        "state_slot": emulator.state_slot if emulator.supports_states else None,
+    }
+
+
 @router.get("/api/health")
 async def health() -> dict[str, str]:
     """Report that the broker is up."""
@@ -568,6 +592,8 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         emulator.save_root,
         dump_subtrees,
         sess["save_baseline"],
+        _archive_identity(sess, emulator),
+        emulator.save_file_kind,
     )
     cb = sess.get("callback")
     archive_name = f"{sess['id']}-{int(time.time())}.zip"

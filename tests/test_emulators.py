@@ -57,6 +57,51 @@ def test_every_emulator_declares_what_the_routes_read_off_it(name: str) -> None:
 
 
 @pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
+def test_every_declared_state_subtree_ships_in_the_save_archive(name: str) -> None:
+    """Every declared state subtree ships in the save archive."""
+    emu = emulators.get_emulator(name)
+
+    assert isinstance(emu.state_subtrees, tuple)
+    # A state subtree the dump never walks would label nothing.
+    for sub in emu.state_subtrees:
+        assert sub in emu.save_subtrees
+
+
+@pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
+def test_every_archive_member_gets_a_kind_the_parent_knows(name: str) -> None:
+    """Every archive member gets a kind the parent knows."""
+    emu = emulators.get_emulator(name)
+    kinds = {"state", "state_screenshot", "memcard", "save"}
+
+    for sub in emu.save_subtrees:
+        assert emu.save_file_kind(f"{sub}/title/data.bin") in kinds
+    assert emu.save_file_kind("unmapped/data.bin") in kinds
+
+
+def test_the_default_classifier_sorts_by_subtree() -> None:
+    """The default classifier sorts a member by the subtree it sits in."""
+    emu = emulators.get_emulator("pcsx2")
+
+    assert emu.save_file_kind("sstates/game.p2s") == "state"
+    assert emu.save_file_kind("sstates/game.png") == "state_screenshot"
+    assert emu.save_file_kind("memcards/Mcd001.ps2") == "memcard"
+    assert emu.save_file_kind("something/else.bin") == "save"
+
+
+def test_a_subtree_name_is_matched_whole() -> None:
+    """A subtree name only matches on a path boundary, never a prefix of a sibling."""
+    emu = emulators.get_emulator("duckstation")
+
+    assert emu.save_file_kind("savestates") == "state"
+    assert emu.save_file_kind("savestates-old/game.p2s") == "save"
+
+
+def test_an_emulator_without_a_launcher_core_reports_none() -> None:
+    """An emulator that is its own backend names no core."""
+    assert emulators.get_emulator("ppsspp").archive_core() is None
+
+
+@pytest.mark.parametrize("name", sorted(emulators.REGISTRY))
 def test_a_memory_card_comes_with_everything_the_card_routes_need(name: str) -> None:
     """A memory card comes with everything the card routes need."""
     emu = emulators.get_emulator(name)

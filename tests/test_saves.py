@@ -5,6 +5,7 @@ writers.
 """
 
 import io
+import json
 import os
 import time
 import zipfile
@@ -265,3 +266,82 @@ def test_write_export_persists_the_dump(tmp_path: Path, monkeypatch: pytest.Monk
 
     assert (tmp_path / "exports" / "session-1.zip").read_bytes() == b"zip-body"
     assert path.endswith("session-1.zip")
+
+
+def test_build_labels_every_member_in_the_manifest(tmp_path: Path) -> None:
+    """With an identity, the archive carries a manifest naming each member's kind."""
+    root = tmp_path / "root"
+    _write(root / "states" / "game.state", b"s", mtime=NEW)
+    _write(root / "saves" / "game.srm", b"v", mtime=NEW)
+    identity = {"emulator": "retroarch", "core": "snes9x", "platform": "snes"}
+
+    report = saves.build_save_archive(
+        root,
+        ("states", "saves"),
+        baseline=0,
+        identity=identity,
+        classify=lambda rel: "state" if rel.startswith("states/") else "save",
+    )
+
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        manifest = json.loads(zf.read(saves.MANIFEST_NAME))
+    assert manifest["version"] == saves.MANIFEST_VERSION
+    assert manifest["session"] == identity
+    assert {f["path"]: f["kind"] for f in manifest["files"]} == {
+        "states/game.state": "state",
+        "saves/game.srm": "save",
+    }
+    # The manifest describes the archive; it is not one of the dumped files.
+    assert [f["path"] for f in report["files"]] == ["states/game.state", "saves/game.srm"]
+
+
+def test_build_labels_members_as_saves_without_a_classifier(tmp_path: Path) -> None:
+    """An identity with no classifier still yields a manifest, all members plain saves."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "card.raw", b"payload", mtime=NEW)
+
+    report = saves.build_save_archive(root, ("GC",), baseline=0, identity={"emulator": "dolphin"})
+
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        manifest = json.loads(zf.read(saves.MANIFEST_NAME))
+    assert manifest["files"] == [{"path": "GC/card.raw", "kind": "save"}]
+
+
+def test_build_leaves_the_manifest_out_without_an_identity(tmp_path: Path) -> None:
+    """No identity, no manifest: an archive stays exactly what it was before."""
+    root = tmp_path / "root"
+    _write(root / "GC" / "card.raw", b"payload", mtime=NEW)
+
+    report = saves.build_save_archive(root, ("GC",), baseline=0)
+
+    with zipfile.ZipFile(io.BytesIO(report["zip_bytes"])) as zf:
+        assert zf.namelist() == ["GC/card.raw"]
+
+
+def test_restore_drops_the_manifest_instead_of_refusing_the_archive(tmp_path: Path) -> None:
+    """The manifest sits outside every subtree, so a restore has to pass it over."""
+    target = tmp_path / "target"
+    target.mkdir()
+    body = _zip({saves.MANIFEST_NAME: b"{}", "GC/card.raw": b"payload"})
+
+    result = saves.extract_save_archive(body, target, ("GC",))
+
+    assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
+    assert (target / "GC" / "card.raw").read_bytes() == b"payload"
+    assert not (target / saves.MANIFEST_NAME).exists()
+
+
+def test_manifest_archive_round_trips_through_a_restore(tmp_path: Path) -> None:
+    """An archive built with a manifest restores as cleanly as one without."""
+    source = tmp_path / "source"
+    _write(source / "GC" / "card.raw", b"payload", mtime=NEW)
+    report = saves.build_save_archive(
+        source, ("GC",), baseline=0, identity={"emulator": "dolphin"}
+    )
+
+    target = tmp_path / "target"
+    target.mkdir()
+    result = saves.extract_save_archive(report["zip_bytes"], target, ("GC",))
+
+    assert result == {"written": 1, "skipped": 0, "excluded": 0, "failed": 0, "error": None}
+    assert (target / "GC" / "card.raw").read_bytes() == b"payload"

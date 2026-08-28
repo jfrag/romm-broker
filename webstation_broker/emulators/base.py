@@ -167,6 +167,19 @@ def reap_orphan() -> Optional[dict[str, Any]]:
     return record
 
 
+def _under_subtree(rel: str, subtree: str) -> bool:
+    """Whether a member path lies inside a subtree, or is the subtree itself.
+
+    Args:
+        rel: The member path, relative to the save root and posix-separated.
+        subtree: The subtree name to test against.
+
+    Returns:
+        True when `rel` equals `subtree` or starts with it followed by a slash.
+    """
+    return rel == subtree or rel.startswith(subtree + "/")
+
+
 class Emulator:
     """Contract every launcher implements, plus the process plumbing they share.
 
@@ -207,6 +220,8 @@ class Emulator:
         save_root: Root of the emulator's writable data.
         save_subtrees: Subtrees under `save_root` that hold save data; save
             restore and dump are scoped to these.
+        state_subtrees: The subset of `save_subtrees` holding savestates, for
+            labelling an archive's members.
         rom_extensions: File extensions the emulator will boot, in preference
             order.
         supports_states: Whether the emulator can save and load state
@@ -237,6 +252,13 @@ class Emulator:
     """Root of the emulator's writable data."""
     save_subtrees: tuple[str, ...] = ()
     """The subtrees under `save_root` that hold save data; save restore and dump are scoped to these."""
+    state_subtrees: tuple[str, ...] = ()
+    """The subset of `save_subtrees` holding savestates rather than the game's own save data.
+
+    Empty for emulators with no states, and for the few whose states share a
+    directory with their saves; those tell the two apart in `save_file_kind`
+    instead.
+    """
     rom_extensions: tuple[str, ...] = ()
     """File extensions the emulator will boot, in preference order."""
     supports_states: bool = False
@@ -472,6 +494,40 @@ class Emulator:
             The card directory, or None for emulators without a memory card.
         """
         return None
+
+    def archive_core(self) -> Optional[str]:
+        """The core or backend actually running the game, or None.
+
+        Only meaningful for a launcher that is one shell over many cores; it
+        goes in the archive manifest so the parent can tell a RetroArch PSP
+        archive from a standalone PPSSPP one.
+
+        Returns:
+            The core name, or None for emulators that are their own backend.
+        """
+        return None
+
+    def save_file_kind(self, rel: str) -> str:
+        """What an archive member holds, for the manifest the parent reads.
+
+        Every emulator lays its save directories out differently, so this is
+        what lets the parent sort an archive without a table of those layouts.
+        The default classifies by subtree; emulators whose states and saves
+        share a directory override it.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            One of `state`, `state_screenshot`, `memcard` or `save`.
+        """
+        if self.memory_card_subtree and _under_subtree(rel, self.memory_card_subtree):
+            return "memcard"
+        if any(_under_subtree(rel, sub) for sub in self.state_subtrees):
+            # The frame captured with a state is written beside it, and the
+            # parent shows it rather than restoring it.
+            return "state_screenshot" if rel.lower().endswith((".png", ".jpg")) else "state"
+        return "save"
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.

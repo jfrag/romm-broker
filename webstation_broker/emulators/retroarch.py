@@ -763,8 +763,8 @@ class Retroarch(Emulator):
         display_name: Shown as "RetroArch".
         save_root: `RA_DATA_DIR`, the broker-managed data root.
         log_path: `RA_LOG_PATH`, where RetroArch's stderr goes.
-        supports_states: On; save states work for every core unless its
-            platform entry opts out of `savestate`.
+        supports_states: Whether the loaded platform's core can save states.
+        state_subtrees: `states`, where savestates land.
         supports_disc_swap: On; discs are swapped through the virtual tray.
         state_slot: `STATE_SLOT`, the one slot the broker works in.
         state_dir: `STATE_DIR`, the broker-managed savestate directory.
@@ -779,10 +779,10 @@ class Retroarch(Emulator):
     """Name the UI shows for RetroArch."""
     save_root = RA_DATA_DIR
     """The broker-managed data root; saves and states live under it."""
+    state_subtrees = ("states",)
+    """Savestates live under `states`, whichever subtrees the platform scopes the dump to."""
     log_path = RA_LOG_PATH
     """Where RetroArch's stderr is appended."""
-    supports_states = True
-    """Save states work for every core unless its platform entry opts out."""
     supports_disc_swap = True
     """Discs are swapped through RetroArch's virtual tray."""
     state_slot = STATE_SLOT
@@ -840,6 +840,25 @@ class Retroarch(Emulator):
         info = _platform_info(self.platform)
         scoped = info.get("save_subtrees") if info else None
         return scoped or ("states", "saves")
+
+    @property
+    def supports_states(self) -> bool:
+        """Whether the loaded platform's core can save and load states.
+
+        A core that stubs out the libretro serialize calls (jaguar) opts out
+        in its platform entry, so the flag has to follow the platform rather
+        than the launcher.
+
+        Returns:
+            True unless the platform entry sets `savestate` false.
+        """
+        info = _platform_info(self.platform)
+        return True if info is None else bool(info.get("savestate", True))
+
+    def archive_core(self) -> Optional[str]:
+        """The libretro core booting the loaded platform, or None when unmapped."""
+        info = _platform_info(self.platform)
+        return info["core"] if info else None
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:
@@ -1068,7 +1087,7 @@ class Retroarch(Emulator):
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
-        if resume_slot is not None:
+        if resume_slot is not None and self.supports_states:
             threading.Thread(
                 target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
             ).start()
@@ -1325,6 +1344,33 @@ class Retroarch(Emulator):
         shot = state.with_name(f"{state.name}.png")
         return shot if shot.is_file() else None
 
+    def clear_working_slot(self) -> None:
+        """Delete every content's state in the broker's slot, and its thumbnail.
+
+        RetroArch names a state after the loaded content, so a leftover for a
+        different game is already invisible to a resume. One for the *same*
+        game is not: in a shared container the previous player's state would
+        be served to the next, since nothing about the name says whose it is.
+
+        Searched recursively, since a core may redirect states into a subdir
+        of its own.
+        """
+        if not STATE_DIR.is_dir():
+            return
+        suffix = _state_name("", STATE_SLOT)
+        try:
+            stale_states = [p for p in STATE_DIR.rglob(f"*{suffix}") if p.is_file()]
+        except OSError as exc:
+            log.warning("could not scan %s for stale states: %s", STATE_DIR, exc)
+            return
+        for stale in stale_states:
+            try:
+                stale.unlink()
+                stale.with_name(f"{stale.name}.png").unlink(missing_ok=True)
+                log.info("cleared stale state %s", stale.name)
+            except OSError as exc:
+                log.warning("could not clear stale state %s: %s", stale.name, exc)
+
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
 
@@ -1369,8 +1415,7 @@ class Retroarch(Emulator):
         saved = False
         state_file = None
         if self.alive():
-            info = _platform_info(self.platform)
-            if slot is not None and (info is None or info.get("savestate", True)):
+            if slot is not None and self.supports_states:
                 saved = self.save_state(slot)
                 if saved:
                     p = self.state_path()

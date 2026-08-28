@@ -712,3 +712,12 @@ def test_class_attributes_match_the_exit_only_api_surface(data_dir: Path) -> Non
     assert emu.rom_extensions == (".chd", ".gdi", ".cdi", ".cue", ".elf")
     assert emu.supports_states is False
     assert emu.supports_disc_swap is False
+
+
+def test_the_savestate_is_labelled_apart_from_the_vmu_saves() -> None:
+    """The savestate is labelled apart from the VMU images it sits beside."""
+    emulator = flycast.Flycast()
+    data = flycast.DATA_DIR.name
+
+    assert emulator.save_file_kind(f"{data}/Game.state") == "state"
+    assert emulator.save_file_kind(f"{data}/vmu_save_A1.bin") == "save"
