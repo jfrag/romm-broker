@@ -129,6 +129,79 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 
+/* ── Stream volume ─────────────────────────────────────────────────────── */
+/* A fader at the left edge of the bar for people who arrived on an invite
+   link: with no RomM window around the page, nothing else can turn the game
+   down for them. */
+#stream-volume {
+  flex: 0 0 auto;
+  align-self: stretch;
+  width: 40px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+#stream-volume.hidden {
+  display: none;
+}
+
+#stream-volume .control-btn {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  font-size: 1rem;
+}
+
+/* Vertical writing mode rather than a rotate so the track follows the bar's
+   height. rtl puts max at the top. */
+#stream-volume-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  writing-mode: vertical-lr;
+  direction: rtl;
+  flex: 1 1 auto;
+  min-height: 60px;
+  width: 8px;
+  margin: 4px 0;
+  background: var(--input-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  outline: none;
+  cursor: pointer;
+}
+
+#stream-volume-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  background: var(--button-bg);
+  border-radius: 50%;
+  border: 2px solid #1a1a1a;
+  transition: background-color 0.2s;
+}
+
+#stream-volume-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  background: var(--button-bg);
+  border-radius: 50%;
+  border: 2px solid #1a1a1a;
+  transition: background-color 0.2s;
+}
+
+#stream-volume-slider:focus-visible::-webkit-slider-thumb,
+#stream-volume-slider:hover::-webkit-slider-thumb {
+  background: var(--button-hover-bg);
+}
+
+#stream-volume-slider:focus-visible::-moz-range-thumb,
+#stream-volume-slider:hover::-moz-range-thumb {
+  background: var(--button-hover-bg);
+}
+
 /* Holds the chat column's place in the bar. The column itself is fixed so it
    can grow up over the play space without the bar clipping it. */
 #chat-dock-slot {
@@ -192,6 +265,22 @@ body {
     width: 40px;
     height: 40px;
     font-size: 1.1rem;
+  }
+
+  #stream-volume {
+    width: 32px;
+    gap: 4px;
+  }
+
+  #stream-volume .control-btn {
+    width: 32px;
+    height: 32px;
+    font-size: 0.85rem;
+  }
+
+  #stream-volume-slider {
+    min-height: 30px;
+    margin: 2px 0;
   }
 
   .invite-links {
@@ -1579,6 +1668,20 @@ body.solo-mode #invite-tile {
 body.solo-mode #video-grid:hover #invite-tile,
 body.solo-mode.solo-peek #invite-tile,
 body.solo-mode #invite-tile.open {
+  opacity: 1;
+}
+
+/* An invitee left alone still needs the fader, so it floats in the corner
+   and fades on the invite tile's rule. */
+body.solo-mode #stream-volume {
+  height: 120px;
+  align-self: flex-end;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+body.solo-mode #video-grid:hover #stream-volume,
+body.solo-mode.solo-peek #stream-volume {
   opacity: 1;
 }
 
