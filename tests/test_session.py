@@ -79,11 +79,11 @@ def test_retiring_keeps_the_emulator_the_state_routes_still_have_to_read() -> No
     assert session.LAST_EXIT["id"] == "sess-1"
 
 
-def test_a_viewer_gets_a_token_that_resolves_back_to_them() -> None:
+async def test_a_viewer_gets_a_token_that_resolves_back_to_them() -> None:
     """A viewer gets a token that resolves back to them."""
     _activate()
 
-    viewer = session.add_viewer("readonly", {"id": 7, "username": "ana"})
+    viewer = await session.add_viewer("readonly", {"id": 7, "username": "ana"})
 
     assert session.find_viewer(viewer["token"]) == viewer
     assert viewer["permission"] == "readonly"
@@ -103,10 +103,10 @@ def test_public_id_for_and_resolve_public_id_round_trip_for_the_controller() -> 
     assert session.resolve_public_id(public_id) == sess["controller_token"]
 
 
-def test_public_id_for_and_resolve_public_id_round_trip_for_a_viewer() -> None:
+async def test_public_id_for_and_resolve_public_id_round_trip_for_a_viewer() -> None:
     """A public id round-trips back to a viewer's token, and vice versa."""
     _activate()
-    viewer = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     public_id = session.public_id_for(viewer["token"])
 
@@ -114,10 +114,10 @@ def test_public_id_for_and_resolve_public_id_round_trip_for_a_viewer() -> None:
     assert session.resolve_public_id(public_id) == viewer["token"]
 
 
-def test_resolve_public_id_returns_none_for_an_unknown_or_missing_id() -> None:
+async def test_resolve_public_id_returns_none_for_an_unknown_or_missing_id() -> None:
     """An unrecognized or missing public id resolves to no token, not a stale match."""
     _activate()
-    session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     assert session.resolve_public_id("not-a-real-id") is None
     assert session.resolve_public_id(None) is None
@@ -140,89 +140,89 @@ def test_public_id_helpers_return_none_when_there_is_no_session() -> None:
     assert session.resolve_public_id("anything") is None
 
 
-def test_rejoining_replaces_the_entry_and_kills_the_old_token() -> None:
+async def test_rejoining_replaces_the_entry_and_kills_the_old_token() -> None:
     """Rejoining replaces the entry and kills the old token."""
     _activate()
-    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    first = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
-    second = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    second = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     assert len(session.SESSION["viewers"]) == 1
     assert second["token"] != first["token"]
     assert session.find_viewer(first["token"]) is None
 
 
-def test_rejoining_clears_the_old_tokens_speaker_and_mk_role() -> None:
+async def test_rejoining_clears_the_old_tokens_speaker_and_mk_role() -> None:
     """A rejoin that replaces a seat clears the old token's role, since it is never disconnected."""
     sess = _activate()
-    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    first = await session.add_viewer("participant", {"id": 7, "username": "ana"})
     sess["designated_speaker"] = first["token"]
     sess["mk_owner_token"] = first["token"]
 
-    session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     assert sess["designated_speaker"] is None
     assert sess["mk_owner_token"] is None
 
 
-def test_rejoining_drops_the_old_tokens_rate_limit_cooldowns() -> None:
+async def test_rejoining_drops_the_old_tokens_rate_limit_cooldowns() -> None:
     """A rejoin that replaces a seat also drops the old token's cooldowns entry."""
     _activate()
-    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    first = await session.add_viewer("participant", {"id": 7, "username": "ana"})
     session.ROOM["cooldowns"][first["token"]] = {"chat": 1.0}
 
-    session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     assert first["token"] not in session.ROOM["cooldowns"]
 
 
-def test_a_rejoin_without_an_id_is_matched_on_the_name() -> None:
+async def test_a_rejoin_without_an_id_is_matched_on_the_name() -> None:
     """A rejoin without an id is matched on the name."""
     _activate()
-    session.add_viewer("participant", {"username": "ana"})
+    await session.add_viewer("participant", {"username": "ana"})
 
-    session.add_viewer("participant", {"username": "ana"})
+    await session.add_viewer("participant", {"username": "ana"})
 
     assert len(session.SESSION["viewers"]) == 1
 
 
-def test_two_different_users_both_keep_a_seat() -> None:
+async def test_two_different_users_both_keep_a_seat() -> None:
     """Two different users both keep a seat."""
     _activate()
-    session.add_viewer("participant", {"id": 7, "username": "ana"})
-    session.add_viewer("participant", {"id": 8, "username": "bo"})
+    await session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.add_viewer("participant", {"id": 8, "username": "bo"})
 
     assert len(session.SESSION["viewers"]) == 2
 
 
-def test_an_anonymous_viewer_still_gets_a_name() -> None:
+async def test_an_anonymous_viewer_still_gets_a_name() -> None:
     """An anonymous viewer still gets a name."""
     _activate()
 
-    viewer = session.add_viewer("participant", None)
+    viewer = await session.add_viewer("participant", None)
 
     assert viewer["username"].startswith("User-")
 
 
-def test_a_seat_past_the_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_seat_past_the_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     """A seat past the cap is refused when nothing is reclaimable."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    session.add_viewer("participant", {"id": 7, "username": "ana"})
+    await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
-    refused = session.add_viewer("participant", {"id": 8, "username": "bo"})
+    refused = await session.add_viewer("participant", {"id": 8, "username": "bo"})
 
     assert refused is None
     assert len(session.SESSION["viewers"]) == 1
 
 
-def test_a_disconnected_anonymous_seat_is_reclaimed_at_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_disconnected_anonymous_seat_is_reclaimed_at_the_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     """A disconnected anonymous seat is reclaimed to seat a new arrival at the cap."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    ghost = session.add_viewer("participant", None)
+    ghost = await session.add_viewer("participant", None)
 
-    arrival = session.add_viewer("participant", None)
+    arrival = await session.add_viewer("participant", None)
 
     assert arrival is not None
     assert arrival["token"] != ghost["token"]
@@ -230,70 +230,70 @@ def test_a_disconnected_anonymous_seat_is_reclaimed_at_the_cap(monkeypatch: pyte
     assert session.find_viewer(ghost["token"]) is None
 
 
-def test_a_connected_anonymous_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_connected_anonymous_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A connected anonymous seat is not reclaimed even at the cap."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    online = session.add_viewer("participant", None)
+    online = await session.add_viewer("participant", None)
     session.ROOM["viewers"][online["token"]] = {"websocket": object()}
 
-    refused = session.add_viewer("participant", None)
+    refused = await session.add_viewer("participant", None)
 
     assert refused is None
     assert session.find_viewer(online["token"]) is not None
 
 
-def test_a_named_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_named_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A named user's seat is never reclaimed, even disconnected and at the cap."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    named = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    named = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
-    refused = session.add_viewer("participant", None)
+    refused = await session.add_viewer("participant", None)
 
     assert refused is None
     assert session.find_viewer(named["token"]) is not None
 
 
-def test_a_named_by_username_only_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_named_by_username_only_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
     """A user with only a username and no id is still named, not anonymous, so its seat holds at the cap."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    named = session.add_viewer("participant", {"username": "ana"})
+    named = await session.add_viewer("participant", {"username": "ana"})
 
-    refused = session.add_viewer("participant", None)
+    refused = await session.add_viewer("participant", None)
 
     assert refused is None
     assert session.find_viewer(named["token"]) is not None
 
 
-def test_reclaiming_a_seat_clears_its_speaker_and_mk_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_reclaiming_a_seat_clears_its_speaker_and_mk_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reclaiming a seat that was still wired up as speaker or MK owner clears those session fields."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     sess = _activate()
-    ghost = session.add_viewer("participant", None)
+    ghost = await session.add_viewer("participant", None)
     sess["designated_speaker"] = ghost["token"]
     sess["mk_owner_token"] = ghost["token"]
 
-    session.add_viewer("participant", None)
+    await session.add_viewer("participant", None)
 
     assert sess["designated_speaker"] is None
     assert sess["mk_owner_token"] is None
 
 
-def test_reclaiming_a_seat_leaves_another_members_speaker_and_mk_role_alone(
+async def test_reclaiming_a_seat_leaves_another_members_speaker_and_mk_role_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Reclaiming an idle seat does not clear the speaker or MK role of a different, surviving member."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
     sess = _activate()
-    holder = session.add_viewer("participant", None)
-    ghost = session.add_viewer("participant", None)
+    holder = await session.add_viewer("participant", None)
+    ghost = await session.add_viewer("participant", None)
     ghost["last_seen"] = 0.0  # guarantee ghost, not holder, is the idle one reclaimed
     sess["designated_speaker"] = holder["token"]
     sess["mk_owner_token"] = holder["token"]
 
-    session.add_viewer("participant", None)
+    await session.add_viewer("participant", None)
 
     assert session.find_viewer(ghost["token"]) is None
     assert session.find_viewer(holder["token"]) is not None
@@ -301,65 +301,65 @@ def test_reclaiming_a_seat_leaves_another_members_speaker_and_mk_role_alone(
     assert sess["mk_owner_token"] == holder["token"]
 
 
-def test_the_longest_idle_anonymous_seat_is_reclaimed_first(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_the_longest_idle_anonymous_seat_is_reclaimed_first(monkeypatch: pytest.MonkeyPatch) -> None:
     """The longest-idle anonymous seat is reclaimed first, regardless of mint order."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
     _activate()
-    minted_first = session.add_viewer("participant", None)
-    minted_second = session.add_viewer("participant", None)
+    minted_first = await session.add_viewer("participant", None)
+    minted_second = await session.add_viewer("participant", None)
     minted_first["last_seen"] = 200.0
     minted_second["last_seen"] = 100.0  # idle longer despite minting later
 
-    session.add_viewer("participant", None)
+    await session.add_viewer("participant", None)
 
     assert session.find_viewer(minted_first["token"]) is not None
     assert session.find_viewer(minted_second["token"]) is None
 
 
-def test_reclaiming_a_seat_drops_its_rate_limit_cooldowns(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_reclaiming_a_seat_drops_its_rate_limit_cooldowns(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reclaiming a seat also drops its cooldowns entry, so it does not linger for the rest of the session."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    ghost = session.add_viewer("participant", None)
+    ghost = await session.add_viewer("participant", None)
     session.ROOM["cooldowns"][ghost["token"]] = {"chat": 1.0}
 
-    session.add_viewer("participant", None)
+    await session.add_viewer("participant", None)
 
     assert ghost["token"] not in session.ROOM["cooldowns"]
 
 
-def test_a_freshly_minted_seat_is_not_reclaimed_ahead_of_a_long_idle_one(
+async def test_a_freshly_minted_seat_is_not_reclaimed_ahead_of_a_long_idle_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A long-idle seat is reclaimed before one just minted, even though the fresh one hasn't connected."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
     _activate()
-    long_idle = session.add_viewer("participant", None)
+    long_idle = await session.add_viewer("participant", None)
     long_idle["last_seen"] = 100.0
 
-    fresh = session.add_viewer("participant", None)
-    session.add_viewer("participant", None)
+    fresh = await session.add_viewer("participant", None)
+    await session.add_viewer("participant", None)
 
     assert session.find_viewer(long_idle["token"]) is None
     assert session.find_viewer(fresh["token"]) is not None
 
 
-def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:
     """A rejoin at the cap still replaces its own seat, since it frees the seat it re-takes."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
-    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    first = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
-    second = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    second = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     assert second is not None
     assert second["token"] != first["token"]
 
 
-def test_the_controller_holds_mouse_and_keyboard_until_it_is_handed_over() -> None:
+async def test_the_controller_holds_mouse_and_keyboard_until_it_is_handed_over() -> None:
     """The controller holds mouse and keyboard until it is handed over."""
     sess = _activate()
-    viewer = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
 
     tokens = selkies.build_token_map(sess)
     assert tokens[sess["controller_token"]]["mk_control"] is True
@@ -371,10 +371,10 @@ def test_the_controller_holds_mouse_and_keyboard_until_it_is_handed_over() -> No
     assert tokens[viewer["token"]]["mk_control"] is True
 
 
-def test_the_token_map_carries_the_gamepad_slot_selkies_routes_on() -> None:
+async def test_the_token_map_carries_the_gamepad_slot_selkies_routes_on() -> None:
     """The token map carries the gamepad slot selkies routes on."""
     sess = _activate()
-    viewer = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
     viewer["slot"] = 2
 
     tokens = selkies.build_token_map(sess)

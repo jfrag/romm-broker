@@ -484,7 +484,7 @@ async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[
             status_code=422, detail="permission must be participant or readonly"
         )
 
-    viewer = session.add_viewer(permission, user)
+    viewer = await session.add_viewer(permission, user)
     if viewer is None:
         raise HTTPException(status_code=429, detail="room is full")
     await selkies.push_tokens(sess)

@@ -238,13 +238,18 @@ def find_invite(token: str) -> Optional[str]:
     return None
 
 
-def _release_seat(token: str) -> None:
-    """Drop a removed seat's rate-limit cooldowns and clear any room role it still held.
+async def _release_seat(token: str) -> None:
+    """Fully retire a seat leaving `SESSION["viewers"]` outside the normal disconnect path.
 
-    Called for a seat leaving `SESSION["viewers"]` outside the normal disconnect
-    path (a same-user rejoin replacing it, or the reclaim of a stale seat), both
-    of which can happen while the seat still holds the speaker or MK role from
-    the unvalidated set_designated_speaker/assign_mk actions.
+    Covers a same-user rejoin replacing the seat and the reclaim of a stale
+    one. Either can leave the token still holding the speaker or MK role (set
+    by the unvalidated set_designated_speaker/assign_mk actions) or a
+    cooldowns entry, both cleared here. A rejoin can also evict a seat whose
+    socket is still connected (a second tab, a reload racing the old tab's
+    close): that connection is force-closed and dropped from the room so it
+    stops relaying room traffic on a token `find_viewer` no longer recognizes.
+    Its own disconnect cleanup is skipped as a result, since the seat it would
+    have acted on is already gone here.
 
     Args:
         token: The removed seat's token.
@@ -254,13 +259,22 @@ def _release_seat(token: str) -> None:
         SESSION["designated_speaker"] = None
     if SESSION.get("mk_owner_token") == token:
         SESSION["mk_owner_token"] = None
+    live = ROOM["viewers"].pop(token, None)
+    if live is not None:
+        try:
+            await live["websocket"].close(code=1008)
+        except Exception:
+            log.debug("room socket for a released seat was already gone")
 
 
-def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """Mint a viewer token and add the viewer to the active session.
 
     A re-join by the same user (matched by id, else username) replaces the old
-    entry and invalidates its token.
+    entry and invalidates its token. If that old seat still has a live room
+    connection (a second tab, a reload racing the first tab's close), that
+    connection is force-closed rather than left running on a token nothing
+    recognizes anymore.
 
     Args:
         permission: The viewer's permission level, e.g. `readonly`.
@@ -290,9 +304,10 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
     SESSION["viewers"] = [v for v in SESSION.get("viewers", []) if not _same_user(v)]
     # A rejoining seat's old token is invalidated above but was never
     # disconnected, so it can still hold the speaker/MK role or a cooldowns
-    # entry that would otherwise dangle on a token nothing can use anymore.
+    # entry that would otherwise dangle on a token nothing can use anymore,
+    # and its socket, if still open, is still relaying room traffic.
     for old in replaced:
-        _release_seat(old["token"])
+        await _release_seat(old["token"])
 
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
         # A seat lives for the whole session by design (its invite link stays
@@ -319,9 +334,8 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
         SESSION["viewers"].remove(stale)
         # The reclaimable filter above already proved stale's token is offline,
         # so if it still holds the speaker or MK role that role has to be
-        # cleared here: normal disconnect cleanup already ran once for it and
-        # will not run again.
-        _release_seat(stale["token"])
+        # cleared here.
+        await _release_seat(stale["token"])
 
     viewer = {
         "token": secrets.token_urlsafe(16),

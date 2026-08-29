@@ -248,7 +248,7 @@ def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
         # A second arrival at the cap goes through the real reclaim path in
         # add_viewer, evicting `viewer`'s seat: it is still the only anonymous,
         # not-yet-online candidate at this point in the handshake.
-        session.add_viewer("participant", None)
+        await session.add_viewer("participant", None)
 
     monkeypatch.setattr(room.WebSocket, "accept", accept_then_reclaim)
 
@@ -342,6 +342,45 @@ def test_controller_can_assign_mk_to_a_viewer_using_its_public_id(
         )
 
         assert any(u["publicId"] == viewer_public_id and u["has_mk"] for u in message["viewers"])
+
+
+def test_a_rejoin_closes_the_old_seats_still_connected_socket(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A same-user rejoin closes the old seat's socket rather than leaving it live on a dead token.
+
+    Unlike a same-token reconnect, a rejoin mints a new token for a different seat: nothing else
+    would ever close the old one, so it would otherwise keep relaying room traffic on a token
+    `find_viewer` no longer recognizes.
+    """
+    controller = _activate(client, broker_dirs)
+    user = {"id": 7, "username": "ana"}
+    first = (
+        client.post(f"{API}/session/join", json={"user": user, "permission": "participant"})
+        .json()["url"]
+        .split("token=")[1]
+    )
+
+    with _connect(client, controller) as host, _connect(client, first) as old:
+        second = (
+            client.post(f"{API}/session/join", json={"user": user, "permission": "participant"})
+            .json()["url"]
+            .split("token=")[1]
+        )
+        assert second != first
+        second_public_id = session.find_viewer(second)["public_id"]
+
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            old.receive_json()
+        assert excinfo.value.code == 1008
+        assert session.find_viewer(first) is None
+
+        # The host and the new seat are the only two members left; the evicted
+        # seat is gone from the roster with no departure notice for it.
+        message = _wait_for_state(
+            host, lambda m: any(u["publicId"] == second_public_id for u in m["viewers"])
+        )
+        assert len(message["viewers"]) == 2
 
 
 def test_a_new_connection_on_the_same_token_replaces_the_old_one(
