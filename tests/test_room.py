@@ -255,6 +255,8 @@ def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
             conn.receive_json()
         assert excinfo.value.code == 1008
 
+    assert session.find_viewer(viewer) is None
+
 
 def test_a_new_connection_on_the_same_token_replaces_the_old_one(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]

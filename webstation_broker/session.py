@@ -30,7 +30,7 @@ Shape:
   "id", "active", "created_at",
   "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
-  "controller_token",
+  "controller_token", "invites": {"participant": str, "readonly": str},
   "viewers": [{"token","user_id","anonymous","last_seen","slot","mk_control",
                "username","permission"}...],
   "controller_slot", "mk_owner_token", "designated_speaker",
@@ -191,6 +191,24 @@ def find_invite(token: str) -> Optional[str]:
     return None
 
 
+def _release_seat(token: str) -> None:
+    """Drop a removed seat's rate-limit cooldowns and clear any room role it still held.
+
+    Called for a seat leaving `SESSION["viewers"]` outside the normal disconnect
+    path (a same-user rejoin replacing it, or the reclaim of a stale seat), both
+    of which can happen while the seat still holds the speaker or MK role from
+    the unvalidated set_designated_speaker/assign_mk actions.
+
+    Args:
+        token: The removed seat's token.
+    """
+    ROOM["cooldowns"].pop(token, None)
+    if SESSION.get("designated_speaker") == token:
+        SESSION["designated_speaker"] = None
+    if SESSION.get("mk_owner_token") == token:
+        SESSION["mk_owner_token"] = None
+
+
 def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
     """Mint a viewer token and add the viewer to the active session.
 
@@ -221,7 +239,13 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
             return v["user_id"] == user["id"]
         return bool(username) and v.get("username") == username
 
+    replaced = [v for v in SESSION.get("viewers", []) if _same_user(v)]
     SESSION["viewers"] = [v for v in SESSION.get("viewers", []) if not _same_user(v)]
+    # A rejoining seat's old token is invalidated above but was never
+    # disconnected, so it can still hold the speaker/MK role or a cooldowns
+    # entry that would otherwise dangle on a token nothing can use anymore.
+    for old in replaced:
+        _release_seat(old["token"])
 
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
         # A seat lives for the whole session by design (its invite link stays
@@ -234,7 +258,7 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
         reclaimable = [
             v for v in SESSION["viewers"] if v.get("anonymous") and v["token"] not in online_tokens
         ]
-        stale = min(reclaimable, key=lambda v: v.get("last_seen", 0), default=None)
+        stale = min(reclaimable, key=lambda v: v["last_seen"], default=None)
         if stale is None:
             log.warning(
                 "session: refusing new viewer, room is at its %d-seat cap",
@@ -246,16 +270,11 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
             stale.get("username"),
         )
         SESSION["viewers"].remove(stale)
-        ROOM["cooldowns"].pop(stale["token"], None)
         # The reclaimable filter above already proved stale's token is offline,
-        # so if it still holds the speaker or MK role (set by the unvalidated
-        # set_designated_speaker/assign_mk actions, or left over from before it
-        # went offline) that role has to be cleared here: normal disconnect
-        # cleanup already ran once and will not run again for this token.
-        if SESSION.get("designated_speaker") == stale["token"]:
-            SESSION["designated_speaker"] = None
-        if SESSION.get("mk_owner_token") == stale["token"]:
-            SESSION["mk_owner_token"] = None
+        # so if it still holds the speaker or MK role that role has to be
+        # cleared here: normal disconnect cleanup already ran once for it and
+        # will not run again.
+        _release_seat(stale["token"])
 
     viewer = {
         "token": secrets.token_urlsafe(16),

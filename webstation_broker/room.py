@@ -104,10 +104,6 @@ async def room_websocket(websocket: WebSocket) -> None:
         # is a leftover of that and is closed rather than left to share the seat.
         previous = session.ROOM["viewers"].get(token)
         session.ROOM["viewers"][token] = connection_info
-        # A connected seat is excluded from reclaim regardless of this value,
-        # but stamping it here too keeps last_seen meaning "last known activity"
-        # instead of freezing at mint time for a seat that has since connected.
-        viewer_ref["last_seen"] = time.time()
         if previous is not None:
             try:
                 await previous["websocket"].close(code=1000)

@@ -102,6 +102,30 @@ def test_rejoining_replaces_the_entry_and_kills_the_old_token() -> None:
     assert session.find_viewer(first["token"]) is None
 
 
+def test_rejoining_clears_the_old_tokens_speaker_and_mk_role() -> None:
+    """A rejoin that replaces a seat clears the old token's role, since it is never disconnected."""
+    sess = _activate()
+    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    sess["designated_speaker"] = first["token"]
+    sess["mk_owner_token"] = first["token"]
+
+    session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    assert sess["designated_speaker"] is None
+    assert sess["mk_owner_token"] is None
+
+
+def test_rejoining_drops_the_old_tokens_rate_limit_cooldowns() -> None:
+    """A rejoin that replaces a seat also drops the old token's cooldowns entry."""
+    _activate()
+    first = session.add_viewer("participant", {"id": 7, "username": "ana"})
+    session.ROOM["cooldowns"][first["token"]] = {"chat": 1.0}
+
+    session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    assert first["token"] not in session.ROOM["cooldowns"]
+
+
 def test_a_rejoin_without_an_id_is_matched_on_the_name() -> None:
     """A rejoin without an id is matched on the name."""
     _activate()
