@@ -31,7 +31,8 @@ Shape:
   "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
   "controller_token",
-  "viewers": [{"token","slot","mk_control","username","permission"}...],
+  "viewers": [{"token","user_id","anonymous","last_seen","slot","mk_control",
+               "username","permission"}...],
   "controller_slot", "mk_owner_token", "designated_speaker",
   "save_baseline": float, "emulator_obj": Emulator,
 }
@@ -225,30 +226,32 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
         # A seat lives for the whole session by design (its invite link stays
         # valid after the tab closes), so an anonymous arrival never frees its
-        # own slot on disconnect. Reclaim the anonymous seat that has gone
-        # longest without a live socket (never-connected first) rather than
-        # treat every seat ever minted as permanent. "anonymous" mirrors
-        # _same_user above: a seat with neither an id nor a username to
-        # identify it, not merely one with no id.
+        # own slot on disconnect. Reclaim the anonymous seat idle longest
+        # rather than treat every seat ever minted as permanent. "anonymous"
+        # is fixed at creation from the same fields _same_user matches on, so
+        # a later self-chosen nickname can't exempt a seat from reclaim.
         online_tokens = set(ROOM.get("viewers", {}).keys())
         reclaimable = [
             v for v in SESSION["viewers"] if v.get("anonymous") and v["token"] not in online_tokens
         ]
-        stale = min(
-            reclaimable,
-            key=lambda v: (v.get("last_seen") is not None, v.get("last_seen") or 0),
-            default=None,
-        )
+        stale = min(reclaimable, key=lambda v: v.get("last_seen", 0), default=None)
         if stale is None:
             log.warning(
                 "session: refusing new viewer, room is at its %d-seat cap",
                 settings.MAX_ROOM_VIEWERS,
             )
             return None
-        log.info("session: reclaiming a disconnected anonymous seat for a new arrival")
+        log.info(
+            "session: reclaiming disconnected anonymous seat %r for a new arrival",
+            stale.get("username"),
+        )
         SESSION["viewers"].remove(stale)
-        # Mirrors the disconnect cleanup in room.py: a token that no longer
-        # holds a seat must not stay wired up as the speaker or MK owner.
+        ROOM["cooldowns"].pop(stale["token"], None)
+        # The reclaimable filter above already proved stale's token is offline,
+        # so if it still holds the speaker or MK role (set by the unvalidated
+        # set_designated_speaker/assign_mk actions, or left over from before it
+        # went offline) that role has to be cleared here: normal disconnect
+        # cleanup already ran once and will not run again for this token.
         if SESSION.get("designated_speaker") == stale["token"]:
             SESSION["designated_speaker"] = None
         if SESSION.get("mk_owner_token") == stale["token"]:
@@ -258,7 +261,7 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
         "token": secrets.token_urlsafe(16),
         "user_id": user.get("id"),
         "anonymous": anonymous,
-        "last_seen": None,
+        "last_seen": time.time(),
         "slot": None,
         "mk_control": False,
         "username": username or f"User-{random.randint(100, 999)}",

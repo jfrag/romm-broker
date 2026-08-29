@@ -207,35 +207,67 @@ def test_reclaiming_a_seat_clears_its_speaker_and_mk_ownership(monkeypatch: pyte
     assert sess["mk_owner_token"] is None
 
 
-def test_the_longest_idle_anonymous_seat_is_reclaimed_first(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Among several disconnected anonymous seats, the one idle longest is reclaimed, not the first minted."""
-    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
-    _activate()
-    older = session.add_viewer("participant", None)
-    newer = session.add_viewer("participant", None)
-    older["last_seen"] = 200.0
-    newer["last_seen"] = 100.0
-
-    session.add_viewer("participant", None)
-
-    assert session.find_viewer(older["token"]) is not None
-    assert session.find_viewer(newer["token"]) is None
-
-
-def test_a_never_connected_seat_is_reclaimed_before_a_disconnected_one(
+def test_reclaiming_a_seat_leaves_another_members_speaker_and_mk_role_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A seat that never connected (no last_seen) is reclaimed before one that has since disconnected."""
+    """Reclaiming an idle seat does not clear the speaker or MK role of a different, surviving member."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
-    _activate()
-    never_connected = session.add_viewer("participant", None)
-    disconnected = session.add_viewer("participant", None)
-    disconnected["last_seen"] = 100.0
+    sess = _activate()
+    holder = session.add_viewer("participant", None)
+    ghost = session.add_viewer("participant", None)
+    ghost["last_seen"] = 0.0  # guarantee ghost, not holder, is the idle one reclaimed
+    sess["designated_speaker"] = holder["token"]
+    sess["mk_owner_token"] = holder["token"]
 
     session.add_viewer("participant", None)
 
-    assert session.find_viewer(never_connected["token"]) is None
-    assert session.find_viewer(disconnected["token"]) is not None
+    assert session.find_viewer(ghost["token"]) is None
+    assert session.find_viewer(holder["token"]) is not None
+    assert sess["designated_speaker"] == holder["token"]
+    assert sess["mk_owner_token"] == holder["token"]
+
+
+def test_the_longest_idle_anonymous_seat_is_reclaimed_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The longest-idle anonymous seat is reclaimed first, regardless of mint order."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
+    _activate()
+    minted_first = session.add_viewer("participant", None)
+    minted_second = session.add_viewer("participant", None)
+    minted_first["last_seen"] = 200.0
+    minted_second["last_seen"] = 100.0  # idle longer despite minting later
+
+    session.add_viewer("participant", None)
+
+    assert session.find_viewer(minted_first["token"]) is not None
+    assert session.find_viewer(minted_second["token"]) is None
+
+
+def test_reclaiming_a_seat_drops_its_rate_limit_cooldowns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reclaiming a seat also drops its cooldowns entry, so it does not linger for the rest of the session."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    ghost = session.add_viewer("participant", None)
+    session.ROOM["cooldowns"][ghost["token"]] = {"chat": 1.0}
+
+    session.add_viewer("participant", None)
+
+    assert ghost["token"] not in session.ROOM["cooldowns"]
+
+
+def test_a_freshly_minted_seat_is_not_reclaimed_ahead_of_a_long_idle_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A long-idle seat is reclaimed before one just minted, even though the fresh one hasn't connected."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
+    _activate()
+    long_idle = session.add_viewer("participant", None)
+    long_idle["last_seen"] = 100.0
+
+    fresh = session.add_viewer("participant", None)
+    session.add_viewer("participant", None)
+
+    assert session.find_viewer(long_idle["token"]) is None
+    assert session.find_viewer(fresh["token"]) is not None
 
 
 def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:

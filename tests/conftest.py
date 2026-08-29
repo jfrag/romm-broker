@@ -39,11 +39,13 @@ def clean_session() -> Iterator[None]:
     session.LAST_EXIT = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
+    session.ROOM["cooldowns"] = {}
     yield
     session.SESSION = None
     session.LAST_EXIT = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
+    session.ROOM["cooldowns"] = {}
 
 
 @pytest.fixture(autouse=True)

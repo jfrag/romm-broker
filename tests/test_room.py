@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
-from webstation_broker import room, session
+from webstation_broker import room, session, settings
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -221,6 +221,39 @@ def test_a_disconnecting_viewer_releases_its_gamepad_but_keeps_its_seat(
     seat = session.find_viewer(viewer)
     assert seat is not None
     assert seat["slot"] is None
+
+
+def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seat reclaimed by a concurrent join while accept() is still pending closes the stale socket.
+
+    accept() is an await point: a join at the room cap can reclaim this very seat while the
+    handshake is in flight, so the seat is re-checked after accept() rather than trusting the lookup
+    made before it.
+    """
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    original_accept = room.WebSocket.accept
+
+    async def accept_then_reclaim(self: object, *args: object, **kwargs: object) -> None:
+        await original_accept(self, *args, **kwargs)
+        # A second arrival at the cap goes through the real reclaim path in
+        # add_viewer, evicting `viewer`'s seat: it is still the only anonymous,
+        # not-yet-online candidate at this point in the handshake.
+        session.add_viewer("participant", None)
+
+    monkeypatch.setattr(room.WebSocket, "accept", accept_then_reclaim)
+
+    with client.websocket_connect(f"{PREFIX}/ws/room?token={viewer}") as conn:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            conn.receive_json()
+        assert excinfo.value.code == 1008
 
 
 def test_a_new_connection_on_the_same_token_replaces_the_old_one(
