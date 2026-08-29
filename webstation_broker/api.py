@@ -1427,8 +1427,10 @@ async def context(
 
     Returns:
         The room's bootstrap context: `sessionId`, `userRole` (`controller` or
-        `viewer`), `userToken`, `userPermission`, `username`, `gameName`,
-        `controllerName`, `multiplayer` and the stream `iframeSrc`.
+        `viewer`), `userToken`, `userPublicId` (the caller's own non-sensitive
+        id, for cross-referencing itself in `state_update` broadcasts),
+        `userPermission`, `username`, `gameName`, `controllerName`,
+        `multiplayer` and the stream `iframeSrc`.
 
     Raises:
         HTTPException: 409 when no session is active; 401 when neither token is
@@ -1470,6 +1472,7 @@ async def context(
         "sessionId": sess["id"],
         "userRole": role,
         "userToken": token,
+        "userPublicId": session.public_id_for(token),
         "userPermission": permission if role == "viewer" else "participant",
         "username": username,
         "gameName": (sess.get("rom") or {}).get("name")

@@ -88,6 +88,56 @@ def test_a_viewer_gets_a_token_that_resolves_back_to_them() -> None:
     assert session.find_viewer(viewer["token"]) == viewer
     assert viewer["permission"] == "readonly"
     assert viewer["username"] == "ana"
+    assert viewer["public_id"]
+    assert viewer["public_id"] != viewer["token"]
+
+
+def test_public_id_for_and_resolve_public_id_round_trip_for_the_controller() -> None:
+    """A public id round-trips back to the controller's token, and vice versa."""
+    sess = _activate()
+
+    public_id = session.public_id_for(sess["controller_token"])
+
+    assert public_id == sess["controller_public_id"]
+    assert public_id != sess["controller_token"]
+    assert session.resolve_public_id(public_id) == sess["controller_token"]
+
+
+def test_public_id_for_and_resolve_public_id_round_trip_for_a_viewer() -> None:
+    """A public id round-trips back to a viewer's token, and vice versa."""
+    _activate()
+    viewer = session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    public_id = session.public_id_for(viewer["token"])
+
+    assert public_id == viewer["public_id"]
+    assert session.resolve_public_id(public_id) == viewer["token"]
+
+
+def test_resolve_public_id_returns_none_for_an_unknown_or_missing_id() -> None:
+    """An unrecognized or missing public id resolves to no token, not a stale match."""
+    _activate()
+    session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    assert session.resolve_public_id("not-a-real-id") is None
+    assert session.resolve_public_id(None) is None
+
+
+def test_public_id_for_returns_none_for_an_unknown_token() -> None:
+    """An unrecognized token has no public id to hand back."""
+    _activate()
+
+    assert session.public_id_for("not-a-real-token") is None
+
+
+def test_public_id_helpers_return_none_when_there_is_no_session() -> None:
+    """Both public id helpers return None rather than raising with no active session."""
+    sess = _activate()
+    controller_token = sess["controller_token"]
+    session.retire_session()
+
+    assert session.public_id_for(controller_token) is None
+    assert session.resolve_public_id("anything") is None
 
 
 def test_rejoining_replaces_the_entry_and_kills_the_old_token() -> None:

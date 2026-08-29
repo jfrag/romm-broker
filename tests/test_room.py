@@ -1,5 +1,6 @@
 """Room websocket: oversized-frame rejection, chat rate limiting, and video/audio/cursor state validation."""
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -211,11 +212,12 @@ def test_a_disconnecting_viewer_releases_its_gamepad_but_keeps_its_seat(
     controller = _activate(client, broker_dirs)
     viewer = _invite(client, controller)
 
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
     with _connect(client, controller) as host, _connect(client, viewer) as guest:
-        host.send_json({"action": "assign_slot", "viewer_token": viewer, "slot": 2})
+        host.send_json({"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": 2})
         _wait_for_state(
             guest,
-            lambda m: any(u["token"] == viewer and u["slot"] == 2 for u in m["viewers"]),
+            lambda m: any(u["publicId"] == viewer_public_id and u["slot"] == 2 for u in m["viewers"]),
         )
 
     seat = session.find_viewer(viewer)
@@ -256,6 +258,90 @@ def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
         assert excinfo.value.code == 1008
 
     assert session.find_viewer(viewer) is None
+
+
+def test_state_update_never_carries_a_raw_token(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """state_update identifies members by publicId, never by their real bearer token.
+
+    Every room member (including anonymous viewers) receives this broadcast, so a raw token in it
+    would hand out the credential needed to reconnect as, or impersonate, anyone else in the room.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer):
+        # The viewer's own _connect already drained its join broadcast; the host's
+        # queue still holds the state_update that announced the viewer, now with
+        # both members in it.
+        message = _wait_for_state(host, lambda m: len(m["viewers"]) == 2)
+
+        assert controller not in json.dumps(message)
+        assert viewer not in json.dumps(message)
+        for user in message["viewers"]:
+            assert "token" not in user
+            assert user["publicId"]
+
+
+def test_resolution_update_and_control_messages_use_public_id_not_token(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """resolution_update and control messages identify the sender by public id, not raw token."""
+    controller = _activate(client, broker_dirs)
+    controller_public_id = session.public_id_for(controller)
+
+    with _connect(client, controller) as conn:
+        conn.send_json({"action": "client_resolution", "width": 1280, "height": 720})
+        resolution_message = conn.receive_json()
+
+        assert resolution_message["type"] == "resolution_update"
+        assert resolution_message["public_id"] == controller_public_id
+        assert controller not in json.dumps(resolution_message)
+
+        conn.send_json({"action": "video_state", "state": 1})
+        control_message = conn.receive_json()
+
+        assert control_message["payload"]["sender_public_id"] == controller_public_id
+        assert controller not in json.dumps(control_message)
+
+
+def test_designated_speaker_is_reported_as_a_public_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The controller can name a viewer as designated speaker using only its public id.
+
+    The controller never learns the viewer's real token (see test_state_update_never_carries_a_raw_token),
+    so this is the only handle it has to target the viewer with.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "set_designated_speaker", "public_id": viewer_public_id})
+        message = _wait_for_state(guest, lambda m: m["designated_speaker"] == viewer_public_id)
+
+        assert message["designated_speaker"] == viewer_public_id
+        assert viewer not in json.dumps(message)
+
+
+def test_controller_can_assign_mk_to_a_viewer_using_its_public_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The controller can hand mouse/keyboard control to a viewer using only its public id."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "assign_mk", "public_id": viewer_public_id})
+        message = _wait_for_state(
+            guest,
+            lambda m: any(u["publicId"] == viewer_public_id and u["has_mk"] for u in m["viewers"]),
+        )
+
+        assert any(u["publicId"] == viewer_public_id and u["has_mk"] for u in message["viewers"])
 
 
 def test_a_new_connection_on_the_same_token_replaces_the_old_one(

@@ -8,7 +8,12 @@ Binary wire format:
 [9..]  payload
 ```
 
-The publicId indirection keeps real tokens out of the media byte stream.
+The publicId indirection keeps real tokens out of the media byte stream. It
+is a per-connection id (`connection_info["public_id"]` below), regenerated
+on every reconnect and sent to the room over `state_update` as `mediaId`;
+that is distinct from a seat's persistent `public_id` in `session.py`, which
+`state_update` sends as `publicId` and which survives reconnects for the
+seat's whole life.
 """
 
 import json
@@ -132,16 +137,21 @@ async def room_websocket(websocket: WebSocket) -> None:
                     return
                 data = json.loads(message["text"])
                 action = data.get("action")
-                data["sender_token"] = token
+                # Clients only ever learn public ids for other members (see
+                # session.broadcast_state), so a target named from the wire is
+                # a public id and has to be resolved back to its real token.
+                data["sender_public_id"] = session.public_id_for(token)
 
                 if action == "assign_slot" and is_controller:
-                    await session.handle_assign_slot(data.get("viewer_token"), data.get("slot"))
+                    target_token = session.resolve_public_id(data.get("viewer_public_id"))
+                    await session.handle_assign_slot(target_token, data.get("slot"))
 
                 elif action == "assign_mk" and is_controller:
-                    await session.handle_assign_mk(data.get("token"))
+                    target_token = session.resolve_public_id(data.get("public_id"))
+                    await session.handle_assign_mk(target_token)
 
                 elif action == "set_designated_speaker" and is_controller:
-                    sess["designated_speaker"] = data.get("token")
+                    sess["designated_speaker"] = session.resolve_public_id(data.get("public_id"))
                     await session.broadcast_state()
 
                 elif action == "set_username" and is_viewer:
@@ -195,11 +205,11 @@ async def room_websocket(websocket: WebSocket) -> None:
                 elif action in ("video_state", "audio_state", "force_cursor_render"):
                     # Self-reported (webcam/mic) or self-triggered (gaming-mode
                     # cursor baking by a non-controller viewer, so this can't be
-                    # gated to the controller); sender_token above already stops
-                    # a client from spoofing another user's identity in it. The
-                    # only thing left to enforce is that state is actually a
-                    # boolean flag, not an arbitrary value forwarded verbatim
-                    # into the Selkies input channel.
+                    # gated to the controller); sender_public_id above already
+                    # stops a client from spoofing another user's identity in
+                    # it. The only thing left to enforce is that state is
+                    # actually a boolean flag, not an arbitrary value forwarded
+                    # verbatim into the Selkies input channel.
                     if data.get("state") in (0, 1):
                         await session.broadcast_to_room({"type": "control", "payload": data})
 
@@ -212,7 +222,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                         await session.broadcast_to_room(
                             {
                                 "type": "resolution_update",
-                                "token": token,
+                                "public_id": session.public_id_for(token),
                                 "width": width,
                                 "height": height,
                             }

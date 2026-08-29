@@ -1286,10 +1286,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     let mkIcon = null;
     const GAMEPAD_COUNT = 4;
     let currentUserState = [];
-    let publicIdToTokenMap = {};
+    let mediaIdToPublicIdMap = {};
     let currentDesignatedSpeaker = null;
-    let localPublicId = null;
-    let localPublicIdBytes = null;
+    let localMediaId = null;
+    let localMediaIdBytes = null;
     const textEncoder = new TextEncoder();
     let clientResolutions = {};
     let isResolutionLocked = false;
@@ -1297,19 +1297,19 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const applyAutoResolution = () => {
         if (COLLAB_DATA.userRole !== 'controller') return;
-        const targetToken = currentMkOwner || COLLAB_DATA.userToken;
+        const targetPublicId = currentMkOwner || COLLAB_DATA.userPublicId;
         const iframe = document.getElementById('session-frame');
         if (!iframe || !iframe.contentWindow) return;
 
         if (isResolutionLocked) return;
 
-        if (targetToken === COLLAB_DATA.userToken) {
+        if (targetPublicId === COLLAB_DATA.userPublicId) {
             console.log("[Controller] MK owner is controller. Resetting resolution to window.");
             iframe.contentWindow.postMessage({ type: 'resetResolutionToWindow' }, window.location.origin);
         } else {
-            const res = clientResolutions[targetToken];
+            const res = clientResolutions[targetPublicId];
             if (res) {
-                console.log(`[Controller] Auto-syncing resolution to MK owner (${targetToken}): ${res.width}x${res.height}`);
+                console.log(`[Controller] Auto-syncing resolution to MK owner (${targetPublicId}): ${res.width}x${res.height}`);
                 iframe.contentWindow.postMessage({ type: 'setManualResolution', width: res.width, height: res.height }, window.location.origin);
             }
         }
@@ -1340,7 +1340,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const inviteTile = document.getElementById('invite-tile');
     const inviteBtn = document.getElementById('invite-btn');
 
-    localContainer.dataset.userToken = COLLAB_DATA.userToken;
+    localContainer.dataset.userPublicId = COLLAB_DATA.userPublicId;
 
     const initNotificationAudio = () => {
         if (notificationAudioCtx) return;
@@ -1657,12 +1657,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         videoEncoder = new VideoEncoder({
             output: (chunk, meta) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN || !localPublicIdBytes) return;
+                if (!ws || ws.readyState !== WebSocket.OPEN || !localMediaIdBytes) return;
 
                 if (meta && meta.decoderConfig && meta.decoderConfig.description) {
                     const description = meta.decoderConfig.description;
                     const message = new Uint8Array(8 + 1 + description.byteLength);
-                    message.set(localPublicIdBytes, 0);
+                    message.set(localMediaIdBytes, 0);
                     message[8] = MSG_TYPE.VIDEO_CONFIG;
                     message.set(new Uint8Array(description), 9);
                     ws.send(message.buffer);
@@ -1672,7 +1672,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                 const isKeyFrame = chunk.type === 'key';
                 const chunkData = new Uint8Array(8 + chunk.byteLength + 2);
-                chunkData.set(localPublicIdBytes, 0);
+                chunkData.set(localMediaIdBytes, 0);
                 chunkData[8] = MSG_TYPE.VIDEO_FRAME;
                 chunkData[9] = isKeyFrame ? 0x01 : 0x00;
                 chunk.copyTo(chunkData.subarray(10));
@@ -1734,7 +1734,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             processor.connect(ctx.destination);
 
             processor.onaudioprocess = (e) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN || !isMicOn || !localPublicIdBytes) return;
+                if (!ws || ws.readyState !== WebSocket.OPEN || !isMicOn || !localMediaIdBytes) return;
 
                 const inputData = e.inputBuffer.getChannelData(0);
                 const pcm16 = new Int16Array(inputData.length);
@@ -1745,7 +1745,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
 
                 const chunkData = new Uint8Array(9 + pcm16.byteLength);
-                chunkData.set(localPublicIdBytes, 0);
+                chunkData.set(localMediaIdBytes, 0);
                 chunkData[8] = MSG_TYPE.PCM_FRAME;
                 chunkData.set(new Uint8Array(pcm16.buffer), 9);
                 ws.send(chunkData.buffer);
@@ -1763,7 +1763,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const [audioTrack] = localStream.getAudioTracks();
             if (!audioTrack) return;
             ws.setMicActive(isMicOn);
-            if (localPublicIdBytes) ws.setMicId(localPublicIdBytes);
+            if (localMediaIdBytes) ws.setMicId(localMediaIdBytes);
             let wired = false;
             if (hasWindowTrackProcessor) {
                 try {
@@ -1815,9 +1815,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             audioEncoder = new AudioEncoder({
                 output: (chunk, meta) => {
-                    if (ws && ws.readyState === WebSocket.OPEN && isMicOn && localPublicIdBytes) {
+                    if (ws && ws.readyState === WebSocket.OPEN && isMicOn && localMediaIdBytes) {
                         const chunkData = new Uint8Array(8 + chunk.byteLength + 2);
-                        chunkData.set(localPublicIdBytes, 0);
+                        chunkData.set(localMediaIdBytes, 0);
                         chunkData[8] = MSG_TYPE.AUDIO_FRAME;
                         chunkData[9] = 0x00;
                         chunk.copyTo(chunkData.subarray(10));
@@ -1848,8 +1848,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const handleRemoteStream = (token, data) => {
-        const stream = remoteStreams[token];
+    const handleRemoteStream = (publicId, data) => {
+        const stream = remoteStreams[publicId];
         if (!stream) return;
 
         const mediaType = new Uint8Array(data, 0, 1)[0];
@@ -1918,7 +1918,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     break;
             }
         } catch (e) {
-            console.error(`[Decoder:${token}] Error handling remote stream data:`, e);
+            console.error(`[Decoder:${publicId}] Error handling remote stream data:`, e);
         }
     };
 
@@ -1981,14 +1981,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         frame.close();
     };
 
-    const addRemoteStream = async (token, username, publicId) => {
-        if (remoteStreams[token]) return;
+    const addRemoteStream = async (publicId, username, mediaId) => {
+        if (remoteStreams[publicId]) return;
 
         const container = document.createElement('div');
         container.className = 'video-container reorderable';
-        container.id = `container-${token}`;
-        container.dataset.userToken = token;
-        
+        container.id = `container-${publicId}`;
+        container.dataset.userPublicId = publicId;
+
         const canvas = document.createElement('canvas');
         canvas.width = WEBCAM_WIDTH;
         canvas.height = WEBCAM_HEIGHT;
@@ -2008,8 +2008,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         let controllerControls = '';
         if (COLLAB_DATA.userRole === 'controller') {
             controllerControls = `
-                <button class="remote-control-btn resize-to-client" data-token="${token}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
-                <button class="remote-control-btn designate-speaker" data-token="${token}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
+                <button class="remote-control-btn resize-to-client" data-public-id="${publicId}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
+                <button class="remote-control-btn designate-speaker" data-public-id="${publicId}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
         const overlay = document.createElement('div');
@@ -2018,8 +2018,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             <span class="username">${escapeHTML(username)}</span>
             <div class="remote-controls">
                 ${controllerControls}
-                <button class="remote-control-btn mute-audio" data-token="${token}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
-                <button class="remote-control-btn mute-video" data-token="${token}" title="${t('tooltips.toggleRemoteVideo')}"><i class="fas fa-video"></i></button>
+                <button class="remote-control-btn mute-audio" data-public-id="${publicId}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
+                <button class="remote-control-btn mute-video" data-public-id="${publicId}" title="${t('tooltips.toggleRemoteVideo')}"><i class="fas fa-video"></i></button>
             </div>
         `;
         
@@ -2030,7 +2030,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         videoGridContent.insertBefore(container, inviteTile);
 
         const stream = {
-            username, container, canvas, ctx, video, publicId,
+            username, container, canvas, ctx, video, mediaId,
             videoMuted: false, audioMuted: false,
             isConfigured: true,
             hasReceivedKeyFrame: false,
@@ -2039,13 +2039,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         const videoDecoder = new VideoDecoder({
             output: (frame) => {
-                if (remoteStreams[token] !== stream) {
+                if (remoteStreams[publicId] !== stream) {
                     frame.close();
                     return;
                 }
                 presentRemoteFrame(stream, frame);
             },
-            error: (e) => console.error(`[Decoder:${token}] VideoDecoder error:`, e)
+            error: (e) => console.error(`[Decoder:${publicId}] VideoDecoder error:`, e)
         });
 
         videoDecoder.configure({ codec: 'vp8' });
@@ -2072,36 +2072,36 @@ document.addEventListener('DOMContentLoaded', async () => {
                 workletNode.port.postMessage(buffer, [buffer.buffer]);
                 frame.close();
             },
-            error: (e) => console.error(`[Decoder:${token}] AudioDecoder error:`, e),
+            error: (e) => console.error(`[Decoder:${publicId}] AudioDecoder error:`, e),
         });
         audioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
 
         Object.assign(stream, { videoDecoder, audioDecoder, audioContext, workletNode, analyser });
-        remoteStreams[token] = stream;
+        remoteStreams[publicId] = stream;
 
         // The socket worker decodes this speaker and feeds the worklet down its
         // own line; the in-page decoder above is the path for a page-owned socket.
-        if (publicId && ws && ws.connectAudio) {
+        if (mediaId && ws && ws.connectAudio) {
             const line = new MessageChannel();
             workletNode.port.postMessage({ port: line.port1 }, [line.port1]);
-            ws.connectAudio(publicId, line.port2);
+            ws.connectAudio(mediaId, line.port2);
         }
 
         // The handshake can involve a worker round-trip, so the canvas renders until
         // it lands -- and again from wherever the sink gives out.
         createVideoSink(() => {
-            if (remoteStreams[token] === stream) detachRemoteSink(stream);
+            if (remoteStreams[publicId] === stream) detachRemoteSink(stream);
         }).then((sink) => {
             if (!sink) return;
             // Removed, or the sink already gave out, while the handshake was in flight.
-            if (remoteStreams[token] !== stream || !sink.alive) {
+            if (remoteStreams[publicId] !== stream || !sink.alive) {
                 sink.close();
                 return;
             }
             try {
                 video.srcObject = new MediaStream([sink.track]);
             } catch (err) {
-                console.warn(`[Media] video sink attach failed for ${token}:`, err);
+                console.warn(`[Media] video sink attach failed for ${publicId}:`, err);
                 sink.close();
                 return;
             }
@@ -2109,9 +2109,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     };
 
-    const removeRemoteStream = (token) => {
-        const stream = remoteStreams[token];
-        if (stream && stream.publicId && ws && ws.closeAudio) ws.closeAudio(stream.publicId);
+    const removeRemoteStream = (publicId) => {
+        const stream = remoteStreams[publicId];
+        if (stream && stream.mediaId && ws && ws.closeAudio) ws.closeAudio(stream.mediaId);
         if (stream) {
             if (stream.sink) {
                 stream.sink.close();
@@ -2139,7 +2139,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 stream.container.remove();
             }
 
-            delete remoteStreams[token];
+            delete remoteStreams[publicId];
         }
     };
 
@@ -2230,7 +2230,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        const self = currentUserState.find(u => u.token === COLLAB_DATA.userToken);
+        const self = currentUserState.find(u => u.publicId === COLLAB_DATA.userPublicId);
         const hasInput = self && (self.slot || self.has_mk);
 
         if (hasInput) {
@@ -2283,11 +2283,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!ws) return;
         if (ws.connectAudio) {
             for (const stream of Object.values(remoteStreams)) {
-                if (!stream.publicId || !stream.workletNode) continue;
+                if (!stream.mediaId || !stream.workletNode) continue;
                 const line = new MessageChannel();
                 stream.workletNode.port.postMessage({ port: line.port1 }, [line.port1]);
-                ws.connectAudio(stream.publicId, line.port2);
-                ws.setAudioActive(stream.publicId, !stream.audioMuted);
+                ws.connectAudio(stream.mediaId, line.port2);
+                ws.setAudioActive(stream.mediaId, !stream.audioMuted);
             }
         }
         if (!mediaInitialized) return;
@@ -2337,18 +2337,18 @@ document.addEventListener('DOMContentLoaded', async () => {
                 if (iframe) {
                     ws.send(JSON.stringify({ action: 'client_resolution', width: iframe.clientWidth, height: iframe.clientHeight }));
                     if (COLLAB_DATA.userRole === 'controller') {
-                        clientResolutions[COLLAB_DATA.userToken] = { width: iframe.clientWidth, height: iframe.clientHeight };
+                        clientResolutions[COLLAB_DATA.userPublicId] = { width: iframe.clientWidth, height: iframe.clientHeight };
                     }
                 }
             };
 
             ws.onmessage = (event) => {
                 if (event.data instanceof ArrayBuffer) {
-                    const publicId = new TextDecoder().decode(event.data.slice(0, 8));
-                    const token = publicIdToTokenMap[publicId];
-                    if (!token) return;
+                    const mediaId = new TextDecoder().decode(event.data.slice(0, 8));
+                    const publicId = mediaIdToPublicIdMap[mediaId];
+                    if (!publicId) return;
                     const payload = event.data.slice(8);
-                    handleRemoteStream(token, payload);
+                    handleRemoteStream(publicId, payload);
                     return;
                 }
 
@@ -2365,8 +2365,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                         break;
                     }
                     case 'resolution_update':
-                        clientResolutions[data.token] = { width: data.width, height: data.height };
-                        if (COLLAB_DATA.userRole === 'controller' && !isResolutionLocked && currentMkOwner === data.token) {
+                        clientResolutions[data.public_id] = { width: data.width, height: data.height };
+                        if (COLLAB_DATA.userRole === 'controller' && !isResolutionLocked && currentMkOwner === data.public_id) {
                             applyAutoResolution();
                         }
                         break;
@@ -2395,22 +2395,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                         currentDesignatedSpeaker = data.designated_speaker;
 
-                        const self = data.viewers.find(u => u.token === COLLAB_DATA.userToken);
-                        if (self && self.publicId && self.publicId !== localPublicId) {
-                            localPublicId = self.publicId;
-                            localPublicIdBytes = textEncoder.encode(localPublicId);
-                            if (ws && ws.setMicId) ws.setMicId(localPublicIdBytes);
+                        const self = data.viewers.find(u => u.publicId === COLLAB_DATA.userPublicId);
+                        if (self && self.mediaId && self.mediaId !== localMediaId) {
+                            localMediaId = self.mediaId;
+                            localMediaIdBytes = textEncoder.encode(localMediaId);
+                            if (ws && ws.setMicId) ws.setMicId(localMediaIdBytes);
                         }
 
-                        publicIdToTokenMap = {};
+                        mediaIdToPublicIdMap = {};
                         data.viewers.forEach(user => {
-                            if (user.publicId) publicIdToTokenMap[user.publicId] = user.token;
+                            if (user.mediaId) mediaIdToPublicIdMap[user.mediaId] = user.publicId;
                         });
 
                         document.querySelectorAll('.video-container').forEach(el => el.classList.remove('designated-speaker'));
                         document.querySelectorAll('.designate-speaker').forEach(el => el.classList.remove('active'));
                         if (currentDesignatedSpeaker) {
-                            const speakerContainer = document.querySelector(`[data-user-token="${currentDesignatedSpeaker}"]`);
+                            const speakerContainer = document.querySelector(`[data-user-public-id="${currentDesignatedSpeaker}"]`);
                             if (speakerContainer) {
                                 speakerContainer.classList.add('designated-speaker');
                                 const speakerButton = speakerContainer.querySelector('.designate-speaker');
@@ -2421,7 +2421,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                         updateGestureOverlay();
 
                         const mkOwnerUser = data.viewers.find(u => u.has_mk);
-                        const newMkOwner = mkOwnerUser ? mkOwnerUser.token : COLLAB_DATA.userToken;
+                        const newMkOwner = mkOwnerUser ? mkOwnerUser.publicId : COLLAB_DATA.userPublicId;
 
                         if (COLLAB_DATA.userRole === 'controller' && currentMkOwner !== newMkOwner) {
                             currentMkOwner = newMkOwner;
@@ -2433,21 +2433,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                         const participantsToShow = data.viewers.filter(u =>
                             u.permission !== 'readonly' &&
                             u.online &&
-                            u.token !== COLLAB_DATA.userToken
+                            u.publicId !== COLLAB_DATA.userPublicId
                         );
-                        const serverTokens = new Set(participantsToShow.map(u => u.token));
-                        const clientTokens = new Set(Object.keys(remoteStreams));
+                        const serverPublicIds = new Set(participantsToShow.map(u => u.publicId));
+                        const clientPublicIds = new Set(Object.keys(remoteStreams));
 
-                        for (const token of clientTokens) {
-                            if (!serverTokens.has(token)) {
-                                removeRemoteStream(token);
+                        for (const publicId of clientPublicIds) {
+                            if (!serverPublicIds.has(publicId)) {
+                                removeRemoteStream(publicId);
                             }
                         }
 
                         for (const user of participantsToShow) {
-                            const stream = remoteStreams[user.token];
+                            const stream = remoteStreams[user.publicId];
                             if (!stream) {
-                                addRemoteStream(user.token, user.username, user.publicId);
+                                addRemoteStream(user.publicId, user.username, user.mediaId);
                             } else if (stream.username !== user.username) {
                                 stream.username = user.username;
                                 const usernameEl = stream.container.querySelector('.username');
@@ -2516,8 +2516,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     const handleControlMessage = (payload) => {
-        const { action, sender_token, state } = payload;
-        
+        const { action, sender_public_id, state } = payload;
+
         if (action === 'force_cursor_render') {
             if (COLLAB_DATA.userRole === 'controller') {
                 const iframe = document.getElementById('session-frame');
@@ -2528,7 +2528,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        const stream = remoteStreams[sender_token];
+        const stream = remoteStreams[sender_public_id];
         if (!stream) return;
 
         if (action === 'video_state') {
@@ -2573,8 +2573,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (isController) {
             localControls = `
                 <button class="remote-control-btn toggle-resolution-lock" title="${t('tooltips.lockResolution')}"><i class="fas fa-lock-open"></i></button>
-                <button class="remote-control-btn resize-to-client" data-token="${COLLAB_DATA.userToken}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
-                <button class="remote-control-btn designate-speaker" data-token="${COLLAB_DATA.userToken}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
+                <button class="remote-control-btn resize-to-client" data-public-id="${COLLAB_DATA.userPublicId}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
+                <button class="remote-control-btn designate-speaker" data-public-id="${COLLAB_DATA.userPublicId}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
         localContainer.querySelector('.video-overlay').innerHTML = `
@@ -3008,9 +3008,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (user.slot) {
                 assignedGamepadIds.add(user.slot);
                 const icon = gamepadIcons[user.slot];
-                const container = user.token === COLLAB_DATA.userToken
+                const container = user.publicId === COLLAB_DATA.userPublicId
                     ? document.getElementById('local-user-container')
-                    : document.getElementById(`container-${user.token}`);
+                    : document.getElementById(`container-${user.publicId}`);
 
                 if (icon && container && icon.parentElement !== container) {
                     container.appendChild(icon);
@@ -3019,9 +3019,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             if (user.has_mk) {
                 mkAssigned = true;
-                const container = user.token === COLLAB_DATA.userToken
+                const container = user.publicId === COLLAB_DATA.userPublicId
                     ? document.getElementById('local-user-container')
-                    : document.getElementById(`container-${user.token}`);
+                    : document.getElementById(`container-${user.publicId}`);
 
                 if (mkIcon && container && mkIcon.parentElement !== container) {
                     container.appendChild(mkIcon);
@@ -3056,7 +3056,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let drag = null;
 
     const dragTargets = () => Array.from(document.querySelectorAll('.video-container')).filter((container) => {
-        const user = currentUserState.find(u => u.token === container.dataset.userToken);
+        const user = currentUserState.find(u => u.publicId === container.dataset.userPublicId);
         return container.id === 'gamepad-source-box' || user;
     });
 
@@ -3104,20 +3104,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!dropped || kind === 'stream' || !over) return;
 
         if (kind === 'mk') {
-            const tokenToAssign = (over.id === 'gamepad-source-box') ? COLLAB_DATA.userToken : over.dataset.userToken;
-            ws.send(JSON.stringify({ action: 'assign_mk', token: tokenToAssign }));
+            const publicIdToAssign = (over.id === 'gamepad-source-box') ? COLLAB_DATA.userPublicId : over.dataset.userPublicId;
+            ws.send(JSON.stringify({ action: 'assign_mk', public_id: publicIdToAssign }));
             return;
         }
         const gamepadId = parseInt(source.dataset.gamepadId, 10);
         if (over.id === 'gamepad-source-box') {
             const parentContainer = source.parentElement;
             if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
-                const userToken = parentContainer.dataset.userToken;
-                if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: null }));
+                const userPublicId = parentContainer.dataset.userPublicId;
+                if (userPublicId) ws.send(JSON.stringify({ action: 'assign_slot', viewer_public_id: userPublicId, slot: null }));
             }
         } else {
-            const userToken = over.dataset.userToken;
-            if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: gamepadId }));
+            const userPublicId = over.dataset.userPublicId;
+            if (userPublicId) ws.send(JSON.stringify({ action: 'assign_slot', viewer_public_id: userPublicId, slot: gamepadId }));
         }
     };
 
@@ -3222,13 +3222,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (!btn) return;
     
         unlockAllAudio();
-        const token = btn.dataset.token;
-        const stream = remoteStreams[token];
-    
+        const publicId = btn.dataset.publicId;
+        const stream = remoteStreams[publicId];
+
         if (btn.classList.contains('mute-audio')) {
             if (!stream) return;
             stream.audioMuted = !stream.audioMuted;
-            if (stream.publicId && ws && ws.setAudioActive) ws.setAudioActive(stream.publicId, !stream.audioMuted);
+            if (stream.mediaId && ws && ws.setAudioActive) ws.setAudioActive(stream.mediaId, !stream.audioMuted);
             if (stream.audioContext) {
                 if (stream.audioMuted && stream.audioContext.state === 'running') {
                     stream.audioContext.suspend();
@@ -3255,12 +3255,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 stream.hasReceivedKeyFrame = false;
             }
         } else if (btn.classList.contains('resize-to-client')) {
-            const res = clientResolutions[token];
+            const res = clientResolutions[publicId];
             if (!res) {
-                console.warn(`[Controller] No resolution data available for client ${token}`);
+                console.warn(`[Controller] No resolution data available for client ${publicId}`);
                 return;
             }
-            console.log(`[Controller] Manually resizing to client ${token}: ${res.width}x${res.height}`);
+            console.log(`[Controller] Manually resizing to client ${publicId}: ${res.width}x${res.height}`);
             const iframe = document.getElementById('session-frame');
             if (iframe && iframe.contentWindow) {
                 iframe.contentWindow.postMessage({ type: 'setManualResolution', width: res.width, height: res.height }, window.location.origin);
@@ -3273,8 +3273,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                 applyAutoResolution();
             }
         } else if (btn.classList.contains('designate-speaker')) {
-            const tokenToSet = (currentDesignatedSpeaker === token) ? null : token;
-            ws.send(JSON.stringify({ action: 'set_designated_speaker', token: tokenToSet }));
+            const publicIdToSet = (currentDesignatedSpeaker === publicId) ? null : publicId;
+            ws.send(JSON.stringify({ action: 'set_designated_speaker', public_id: publicIdToSet }));
         }
     });
 

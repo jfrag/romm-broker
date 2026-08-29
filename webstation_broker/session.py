@@ -30,13 +30,17 @@ Shape:
   "id", "active", "created_at",
   "user": {...}, "emulator": "pcsx2", "rom": {...}, "rom_file": str,
   "save": {...} | None, "callback": {...} | None, "multiplayer": bool,
-  "controller_token", "invites": {"participant": str, "readonly": str},
-  "viewers": [{"token","user_id","anonymous","last_seen","slot","mk_control",
-               "username","permission"}...],
+  "controller_token", "controller_public_id",
+  "invites": {"participant": str, "readonly": str},
+  "viewers": [{"token","public_id","user_id","anonymous","last_seen","slot",
+               "mk_control","username","permission"}...],
   "controller_slot", "mk_owner_token", "designated_speaker",
   "save_baseline": float, "emulator_obj": Emulator,
 }
 ```
+
+`token` is each seat's bearer credential; `public_id` is a non-sensitive
+stand-in safe to broadcast to the room in its place (see `broadcast_state`).
 """
 
 LAST_EXIT: Optional[dict[str, Any]] = None
@@ -107,6 +111,7 @@ def new_session(payload: dict[str, Any], emulator_obj: "Emulator", rom_file: str
         "callback": payload.get("callback"),
         "multiplayer": bool(payload.get("multiplayer")),
         "controller_token": secrets.token_urlsafe(16),
+        "controller_public_id": secrets.token_hex(4),
         "viewers": [],
         # Reusable invite tokens by permission, minted on first request. One
         # link per role is what a host hands round; each arrival on it takes
@@ -153,6 +158,48 @@ def find_viewer(token: str) -> Optional[dict[str, Any]]:
     if SESSION is None:
         return None
     return next((v for v in SESSION.get("viewers", []) if v["token"] == token), None)
+
+
+def public_id_for(token: str) -> Optional[str]:
+    """Resolve a seat's real token to the non-sensitive id safe to broadcast for it.
+
+    Args:
+        token: A controller or viewer token already known to be valid.
+
+    Returns:
+        The matching public id, or None when there is no session or no seat
+        holds that token.
+    """
+    if SESSION is None:
+        return None
+    if SESSION.get("controller_token") == token:
+        return SESSION.get("controller_public_id")
+    viewer = find_viewer(token)
+    return viewer.get("public_id") if viewer else None
+
+
+def resolve_public_id(public_id: Optional[str]) -> Optional[str]:
+    """Resolve a broadcast-safe public id back to the seat's real token.
+
+    The inverse of `public_id_for`, used to translate a room-management
+    target (e.g. who a gamepad slot goes to) that a client can only name by
+    its public id back into the token the rest of the session logic keys on.
+
+    Args:
+        public_id: The publicId a client sent to name a room member, or None.
+
+    Returns:
+        The matching seat token, or None when there is no session, no seat
+        holds that public id, or `public_id` is None.
+    """
+    if SESSION is None or public_id is None:
+        return None
+    if SESSION.get("controller_public_id") == public_id:
+        return SESSION["controller_token"]
+    for v in SESSION.get("viewers", []):
+        if v.get("public_id") == public_id:
+            return v["token"]
+    return None
 
 
 def invite_token(permission: str) -> str:
@@ -221,8 +268,8 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
             None for an anonymous viewer who gets a generated username.
 
     Returns:
-        The new viewer dict: `{"token", "user_id", "anonymous", "last_seen",
-        "slot", "mk_control", "username", "permission"}`. None when the
+        The new viewer dict: `{"token", "public_id", "user_id", "anonymous",
+        "last_seen", "slot", "mk_control", "username", "permission"}`. None when the
         session is at `settings.MAX_ROOM_VIEWERS` seats and none of them can
         be reclaimed: every seat is either a named user or an anonymous seat
         that is still connected.
@@ -278,6 +325,7 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
 
     viewer = {
         "token": secrets.token_urlsafe(16),
+        "public_id": secrets.token_hex(4),
         "user_id": user.get("id"),
         "anonymous": anonymous,
         "last_seen": time.time(),
@@ -343,39 +391,48 @@ async def broadcast_binary_to_room(payload: bytes, sender_ws: WebSocket) -> None
 async def broadcast_state() -> None:
     """Broadcast a `state_update` describing every room member to the room.
 
-    The controller is listed first, then each viewer with its online status,
-    mouse/keyboard ownership and, while connected, its public id. Does nothing
-    when there is no session.
+    The controller is listed first, then each viewer with its online status
+    and mouse/keyboard ownership. Members are identified by `publicId`, a
+    non-sensitive stand-in for their seat token: broadcasting the real token
+    would hand every room member, including anonymous viewers, the bearer
+    credential needed to reconnect as (or impersonate) anyone else. While a
+    member is connected its `mediaId`, the per-connection id its live socket
+    tags binary media frames with, is included too. Does nothing when there
+    is no session.
     """
     if SESSION is None:
         return
     controller_name = (SESSION.get("user") or {}).get("display_name") or "Controller"
     controller_info = {
-        "token": SESSION["controller_token"],
+        "publicId": SESSION["controller_public_id"],
         "username": controller_name,
         "slot": SESSION.get("controller_slot"),
         "online": ROOM.get("controller") is not None,
         "has_mk": (SESSION.get("mk_owner_token") == SESSION["controller_token"])
         or (SESSION.get("mk_owner_token") is None),
         "permission": "controller",
-        "publicId": ROOM["controller"]["public_id"] if ROOM.get("controller") else None,
+        "mediaId": ROOM["controller"]["public_id"] if ROOM.get("controller") else None,
     }
     online_tokens = set(ROOM.get("viewers", {}).keys())
     users = [controller_info]
     for v in SESSION.get("viewers", []):
         info = v.copy()
+        del info["token"]
+        info["publicId"] = info.pop("public_id")
         info["has_mk"] = SESSION.get("mk_owner_token") == v["token"]
         info["online"] = v["token"] in online_tokens
         if info["online"]:
             conn = ROOM["viewers"].get(v["token"])
             if conn:
-                info["publicId"] = conn.get("public_id")
+                info["mediaId"] = conn.get("public_id")
         users.append(info)
     await broadcast_to_room(
         {
             "type": "state_update",
             "viewers": users,
-            "designated_speaker": SESSION.get("designated_speaker"),
+            "designated_speaker": public_id_for(SESSION["designated_speaker"])
+            if SESSION.get("designated_speaker")
+            else None,
         }
     )
 
