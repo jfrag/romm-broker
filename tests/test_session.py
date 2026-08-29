@@ -181,6 +181,63 @@ def test_a_named_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> Non
     assert session.find_viewer(named["token"]) is not None
 
 
+def test_a_named_by_username_only_seat_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A user with only a username and no id is still named, not anonymous, so its seat holds at the cap."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    named = session.add_viewer("participant", {"username": "ana"})
+
+    refused = session.add_viewer("participant", None)
+
+    assert refused is None
+    assert session.find_viewer(named["token"]) is not None
+
+
+def test_reclaiming_a_seat_clears_its_speaker_and_mk_ownership(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reclaiming a seat that was still wired up as speaker or MK owner clears those session fields."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    sess = _activate()
+    ghost = session.add_viewer("participant", None)
+    sess["designated_speaker"] = ghost["token"]
+    sess["mk_owner_token"] = ghost["token"]
+
+    session.add_viewer("participant", None)
+
+    assert sess["designated_speaker"] is None
+    assert sess["mk_owner_token"] is None
+
+
+def test_the_longest_idle_anonymous_seat_is_reclaimed_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Among several disconnected anonymous seats, the one idle longest is reclaimed, not the first minted."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
+    _activate()
+    older = session.add_viewer("participant", None)
+    newer = session.add_viewer("participant", None)
+    older["last_seen"] = 200.0
+    newer["last_seen"] = 100.0
+
+    session.add_viewer("participant", None)
+
+    assert session.find_viewer(older["token"]) is not None
+    assert session.find_viewer(newer["token"]) is None
+
+
+def test_a_never_connected_seat_is_reclaimed_before_a_disconnected_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seat that never connected (no last_seen) is reclaimed before one that has since disconnected."""
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 2)
+    _activate()
+    never_connected = session.add_viewer("participant", None)
+    disconnected = session.add_viewer("participant", None)
+    disconnected["last_seen"] = 100.0
+
+    session.add_viewer("participant", None)
+
+    assert session.find_viewer(never_connected["token"]) is None
+    assert session.find_viewer(disconnected["token"]) is not None
+
+
 def test_a_rejoin_at_the_cap_still_replaces_its_own_seat(monkeypatch: pytest.MonkeyPatch) -> None:
     """A rejoin at the cap still replaces its own seat, since it frees the seat it re-takes."""
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)

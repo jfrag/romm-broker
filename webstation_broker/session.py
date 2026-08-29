@@ -202,16 +202,17 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
             None for an anonymous viewer who gets a generated username.
 
     Returns:
-        The new viewer dict: `{"token", "user_id", "slot", "mk_control",
-        "username", "permission"}`. None when the session is at
-        `settings.MAX_ROOM_VIEWERS` seats and none of them can be reclaimed:
-        every seat is either a named user or an anonymous seat that is still
-        connected.
+        The new viewer dict: `{"token", "user_id", "anonymous", "last_seen",
+        "slot", "mk_control", "username", "permission"}`. None when the
+        session is at `settings.MAX_ROOM_VIEWERS` seats and none of them can
+        be reclaimed: every seat is either a named user or an anonymous seat
+        that is still connected.
     """
     import random
 
     user = user or {}
     username = user.get("display_name") or user.get("username")
+    anonymous = user.get("id") is None and not username
 
     def _same_user(v: dict[str, Any]) -> bool:
         """Whether viewer entry `v` belongs to the user now joining."""
@@ -224,16 +225,19 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
         # A seat lives for the whole session by design (its invite link stays
         # valid after the tab closes), so an anonymous arrival never frees its
-        # own slot on disconnect. Reclaim the oldest anonymous seat with no
-        # live socket rather than treat every seat ever minted as permanent.
+        # own slot on disconnect. Reclaim the anonymous seat that has gone
+        # longest without a live socket (never-connected first) rather than
+        # treat every seat ever minted as permanent. "anonymous" mirrors
+        # _same_user above: a seat with neither an id nor a username to
+        # identify it, not merely one with no id.
         online_tokens = set(ROOM.get("viewers", {}).keys())
-        stale = next(
-            (
-                v
-                for v in SESSION["viewers"]
-                if v.get("user_id") is None and v["token"] not in online_tokens
-            ),
-            None,
+        reclaimable = [
+            v for v in SESSION["viewers"] if v.get("anonymous") and v["token"] not in online_tokens
+        ]
+        stale = min(
+            reclaimable,
+            key=lambda v: (v.get("last_seen") is not None, v.get("last_seen") or 0),
+            default=None,
         )
         if stale is None:
             log.warning(
@@ -241,12 +245,20 @@ def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Option
                 settings.MAX_ROOM_VIEWERS,
             )
             return None
-        log.info("session: reclaiming disconnected anonymous seat %s for a new arrival", stale["token"])
+        log.info("session: reclaiming a disconnected anonymous seat for a new arrival")
         SESSION["viewers"].remove(stale)
+        # Mirrors the disconnect cleanup in room.py: a token that no longer
+        # holds a seat must not stay wired up as the speaker or MK owner.
+        if SESSION.get("designated_speaker") == stale["token"]:
+            SESSION["designated_speaker"] = None
+        if SESSION.get("mk_owner_token") == stale["token"]:
+            SESSION["mk_owner_token"] = None
 
     viewer = {
         "token": secrets.token_urlsafe(16),
         "user_id": user.get("id"),
+        "anonymous": anonymous,
+        "last_seen": None,
         "slot": None,
         "mk_control": False,
         "username": username or f"User-{random.randint(100, 999)}",

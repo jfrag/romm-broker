@@ -52,7 +52,9 @@ async def room_websocket(websocket: WebSocket) -> None:
     map is pushed to selkies when it held either. The seat itself stays in
     the session, so its token (and the invite link carrying it) keeps working
     until the session ends; a new connection on a token that is already
-    connected replaces the old socket.
+    connected replaces the old socket. A departing viewer's seat also records
+    when it went offline, so the room cap can reclaim the longest-idle
+    anonymous seat first when the room is full.
 
     Args:
         websocket: The incoming room connection.
@@ -71,6 +73,15 @@ async def room_websocket(websocket: WebSocket) -> None:
         return
 
     await websocket.accept()
+
+    if not is_controller:
+        # accept() is an await point: a join at the room cap can reclaim this
+        # very seat while the handshake is in flight, so the seat is checked
+        # again rather than trusting the lookup made before it.
+        viewer_ref = session.find_viewer(token)
+        if viewer_ref is None:
+            await websocket.close(code=1008)
+            return
 
     username = "Controller"
     if is_controller:
@@ -250,6 +261,7 @@ async def room_websocket(websocket: WebSocket) -> None:
                 disconnected = session.find_viewer(token)
                 input_released = False
                 if disconnected:
+                    disconnected["last_seen"] = time.time()
                     if disconnected.get("slot"):
                         await session.broadcast_to_room(
                             {
