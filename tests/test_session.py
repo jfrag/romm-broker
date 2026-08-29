@@ -176,6 +176,26 @@ async def test_rejoining_drops_the_old_tokens_rate_limit_cooldowns() -> None:
     assert first["token"] not in session.ROOM["cooldowns"]
 
 
+def test_release_seat_pops_and_returns_the_tokens_live_connection() -> None:
+    """`_release_seat` pops and returns a token's live connection, so its caller can close it."""
+    _activate()
+    sentinel = object()
+    session.ROOM["viewers"]["tok"] = {"websocket": sentinel}
+
+    live = session._release_seat("tok")
+
+    assert live is not None
+    assert live["websocket"] is sentinel
+    assert "tok" not in session.ROOM["viewers"]
+
+
+def test_release_seat_returns_none_for_a_token_with_no_live_connection() -> None:
+    """`_release_seat` returns None for a token that was never connected, or already dropped."""
+    _activate()
+
+    assert session._release_seat("never-connected") is None
+
+
 async def test_a_rejoin_without_an_id_is_matched_on_the_name() -> None:
     """A rejoin without an id is matched on the name."""
     _activate()

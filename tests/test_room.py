@@ -368,6 +368,9 @@ def test_a_rejoin_closes_the_old_seats_still_connected_socket(
             .split("token=")[1]
         )
         assert second != first
+        # The evicted token's connection is detached the moment the join call
+        # returns, before the socket close below is even awaited.
+        assert first not in session.ROOM["viewers"]
         second_public_id = session.find_viewer(second)["public_id"]
 
         with pytest.raises(WebSocketDisconnect) as excinfo:

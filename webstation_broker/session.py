@@ -238,33 +238,35 @@ def find_invite(token: str) -> Optional[str]:
     return None
 
 
-async def _release_seat(token: str) -> None:
-    """Fully retire a seat leaving `SESSION["viewers"]` outside the normal disconnect path.
+def _release_seat(token: str) -> Optional[dict[str, Any]]:
+    """Drop a removed seat's rate-limit cooldowns and role, and detach its live connection.
 
-    Covers a same-user rejoin replacing the seat and the reclaim of a stale
-    one. Either can leave the token still holding the speaker or MK role (set
-    by the unvalidated set_designated_speaker/assign_mk actions) or a
-    cooldowns entry, both cleared here. A rejoin can also evict a seat whose
-    socket is still connected (a second tab, a reload racing the old tab's
-    close): that connection is force-closed and dropped from the room so it
-    stops relaying room traffic on a token `find_viewer` no longer recognizes.
-    Its own disconnect cleanup is skipped as a result, since the seat it would
-    have acted on is already gone here.
+    Called for a seat leaving `SESSION["viewers"]` outside the normal disconnect
+    path (a same-user rejoin replacing it, or the reclaim of a stale seat), both
+    of which can happen while the seat still holds the speaker or MK role from
+    the unvalidated set_designated_speaker/assign_mk actions, or a cooldowns
+    entry, both cleared here. A rejoin can also evict a seat whose socket is
+    still connected (a second tab, a reload racing the old tab's close): that
+    connection is detached from `ROOM["viewers"]` here, synchronously, so
+    nothing can look it up as the seat's connection anymore, but closing it is
+    left to the caller. It must stay a synchronous pop rather than an awaited
+    close here, since add_viewer's cap check right after this needs the whole
+    admission decision to run without yielding control, or a concurrent join
+    could interleave mid-decision and seat past the cap.
 
     Args:
         token: The removed seat's token.
+
+    Returns:
+        The token's live connection info, for the caller to close, or None if
+        it had none.
     """
     ROOM["cooldowns"].pop(token, None)
     if SESSION.get("designated_speaker") == token:
         SESSION["designated_speaker"] = None
     if SESSION.get("mk_owner_token") == token:
         SESSION["mk_owner_token"] = None
-    live = ROOM["viewers"].pop(token, None)
-    if live is not None:
-        try:
-            await live["websocket"].close(code=1008)
-        except Exception:
-            log.debug("room socket for a released seat was already gone")
+    return ROOM["viewers"].pop(token, None)
 
 
 async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
@@ -274,7 +276,9 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
     entry and invalidates its token. If that old seat still has a live room
     connection (a second tab, a reload racing the first tab's close), that
     connection is force-closed rather than left running on a token nothing
-    recognizes anymore.
+    recognizes anymore. The close is deferred until every seat has already
+    been decided (see `_release_seat`), so it never interleaves with a
+    concurrent join's own admission decision.
 
     Args:
         permission: The viewer's permission level, e.g. `readonly`.
@@ -300,6 +304,8 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
             return v["user_id"] == user["id"]
         return bool(username) and v.get("username") == username
 
+    to_close: list[dict[str, Any]] = []
+
     replaced = [v for v in SESSION.get("viewers", []) if _same_user(v)]
     SESSION["viewers"] = [v for v in SESSION.get("viewers", []) if not _same_user(v)]
     # A rejoining seat's old token is invalidated above but was never
@@ -307,7 +313,9 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
     # entry that would otherwise dangle on a token nothing can use anymore,
     # and its socket, if still open, is still relaying room traffic.
     for old in replaced:
-        await _release_seat(old["token"])
+        live = _release_seat(old["token"])
+        if live is not None:
+            to_close.append(live)
 
     if len(SESSION["viewers"]) >= settings.MAX_ROOM_VIEWERS:
         # A seat lives for the whole session by design (its invite link stays
@@ -334,8 +342,8 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
         SESSION["viewers"].remove(stale)
         # The reclaimable filter above already proved stale's token is offline,
         # so if it still holds the speaker or MK role that role has to be
-        # cleared here.
-        await _release_seat(stale["token"])
+        # cleared here. It never has a live connection to close.
+        _release_seat(stale["token"])
 
     viewer = {
         "token": secrets.token_urlsafe(16),
@@ -349,6 +357,15 @@ async def add_viewer(permission: str, user: Optional[dict[str, Any]] = None) -> 
         "permission": permission,
     }
     SESSION.setdefault("viewers", []).append(viewer)
+
+    # Deferred until every seat's admission is fully decided above, so an
+    # awaited close can't yield control mid-decision to a concurrent join.
+    for conn in to_close:
+        try:
+            await conn["websocket"].close(code=1008)
+        except Exception:
+            log.debug("room socket for a released seat was already gone")
+
     return viewer
 
 
