@@ -1240,6 +1240,39 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
+    // Arrivals on an invite link have no RomM window around this one, so the
+    // fader in the bar is their only way to turn the game down. RomM arrivals
+    // keep the parent's control bar and never see it.
+    const streamVolume = document.getElementById('stream-volume');
+    const streamMuteBtn = document.getElementById('stream-mute-btn');
+    const streamVolumeSlider = document.getElementById('stream-volume-slider');
+    const syncStreamVolumeControls = () => {
+        streamMuteBtn.querySelector('i').className = isIframeMuted ? 'fas fa-volume-mute' : 'fas fa-volume-up';
+        streamMuteBtn.classList.toggle('inactive', isIframeMuted);
+        streamVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
+    };
+    if (inviteToken) {
+        document.body.classList.add('invited');
+        streamVolume.classList.remove('hidden');
+        syncStreamVolumeControls();
+        // Dragging to the bottom is a mute, not a volume of zero to remember.
+        streamVolumeSlider.addEventListener('input', (e) => {
+            const value = parseFloat(e.target.value);
+            isIframeMuted = value === 0;
+            if (!isIframeMuted) {
+                lastKnownVolume = value;
+                localStorage.setItem('collab_iframe_volume', lastKnownVolume);
+            }
+            syncStreamVolumeControls();
+            sendVolumeToIframe();
+        });
+        streamMuteBtn.addEventListener('click', () => {
+            isIframeMuted = !isIframeMuted;
+            syncStreamVolumeControls();
+            sendVolumeToIframe();
+        });
+    }
+
     // RomM's control bar owns game volume: it sits outside this frame and
     // cannot reach the stream across origins, so its volume and mute arrive
     // here as messages and are relayed on. Announcing on load is how the
@@ -1263,6 +1296,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             return;
         }
+        syncStreamVolumeControls();
         sendVolumeToIframe();
     });
 
@@ -2842,7 +2876,8 @@ document.addEventListener('DOMContentLoaded', async () => {
             const gap = parseFloat(styles.columnGap) || 0;
             const padding = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
             const fullDock = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--chat-dock-width')) || 0;
-            const needed = videoGridContent.scrollWidth + gap + fullDock + padding;
+            const fader = streamVolume.offsetWidth ? streamVolume.offsetWidth + gap : 0;
+            const needed = videoGridContent.scrollWidth + fader + gap + fullDock + padding;
             document.body.classList.toggle('chat-crowded', needed > videoGrid.clientWidth);
         };
         const barObserver = new ResizeObserver(updateBarLayout);
