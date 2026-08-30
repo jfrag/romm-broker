@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -10,7 +10,6 @@
         <div class="disconnection-message">
             <h2 data-i18n="disconnect.title">Session Ended</h2>
             <p id="disconnection-detail" data-i18n="disconnect.message">The session has been terminated by the host.</p>
-            <pre id="exit-report" class="hidden"></pre>
         </div>
     </div>
 
@@ -24,31 +23,66 @@
         </div>
         <div id="gesture-overlay" class="hidden"></div>
         <iframe id="session-frame" src="about:blank" data-src=""></iframe>
-        <div id="sidebar-toggle-handle" class="sidebar-toggle-handle" title="Toggle Sidebar">
-            <div class="toggle-indicator"></div>
-        </div>
+        <div id="chat-peek"></div>
     </div>
 
     <div id="video-grid">
-        <div id="video-grid-content">
-            <div id="gamepad-source-box" class="video-container pinned"></div>
-            <div id="local-user-container" class="video-container pinned">
-                <video id="local-video" autoplay muted playsinline></video>
-                <div class="video-overlay">
-                    <span class="username" data-i18n="localUsername"></span>
+        <div id="video-strip">
+            <div id="video-grid-content">
+                <div id="gamepad-source-box" class="video-container pinned"></div>
+                <div id="local-user-container" class="video-container pinned">
+                    <video id="local-video" autoplay muted playsinline></video>
+                    <div class="self-controls">
+                        <button id="toggle-mic-btn" class="control-btn" data-i18n-title="tooltips.toggleLocalMic"><i class="fas fa-microphone"></i></button>
+                        <button id="toggle-video-btn" class="control-btn" data-i18n-title="tooltips.toggleLocalWebcam"><i class="fas fa-video"></i></button>
+                        <button id="settings-btn" class="control-btn" data-i18n-title="settings.title"><i class="fas fa-cog"></i></button>
+                    </div>
+                    <div class="video-overlay">
+                        <span class="username" data-i18n="localUsername"></span>
+                    </div>
+                </div>
+                <div id="invite-tile" class="video-container pinned hidden">
+                    <div class="invite-card">
+                        <div class="invite-face invite-front">
+                            <button id="invite-btn" class="invite-btn" data-i18n-title="tooltips.invite"><i class="fas fa-plus"></i></button>
+                        </div>
+                        <div class="invite-face invite-back invite-links">
+                            <button class="invite-copy" data-permission="participant" data-i18n="inviteLinks.participant"></button>
+                            <button class="invite-copy" data-permission="readonly" data-i18n="inviteLinks.readonly"></button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>
+        <div id="chat-dock-slot"></div>
+    </div>
+
+    <div id="chat-dock">
+        <button id="chat-tab" type="button" data-i18n-title="chat.inputPlaceholder"><i class="fas fa-comment"></i></button>
+        <div id="chat-messages-scroll">
+            <div id="chat-messages"></div>
+        </div>
+        <div id="chat-reply-banner"></div>
+        <form id="chat-form">
+            <input type="text" id="chat-input" data-i18n-placeholder="chat.inputPlaceholder" autocomplete="off" maxlength="500">
+            <button type="submit"><i class="fas fa-paper-plane"></i></button>
+        </form>
     </div>
 
     <div id="video-toggle-handle" class="video-toggle-handle" title="Toggle Video Bar">
         <div class="toggle-indicator-horizontal"></div>
     </div>
 
-    <div id="sidebar" class="sidebar">
+    <div id="username-modal-overlay" class="modal-overlay hidden">
+        <div class="modal-content username-prompt">
+            <h3 data-i18n="usernamePrompt.title"></h3>
+            <p data-i18n="usernamePrompt.description"></p>
+            <form id="username-form">
+                <input type="text" id="username-input" data-i18n-placeholder="usernamePrompt.placeholder" maxlength="25" required>
+                <button type="submit" data-i18n="usernamePrompt.joinButton"></button>
+            </form>
+        </div>
     </div>
-
-    <div id="toast-container"></div>
 
     <div id="settings-modal-overlay" class="modal-overlay hidden">
         <div class="modal-content">
@@ -64,6 +98,9 @@
                 <div class="settings-group">
                     <label for="video-input-select" data-i18n="settings.webcamLabel"></label>
                     <select id="video-input-select"></select>
+                </div>
+                <div class="settings-group">
+                    <button id="reload-stream-btn" class="settings-action"><i class="fas fa-sync"></i><span data-i18n="tooltips.reloadStream"></span></button>
                 </div>
             </div>
         </div>

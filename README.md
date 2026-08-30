@@ -44,7 +44,9 @@ docker compose up -d
 ```
 
 `/dev/dri` is GPU passthrough for Intel/AMD; NVIDIA needs the container
-runtime instead of a device mount, covered in the docs.
+runtime instead of a device mount, covered in the docs. BIOS and firmware can
+also be pre-seeded with an optional volume mount instead of dragging files
+into the desktop; see [Running the container](https://romm-streaming.github.io/romm-broker/docs/container).
 
 Then point RomM at it: add a `webstation` container under
 `streaming.containers` in RomM's `config.yml`, matching the `SUBFOLDER` and
@@ -84,6 +86,7 @@ webstation_broker/       FastAPI app (pip installable, console script webstation
   memcard.py             whole memory card capture and hydrate
   callback.py            exit-time save archive upload to the parent
   settings.py            environment-driven configuration
+  main.py                console-script entrypoint; refuses to start without BROKER_SECRET or dev mode
   app.py                 application factory, SUBFOLDER mount, orphan reaping on start
   emulators/             one launcher per emulator, all subclassing emulators.base.Emulator
 frontend/                vite vanilla-JS room interface
@@ -115,6 +118,9 @@ cd docs && npm run generate && npm run dev
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the PR workflow.
+
+A session can stream a full desktop with a real terminal on it. Before
+exposing this beyond your own LAN, read [SECURITY.md](SECURITY.md).
 
 ## Releases
 

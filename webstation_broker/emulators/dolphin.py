@@ -89,6 +89,62 @@ _DISC_RE = re.compile(r"(?:^|[^a-z0-9])(?:disc|disk|cd)[\s._-]*(\d+)", re.IGNORE
 _STATE_NAME_RE = re.compile(r"^(?P<game>[^/]+)\.s\d{2}$")
 """Matches `<game id>.s01`, the name Dolphin builds for a save state."""
 
+_GC_PLATFORM = "ngc"
+"""RomM platform slug for GameCube, the only Dolphin platform with a physical memory card."""
+
+_GAME_ID_LEN = 6
+"""Length of the game id a disc header opens with and Dolphin stamps into a state."""
+_GAME_ID_RE = re.compile(r"^[A-Za-z0-9]{6}$")
+"""A game id the broker will compare on: six alphanumerics, e.g. `GXCE01`."""
+_ID_OFFSETS = {".iso": 0, ".gcm": 0, ".wbfs": 0x200}
+"""Disc formats that keep the game id in the clear, and the offset it sits at.
+
+A raw GameCube or Wii image opens with the disc header, and a WBFS file keeps
+a copy of that header at 0x200. The compressed formats (.rvz, .wia, .gcz,
+.ciso) hold it behind their own container, so a ROM in one of those has no id
+to check a state against.
+"""
+
+
+def _game_id_at(path: Path, offset: int) -> Optional[str]:
+    """Read a game id out of `path` at `offset`.
+
+    Args:
+        path: The disc image or state file to read.
+        offset: Byte offset the id starts at.
+
+    Returns:
+        The id, or None when it cannot be read or is not six alphanumerics.
+    """
+    try:
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            raw = fh.read(_GAME_ID_LEN)
+    except OSError as exc:
+        log.warning("could not read a game id out of %s: %s", path, exc)
+        return None
+    try:
+        game_id = raw.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return game_id if _GAME_ID_RE.match(game_id) else None
+
+
+def _rom_game_id(rom_path: Path) -> Optional[str]:
+    """The game id of the disc about to boot, for a format that stores one in the clear.
+
+    Args:
+        rom_path: The image being booted.
+
+    Returns:
+        The six-character id, or None for a format that keeps it compressed.
+    """
+    offset = _ID_OFFSETS.get(rom_path.suffix.lower())
+    if offset is None:
+        return None
+    return _game_id_at(rom_path, offset)
+
+
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 _WINDOW_CLASS = "dolphin-emu"
 """WM class shared by Dolphin's render window, its main window and its dialogs.
@@ -230,6 +286,40 @@ def _state_for_slot(slot: int) -> Optional[Path]:
     return max(candidates)[1]
 
 
+def _resume_state(rom_path: Path) -> Optional[Path]:
+    """The working slot's state, when it belongs to the ROM being booted.
+
+    Dolphin loads a `-s` state whatever game it was taken from, and a state
+    opens with the game id it belongs to, so the two can be compared before it
+    is handed over. A ROM whose format hides its own id is taken on trust:
+    refusing every compressed image would cost far more resumes than the
+    mismatch it guards against.
+
+    Args:
+        rom_path: The image about to boot.
+
+    Returns:
+        The state to resume from, or None when the slot is empty or holds another game's state.
+    """
+    state = _state_for_slot(STATE_SLOT)
+    if state is None:
+        return None
+    rom_id = _rom_game_id(rom_path)
+    if rom_id is None:
+        return state
+    state_id = _game_id_at(state, 0)
+    if state_id == rom_id:
+        return state
+    log.warning(
+        "resume: state %s belongs to game id %s, not %s from %s, refusing it",
+        state.name,
+        state_id,
+        rom_id,
+        rom_path.name,
+    )
+    return None
+
+
 def _snapshot() -> dict[Path, tuple[int, float]]:
     """Snapshot every state in the broker's working slot.
 
@@ -249,17 +339,55 @@ def _snapshot() -> dict[Path, tuple[int, float]]:
     return snap
 
 
-def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float) -> bool:
+def _holds_open(pid: Optional[int], path: Path) -> bool:
+    """Tell whether `pid` still has `path` open.
+
+    A file the writer has not closed yet is a write still in flight, however
+    long its size happens to sit still: Dolphin compresses a state in chunks
+    and a busy or stalled host can leave it the same size for a full poll
+    window mid-write.
+
+    Args:
+        pid: The emulator process, or None when the broker holds no handle on it.
+        path: The state file being watched.
+
+    Returns:
+        True only when the descriptor is confirmed open. No pid, a `/proc` that
+        cannot be read, and a process already gone all read as False, so the
+        size test stays the answer where this one cannot contribute.
+    """
+    if pid is None:
+        return False
+    try:
+        target = os.path.realpath(path)
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                if os.path.realpath(fd) == target:
+                    return True
+            except OSError:
+                continue
+    except OSError as exc:
+        log.debug("could not read the open files of dolphin pid %s for %s: %s", pid, path, exc)
+    return False
+
+
+def _wait_for_state_write(
+    before: dict[Path, tuple[int, float]], deadline: float, pid: Optional[int] = None
+) -> bool:
     """Poll the working slot until a write completes or the deadline passes.
 
-    A write counts as complete once the file's size has been stable for 0.5 s.
-    The hotkey is fire-and-forget, so the file appearing and settling is the
-    only confirmation there is. A target that disappears mid-write is dropped
-    and the scan starts over.
+    A write counts as complete once the file is non-empty, Dolphin has closed
+    it, and its size has been stable for 0.5 s. The hotkey is fire-and-forget,
+    so the file itself is the only confirmation there is, and size alone is not
+    enough of one: an emulator that stalls mid-write holds a steady size while
+    the state on disk is still truncated. A target that disappears mid-write is
+    dropped and the scan starts over.
 
     Args:
         before: Snapshot from `_snapshot` taken before the hotkey was sent.
         deadline: `time.monotonic` value to give up at.
+        pid: The running dolphin process, whose open descriptors say whether the
+            write has finished; None falls back to the size test alone.
 
     Returns:
         True once a new or modified state has settled, False on timeout.
@@ -287,10 +415,21 @@ def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float
                 if cur[0] != last_size:
                     last_size = cur[0]
                     stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= STABLE_SECS:
+                elif (
+                    time.monotonic() - stable_since >= STABLE_SECS
+                    and last_size > 0
+                    and not _holds_open(pid, target)
+                ):
                     log.info("save state write complete: %s (%d bytes)", target.name, last_size)
                     return True
         time.sleep(POLL_SECS)
+    if target is not None:
+        log.warning(
+            "save state write never settled before the deadline: %s (%s bytes, pid %s)",
+            target.name,
+            last_size,
+            pid,
+        )
     return False
 
 
@@ -322,13 +461,14 @@ class Dolphin(Emulator):
     of `-C` overrides for fullscreen, no stop confirmation, no panic dialogs,
     analytics consent already answered, and slot A pinned to a GCI folder
     card. Qt is forced onto xcb so the window lives on Xwayland, where
-    xdotool can reach it. A resume whose state is already on disk loads at
-    boot with `-s`, which is both more reliable than the hotkey and invisible
-    to the player; a resume whose state RomM pushes after activate returns is
-    delivered by a deferred thread over the load hotkey instead. Saving is
-    hotkey only: the render window is activated, `SAVE_KEY` is sent through
-    XTEST, and the state directory is polled until the file settles, since
-    the hotkey gives no acknowledgement.
+    xdotool can reach it. A resume whose state is already on disk, and whose
+    game id matches the disc booting, loads at boot with `-s`, which is both
+    more reliable than the hotkey and invisible to the player; a resume whose
+    state RomM pushes after activate returns is delivered by a deferred thread
+    over the load hotkey instead. Saving is hotkey only: this launch's own
+    render window is activated, `SAVE_KEY` is sent through XTEST, and the state
+    directory is polled until the file settles, since the hotkey gives no
+    acknowledgement.
 
     Save data rides the save archive: `GC` holds the memory cards as loose
     `.gci` files, `Wii` the NAND, so nothing here needs the whole-card
@@ -347,6 +487,7 @@ class Dolphin(Emulator):
         state_slot: The one slot the broker works in, echoed back as the effective slot.
         state_dir: Where Dolphin writes `.sNN` files.
         log_path: The Dolphin log the broker exposes.
+        memory_card_subtree: `GC` on a GameCube session, None on any other.
     """
 
     name = "dolphin"
@@ -356,21 +497,32 @@ class Dolphin(Emulator):
     """Directories the save archive carries.
 
     GC holds the memory cards, Wii the NAND. GC's card also rides the
-    whole-card routes when a container opts in (`memory_card_subtree` below);
-    Wii has no physical card, so its NAND only ever moves through the save
-    archive.
+    whole-card routes when a GameCube session opts in
+    (`memory_card_subtree` below); Wii has no physical card, so both its NAND
+    and any GC tree beside it only ever move through the save archive.
     """
+    state_subtrees = ("StateSaves",)
     rom_extensions = ROM_EXTENSIONS
     supports_states = True
     state_slot = STATE_SLOT
     state_dir = STATE_DIR
     log_path = DOLPHIN_LOG_PATH
-    memory_card_subtree = "GC"
 
     def __init__(self) -> None:
         """Set up the process state and the launch sequence counter that fences deferred loads."""
         super().__init__()
         self._launch_seq = 0
+
+    @property
+    def memory_card_subtree(self) -> Optional[str]:
+        """The subtree the whole-card routes carry: `GC` for GameCube, None otherwise.
+
+        Gated on the session's platform because `memory_card_path` is: a Wii
+        session has no card for those routes to carry, so naming a subtree
+        here anyway would take GC out of both the archive restore and the dump
+        with nothing else willing to move it.
+        """
+        return "GC" if self.platform == _GC_PLATFORM else None
 
     def memory_card_path(self, platform: Optional[str] = None) -> Optional[Path]:
         """The whole GC/ tree, or None for Wii (NAND, no physical card).
@@ -380,7 +532,7 @@ class Dolphin(Emulator):
         and a library can mix regions, so syncing has to carry all of them
         rather than guessing one.
         """
-        return USER_DIR / "GC" if platform == "ngc" else None
+        return USER_DIR / "GC" if platform == _GC_PLATFORM else None
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a RomM path to the disc image to boot.
@@ -440,23 +592,34 @@ class Dolphin(Emulator):
         return result.stdout
 
     def _render_window(self) -> Optional[str]:
-        """Find the window Dolphin renders the game into.
+        """Find the window this launch's Dolphin renders the game into.
 
         Picked by title rather than by taking the first match, because the main
         window and any dialog carry the same class, and a hotkey sent at either
-        of those does nothing.
+        of those does nothing. Then confirmed by pid: a window left behind by
+        the previous emulator process carries the same class and the same kind
+        of title, and would swallow the save hotkey for a session that has
+        already moved on.
 
         Returns:
-            The X window id as xdotool prints it, or None when no render window is up.
+            The X window id as xdotool prints it, or None when this process has no render
+            window up.
         """
+        proc = self._proc
+        if proc is None:
+            log.warning("no dolphin process to find a render window for")
+            return None
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if out is None:
             return None
         for win_id in out.split():
             name = self._xdotool("getwindowname", win_id)
-            if name and _RENDER_TITLE_MARK in name:
+            if not name or _RENDER_TITLE_MARK not in name:
+                continue
+            pid = self._xdotool("getwindowpid", win_id)
+            if pid is not None and pid.strip() == str(proc.pid):
                 return win_id
-        log.warning("no dolphin render window found")
+        log.warning("no dolphin render window found for pid %s", proc.pid)
         return None
 
     def _send_key(self, key: str) -> bool:
@@ -483,9 +646,10 @@ class Dolphin(Emulator):
         """Stop any running instance, seed the pad bindings, and start dolphin-emu.
 
         The binary comes from env `DOLPHIN_BIN` (default `dolphin-emu`). With
-        `resume_slot` set and a state already in the working slot, the state
-        is loaded at boot with `-s`; with the slot still empty, a deferred
-        thread waits for RomM's push and loads it over the hotkey.
+        `resume_slot` set and the working slot holding a state for this disc,
+        the state is loaded at boot with `-s`; with the slot empty or holding
+        another game's state, a deferred thread waits for RomM's push and
+        loads it over the hotkey.
 
         Args:
             rom_path: The disc image to boot.
@@ -522,7 +686,7 @@ class Dolphin(Emulator):
 
         # A state already on disk (restored from the save archive) loads at boot,
         # which is both more reliable than the hotkey and invisible to the player.
-        resume_path = _state_for_slot(STATE_SLOT) if resume_slot is not None else None
+        resume_path = _resume_state(rom_path) if resume_slot is not None else None
         if resume_path is not None:
             cmd += ["-s", str(resume_path)]
 
@@ -533,18 +697,23 @@ class Dolphin(Emulator):
         # RomM pushes its resume pick after activate returns, so a slot that was
         # empty at launch can still fill. That one has to go in over the hotkey.
         if resume_slot is not None and resume_path is None:
-            Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
+            Thread(
+                target=self._deferred_load_state, args=(seq, rom_path), daemon=True
+            ).start()
 
-    def _deferred_load_state(self, seq: int) -> None:
+    def _deferred_load_state(self, seq: int, rom_path: Path) -> None:
         """Wait for a pushed state to arrive, then load it over the hotkey.
 
         Gives the file `RESUME_LOAD_WAIT` to appear, then `RESUME_LOAD_SETTLE`
-        for the window to be ready. Abandons itself whenever `seq` no longer
-        matches the current launch, so a superseded launch never gets a stray
-        load.
+        for the window to be ready. The state has to belong to the ROM that
+        booted, the same test the `-s` resume makes, since this path also runs
+        for a launch whose slot held another game's state. Abandons itself
+        whenever `seq` no longer matches the current launch, so a superseded
+        launch never gets a stray load.
 
         Args:
             seq: The launch sequence number this load belongs to.
+            rom_path: The image that booted, whose game id the state must carry.
         """
         deadline = time.monotonic() + RESUME_LOAD_WAIT
         if not self.wait_for_state(deadline):
@@ -555,6 +724,11 @@ class Dolphin(Emulator):
             return
         time.sleep(RESUME_LOAD_SETTLE)
         if self._launch_seq != seq:
+            return
+        if _resume_state(rom_path) is None:
+            log.warning(
+                "resume: the working slot holds no state for %s, no load sent", rom_path.name
+            )
             return
         ok = self.load_state(STATE_SLOT)
         log.info("resume: deferred load %s", "delivered" if ok else "failed")
@@ -576,7 +750,8 @@ class Dolphin(Emulator):
         before = _snapshot()
         if not self._send_key(SAVE_KEY):
             return False
-        return _wait_for_state_write(before, time.monotonic() + STATE_WAIT)
+        pid = self._proc.pid if self._proc is not None else None
+        return _wait_for_state_write(before, time.monotonic() + STATE_WAIT, pid)
 
     def load_state(self, slot: int) -> bool:
         """Load the broker's slot over the hotkey.

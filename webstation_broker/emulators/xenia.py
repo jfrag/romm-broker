@@ -143,8 +143,11 @@ def _find_container(base: Path) -> Optional[Path]:
     for pattern in _CONTAINER_GLOBS:
         try:
             matches = list(base.glob(pattern))
-        except OSError:
-            return None
+        except OSError as exc:
+            # One unreadable subdirectory must not discard the candidates the
+            # other patterns already found.
+            log.warning("xenia: container search of %s for %s failed: %s", base, pattern, exc)
+            continue
         for p in matches:
             if p.name.startswith("."):
                 continue
@@ -219,8 +222,10 @@ class Xenia(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                # One unreadable subdirectory must not discard the candidates
+                # the other patterns already found.
+                log.warning("xenia: search of %s for %s failed: %s", path, pattern, exc)
         rom = _pick_rom_file(candidates, path)
         if rom is not None:
             return rom

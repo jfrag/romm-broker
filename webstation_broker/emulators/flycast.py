@@ -121,6 +121,17 @@ def _pick_rom_file(candidates: list[Path], base: Path) -> Optional[Path]:
     return min(ranked)[4]
 
 
+UNTRUSTED_SUFFIX = ".untrusted"
+"""Suffix a resume state is renamed with when a force-killed exit leaves it unusable.
+
+The file is only suspected of being torn, never known to be, so it is set
+aside under this name rather than deleted. It stops matching `*.state`, so
+neither `clear_working_slot` nor a resume can pick it up, and it rides the
+save archive as ordinary save data (see `save_file_kind`), which is what
+makes it recoverable at all: DATA_DIR itself does not outlive the container.
+"""
+
+
 def _state_path_for(rom_path: Path) -> Path:
     return DATA_DIR / f"{rom_path.stem}.state"
 
@@ -151,8 +162,28 @@ class Flycast(Emulator):
         super().__init__()
         self._rom_path: Optional[Path] = None
 
+    def save_file_kind(self, rel: str) -> str:
+        """Classify an archive member for the manifest.
+
+        Flycast keeps the savestate loose beside the VMU images, so the
+        subtree-based default cannot split them; the `.state` suffix can.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            `state` for the savestate, `save` for everything else.
+        """
+        return "state" if rel.lower().endswith(".state") else "save"
+
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
         """Resolve a ROM path to a single playable disc image or file.
+
+        A pattern that cannot be walked (an unreadable subdirectory, a broken
+        mount) costs only what that pattern would have contributed: the
+        candidates already found still rank, since reporting a title
+        unbootable over one bad directory is worse than booting the best of
+        what could be read.
 
         Args:
             path: A direct file path, or a folder searched up to one level
@@ -171,8 +202,8 @@ class Flycast(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                log.warning("rom search %r under %s failed: %s", pattern, path, exc)
         return _pick_rom_file(candidates, path)
 
     def _xdotool(self, *args: str) -> Optional[str]:
@@ -213,6 +244,39 @@ class Flycast(Emulator):
         log.warning("no flycast window found for pid %s", proc.pid)
         return None
 
+    def _close_request(self, win_id: str) -> bool:
+        """Activate the emulator's own window and send it Alt+F4.
+
+        The keystroke goes through XTEST (no `key --window`) on purpose:
+        Alt+F4 is a labwc keybind, and the compositor only acts on input that
+        reaches the seat, so a synthetic event delivered straight to the
+        client window would never fire its Close action and flycast would
+        never see SDL_QUIT. XTEST lands on whatever holds focus, so focus is
+        read back and the request is abandoned when a different window owns
+        it, rather than closing something the player did not ask to close.
+
+        Args:
+            win_id: Window id already confirmed to belong to this launch.
+
+        Returns:
+            True when the keystroke was sent, False when the window could not
+            be activated or a different window holds focus.
+        """
+        if self._xdotool("windowactivate", "--sync", win_id) is None:
+            return False
+        active = (self._xdotool("getactivewindow") or "").strip()
+        if active and active != win_id:
+            log.warning(
+                "%s window %s did not take focus (active window is %s), skipping the close request",
+                self.name,
+                win_id,
+                active,
+            )
+            return False
+        if not active:
+            log.debug("could not read the active window, trusting the synced activate of %s", win_id)
+        return self._xdotool("key", "--clearmodifiers", "alt+F4") is not None
+
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Stop any running instance and launch Flycast for the given ROM.
 
@@ -248,18 +312,14 @@ class Flycast(Emulator):
 
         Activates the emulator's own window and sends Alt+F4 to trigger
         Flycast's only clean-shutdown path (SDL_QUIT). Falls back to the
-        base class's SIGTERM/SIGKILL escalation if no window can be found or
-        activated, or if the process has not exited within term_timeout.
+        base class's SIGTERM/SIGKILL escalation if no window can be found,
+        activated or focused, or if the process has not exited within
+        term_timeout.
         """
         proc = self._proc
         if proc is not None and proc.poll() is None:
             win_id = self._window()
-            sent = (
-                win_id is not None
-                and self._xdotool("windowactivate", "--sync", win_id) is not None
-                and self._xdotool("key", "--clearmodifiers", "alt+F4") is not None
-            )
-            if sent:
+            if win_id is not None and self._close_request(win_id):
                 try:
                     proc.wait(timeout=self.term_timeout)
                     self._forget()
@@ -292,8 +352,33 @@ class Flycast(Emulator):
             except OSError as exc:
                 log.warning("could not clear stale resume state %s: %s", stale.name, exc)
 
+    def _set_aside_untrusted_state(self, path: Path) -> None:
+        """Rename a resume state that a force-killed exit may have torn.
+
+        Size and mtime are all the broker has to judge a state by, and that
+        is enough to refuse to resume from one but not enough to destroy the
+        only copy of a player's progress, so the file is moved to a
+        `UNTRUSTED_SUFFIX` sidecar instead of unlinked. A previous sidecar
+        for the same rom is replaced, which bounds the leftovers at one per
+        title.
+
+        Args:
+            path: The resume state to move aside.
+        """
+        aside = path.with_name(path.name + UNTRUSTED_SUFFIX)
+        try:
+            path.replace(aside)
+        except OSError as exc:
+            log.warning("could not set aside untrusted resume state at %s: %s", path, exc)
+        else:
+            log.warning("set aside untrusted resume state at %s as %s", path, aside.name)
+
     def save_and_exit(self, slot: Optional[int]) -> dict:
         """Stop the emulator and report whether this exit actually saved state.
+
+        A state the exit may have torn is not reported and not resumed from,
+        but it is kept: `_set_aside_untrusted_state` renames it rather than
+        deleting it.
 
         Args:
             slot: The resume slot to report on. If None, the emulator is
@@ -336,17 +421,11 @@ class Flycast(Emulator):
                 log.warning("flycast had to be force-killed, resume state not trusted")
                 try:
                     st = p.stat()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    log.debug("no resume state at %s after a force-killed exit: %s", p, exc)
                 else:
                     if before is None or before != (st.st_size, st.st_mtime):
-                        try:
-                            p.unlink()
-                            log.warning("discarded untrusted resume state at %s", p)
-                        except OSError as exc:
-                            log.warning(
-                                "could not discard untrusted resume state at %s: %s", p, exc
-                            )
+                        self._set_aside_untrusted_state(p)
             else:
                 try:
                     st = p.stat()

@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking at webstation-broker. A few ground rules before you open a PR.
+Thanks for looking at romm-broker. A few ground rules before you open a PR.
 
 ## Workflow
 

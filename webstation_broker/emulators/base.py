@@ -37,6 +37,9 @@ emulator on top of the first.
 _SENSITIVE_ENV_VARS = {"BROKER_SECRET", "SELKIES_MASTER_TOKEN", "GITHUB_TOKEN"}
 _SENSITIVE_ENV_SUFFIXES = ("_SECRET", "_TOKEN", "_PASSWORD", "_KEY")
 
+_DEFAULT_TERM_TIMEOUT = 5.0
+"""Seconds SIGTERM gets before SIGKILL when nothing names a longer grace."""
+
 
 def base_launch_env() -> dict[str, str]:
     """Build the environment apps are launched into.
@@ -66,26 +69,39 @@ def base_launch_env() -> dict[str, str]:
     return env
 
 
-def _record_pid(name: str, pid: int, cmd: list[str]) -> None:
+def _record_pid(
+    name: str, pid: int, cmd: list[str], term_timeout: Optional[float] = None
+) -> None:
     """Write the running emulator's pid record to `PID_FILE`.
 
     Written through a temp file: the record exists for the case where the broker
     dies, and a broker that dies mid-write would otherwise leave half a line of
-    JSON and no way to find the emulator it left behind. A failure to write is
-    logged, not raised.
+    JSON and no way to find the emulator it left behind.
 
     Args:
         name: The emulator's `name`, so the reaper can say what it killed.
         pid: The spawned process's pid.
         cmd: The argv it was spawned with, used later to confirm the pid still
             runs that command.
+        term_timeout: The emulator's own SIGTERM grace, stored so a later
+            broker process reaps it on its own teardown budget rather than a
+            fixed one. None leaves it out and the reaper falls back.
+
+    Raises:
+        OSError: When the record cannot be written. A session whose emulator
+            has no record survives a broker restart unreapable, so the caller
+            has to know rather than find out at the next launch.
     """
     tmp = PID_FILE.with_suffix(".tmp")
+    record: dict[str, Any] = {"name": name, "pid": pid, "cmd": cmd}
+    if term_timeout is not None:
+        record["term_timeout"] = term_timeout
     try:
-        tmp.write_text(json.dumps({"name": name, "pid": pid, "cmd": cmd}))
+        tmp.write_text(json.dumps(record))
         tmp.replace(PID_FILE)
     except OSError as exc:
-        log.warning("could not record emulator pid: %s", exc)
+        log.error("could not record %s pid %d at %s: %s", name, pid, PID_FILE, exc)
+        raise
 
 
 def _clear_pid_record() -> None:
@@ -115,18 +131,47 @@ def _cmdline(pid: int) -> list[str]:
     return [part for part in raw.decode(errors="replace").split("\0") if part]
 
 
+def _record_term_timeout(record: dict[str, Any]) -> float:
+    """The SIGTERM grace a pid record asks for, in seconds.
+
+    Args:
+        record: The decoded pid record.
+
+    Returns:
+        The record's `term_timeout` when it is a usable positive number, else
+        `_DEFAULT_TERM_TIMEOUT`. Records written before the field existed, and
+        anything that did not survive the JSON round trip as a number, land on
+        the fallback rather than on a grace of zero.
+    """
+    grace = record.get("term_timeout")
+    if isinstance(grace, bool) or not isinstance(grace, (int, float)):
+        return _DEFAULT_TERM_TIMEOUT
+    if grace <= 0:
+        log.warning(
+            "pid record for %s names a non-positive term_timeout %s, using %s s",
+            record.get("name", "emulator"),
+            grace,
+            _DEFAULT_TERM_TIMEOUT,
+        )
+        return _DEFAULT_TERM_TIMEOUT
+    return float(grace)
+
+
 def reap_orphan() -> Optional[dict[str, Any]]:
     """Kill an emulator left running by an earlier broker process.
 
     Only ever kills the pid the broker itself recorded, and only while that pid
     is still running the command it was recorded with, so a recycled pid is
     left alone. The process group gets SIGTERM, then SIGKILL if it is still
-    running the recorded command five seconds later. The record is cleared
+    running the recorded command once the grace in the record has passed. That
+    grace is the emulator's own `term_timeout`, so an orphan gets the same
+    teardown budget here as it would from `Emulator.stop`; a record written
+    without one falls back to `_DEFAULT_TERM_TIMEOUT`. The record is cleared
     whatever happens.
 
     Returns:
-        The record that was acted on, a dict with `{"name", "pid", "cmd"}`, or
-        None when there was no usable record.
+        The record that was acted on, a dict with `{"name", "pid", "cmd"}` and
+        optionally `term_timeout`, or None when there was no usable record.
     """
     try:
         record = json.loads(PID_FILE.read_text())
@@ -156,7 +201,7 @@ def reap_orphan() -> Optional[dict[str, Any]]:
         log.warning("reaping orphaned %s (pid %d) from an earlier broker process",
                     record.get("name", "emulator"), pid)
         os.killpg(pgid, signal.SIGTERM)
-        deadline = time.monotonic() + 5.0
+        deadline = time.monotonic() + _record_term_timeout(record)
         while time.monotonic() < deadline and _cmdline(pid) == cmd:
             time.sleep(0.2)
         if _cmdline(pid) == cmd:
@@ -165,6 +210,19 @@ def reap_orphan() -> Optional[dict[str, Any]]:
         log.warning("could not kill orphaned pid %d: %s", pid, exc)
     _clear_pid_record()
     return record
+
+
+def _under_subtree(rel: str, subtree: str) -> bool:
+    """Whether a member path lies inside a subtree, or is the subtree itself.
+
+    Args:
+        rel: The member path, relative to the save root and posix-separated.
+        subtree: The subtree name to test against.
+
+    Returns:
+        True when `rel` equals `subtree` or starts with it followed by a slash.
+    """
+    return rel == subtree or rel.startswith(subtree + "/")
 
 
 class Emulator:
@@ -198,15 +256,19 @@ class Emulator:
        arrives after launch.
     4. `save_and_exit` saves when asked and stops. `stop` sends SIGTERM to the
        process group, escalates to SIGKILL after `term_timeout`, and `_forget`
-       drops both the handle and the pid record.
+       drops both the handle and the pid record once the process is confirmed
+       gone.
 
     Attributes:
         name: Registry key and log label for the emulator.
         display_name: Human-readable name the UI shows.
+        platform: The RomM platform slug the session was activated for, or None.
         requires_rom: Whether a launch needs a ROM; the desktop session does not.
         save_root: Root of the emulator's writable data.
         save_subtrees: Subtrees under `save_root` that hold save data; save
             restore and dump are scoped to these.
+        state_subtrees: The subset of `save_subtrees` holding savestates, for
+            labelling an archive's members.
         rom_extensions: File extensions the emulator will boot, in preference
             order.
         supports_states: Whether the emulator can save and load state
@@ -223,18 +285,36 @@ class Emulator:
             before it treats it as a card, or None.
         boot_failed: Set by an emulator that can tell its process is alive but
             never reached a running game.
+        extraction_phase: Set while a slow pre-launch extraction is running,
+            else None.
     """
 
     name: str = "base"
     """Registry key and log label for the emulator."""
     display_name: str = "Webstation"
     """Human-readable name the UI shows."""
+    platform: Optional[str] = None
+    """The RomM platform slug the session was activated for, or None.
+
+    The activate route sets it on every instance it builds, before `launch`,
+    so a launcher that is one shell over many backends (RetroArch picks its
+    core from it) has the slug to dispatch on. Declared here because the route
+    assigns it whether or not the emulator reads it, and a reader of any
+    subclass has to be able to find where it comes from.
+    """
     requires_rom: bool = True
     """Whether a launch needs a ROM; the desktop session is the one that does not."""
     save_root: Path = Path("/config")
     """Root of the emulator's writable data."""
     save_subtrees: tuple[str, ...] = ()
     """The subtrees under `save_root` that hold save data; save restore and dump are scoped to these."""
+    state_subtrees: tuple[str, ...] = ()
+    """The subset of `save_subtrees` holding savestates rather than the game's own save data.
+
+    Empty for emulators with no states, and for the few whose states share a
+    directory with their saves; those tell the two apart in `save_file_kind`
+    instead.
+    """
     rom_extensions: tuple[str, ...] = ()
     """File extensions the emulator will boot, in preference order."""
     supports_states: bool = False
@@ -261,8 +341,12 @@ class Emulator:
     """Where that slot's file lives, for the state-file routes to read and write."""
     log_path: Path = Path("/config/broker-app.log")
     """Where the emulator's stdout and stderr are appended."""
-    term_timeout: float = 5.0
-    """Seconds SIGTERM gets before escalating to SIGKILL."""
+    term_timeout: float = _DEFAULT_TERM_TIMEOUT
+    """Seconds SIGTERM gets before escalating to SIGKILL.
+
+    Recorded alongside the pid so `reap_orphan` gives an orphan of this
+    emulator the same grace a live `stop` would.
+    """
     memory_card_subtree: Optional[str] = None
     """The save subtree holding the whole memory card, for emulators that have one.
 
@@ -278,13 +362,19 @@ class Emulator:
     """
 
     def __init__(self) -> None:
-        """Start with no process handle and no boot failure flagged."""
+        """Start with no process handle, no boot failure, and no extraction running."""
         self._proc: Optional[subprocess.Popen[bytes]] = None
         self.boot_failed: bool = False
         """Whether the process is alive but never reached a running game.
 
         Set by an emulator that can tell: the boot-error-dialog case. Passive
         signal only: the broker surfaces it and takes no action of its own.
+        """
+        self.extraction_phase: Optional[str] = None
+        """Set while a slow pre-launch extraction is running, else None.
+
+        e.g. "extracting_archive", "extracting_pkg". Passive signal only, like
+        boot_failed: the broker surfaces it, RomM decides what to show.
         """
 
     def _spawn(self, cmd: list[str], env: dict[str, str], stdin_pipe: bool = False) -> None:
@@ -299,6 +389,12 @@ class Emulator:
             env: The environment to run it in, normally `base_launch_env()`.
             stdin_pipe: Keep the child's stdin as a pipe so emulators with a
                 stdin control protocol (shadPS4 IPC) can be driven headlessly.
+
+        Raises:
+            OSError: When the process started but its pid could not be
+                recorded. The process is killed first: an emulator no record
+                names outlives the next broker restart with nothing able to
+                find it, so the launch fails rather than leaving one behind.
         """
         try:
             log_fh = open(self.log_path, "ab", buffering=0)
@@ -319,7 +415,14 @@ class Emulator:
         finally:
             if log_fh:
                 log_fh.close()
-        _record_pid(self.name, self._proc.pid, cmd)
+        try:
+            _record_pid(self.name, self._proc.pid, cmd, self.term_timeout)
+        except OSError:
+            # Emulator.stop rather than self.stop: a subclass stop drives a
+            # control channel (IPC, a hotkey) the process has not come up far
+            # enough to answer yet, and this only needs the signal path.
+            Emulator.stop(self)
+            raise
 
     def alive(self) -> bool:
         """Whether a spawned process exists and has not exited."""
@@ -338,28 +441,50 @@ class Emulator:
     def stop(self) -> None:
         """Terminate the running emulator, if any, and forget it.
 
-        The handle and pid record are dropped first, then the process group gets
-        SIGTERM, escalating to SIGKILL once `term_timeout` passes. A process
-        that is already gone is a no-op.
+        The process group gets SIGTERM, escalating to SIGKILL once
+        `term_timeout` passes. A process that is already gone is a no-op.
+
+        The handle and the pid record are only dropped once the process is
+        confirmed gone. An emulator that outlived SIGKILL, or that refused the
+        signal outright, keeps both: dropping the record while it still runs
+        would leave it with nothing able to find it, which is the orphan
+        `PID_FILE` exists to prevent, and every subclass `launch` opens with a
+        `stop` that would then be its next chance to try again.
         """
         proc = self._proc
-        self._forget()
         if proc is None or proc.poll() is not None:
+            self._forget()
             return
         log.info("stopping %s (pid %d)", self.name, proc.pid)
+        gone = False
         try:
             pgid = os.getpgid(proc.pid)
             os.killpg(pgid, signal.SIGTERM)
             try:
                 proc.wait(timeout=self.term_timeout)
+                gone = True
             except subprocess.TimeoutExpired:
                 os.killpg(pgid, signal.SIGKILL)
                 try:
                     proc.wait(timeout=10)
+                    gone = True
                 except subprocess.TimeoutExpired:
-                    log.error("%s did not exit after SIGKILL", self.name)
+                    log.error(
+                        "%s (pid %d) did not exit after SIGKILL, keeping its pid record",
+                        self.name,
+                        proc.pid,
+                    )
         except ProcessLookupError:
-            pass
+            gone = True
+        except PermissionError as exc:
+            log.error(
+                "not allowed to signal %s (pid %d), keeping its pid record: %s",
+                self.name,
+                proc.pid,
+                exc,
+            )
+        if gone:
+            self._forget()
 
     def prepare_restore(self) -> None:
         """Hook run before a save archive is extracted into `save_root`.
@@ -464,6 +589,40 @@ class Emulator:
             The card directory, or None for emulators without a memory card.
         """
         return None
+
+    def archive_core(self) -> Optional[str]:
+        """The core or backend actually running the game, or None.
+
+        Only meaningful for a launcher that is one shell over many cores; it
+        goes in the archive manifest so the parent can tell a RetroArch PSP
+        archive from a standalone PPSSPP one.
+
+        Returns:
+            The core name, or None for emulators that are their own backend.
+        """
+        return None
+
+    def save_file_kind(self, rel: str) -> str:
+        """What an archive member holds, for the manifest the parent reads.
+
+        Every emulator lays its save directories out differently, so this is
+        what lets the parent sort an archive without a table of those layouts.
+        The default classifies by subtree; emulators whose states and saves
+        share a directory override it.
+
+        Args:
+            rel: The member path, relative to `save_root` and posix-separated.
+
+        Returns:
+            One of `state`, `state_screenshot`, `memcard` or `save`.
+        """
+        if self.memory_card_subtree and _under_subtree(rel, self.memory_card_subtree):
+            return "memcard"
+        if any(_under_subtree(rel, sub) for sub in self.state_subtrees):
+            # The frame captured with a state is written beside it, and the
+            # parent shows it rather than restoring it.
+            return "state_screenshot" if rel.lower().endswith((".png", ".jpg")) else "state"
+        return "save"
 
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.

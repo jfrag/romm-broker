@@ -7,6 +7,7 @@ why the redirect is a monkeypatch of those globals rather than of the env.
 """
 
 import subprocess
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, Optional
@@ -20,6 +21,9 @@ from webstation_broker.emulators import base
 from webstation_broker.emulators.base import Emulator
 
 PREFIX = settings.PREFIX
+
+SLEEPER_CMD = ["/usr/bin/sleep", "60"]
+"""Argv every `sleeper` process runs, and what a record naming one has to hold."""
 
 
 @pytest.fixture(autouse=True)
@@ -35,11 +39,13 @@ def clean_session() -> Iterator[None]:
     session.LAST_EXIT = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
+    session.ROOM["cooldowns"] = {}
     yield
     session.SESSION = None
     session.LAST_EXIT = None
     session.ROOM["controller"] = None
     session.ROOM["viewers"] = {}
+    session.ROOM["cooldowns"] = {}
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +104,13 @@ def pid_record(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 def sleeper() -> Iterator[Callable[[], subprocess.Popen[bytes]]]:
     """Hand out processes in their own session, each standing in for a running emulator.
 
+    A sleeper is handed back only once `/proc` reports the argv the reaper
+    matches its record against. `Popen` returns as soon as the exec closes the
+    error pipe, which is before the loader has published the new argv, so a
+    caller that records the pid straight away can record a process whose
+    cmdline still reads empty. The reaper then refuses that record, kills
+    nothing, and the test waits out its deadline on a process nobody signalled.
+
     Every process spawned is killed and reaped when the test ends.
 
     Yields:
@@ -106,13 +119,20 @@ def sleeper() -> Iterator[Callable[[], subprocess.Popen[bytes]]]:
     procs = []
 
     def spawn() -> subprocess.Popen[bytes]:
-        """Start one sleeper and remember it for teardown.
+        """Start one sleeper, wait for it to be identifiable, and remember it for teardown.
 
         Returns:
-            The spawned process.
+            The spawned process, whose pid `base._cmdline` already reports
+            `SLEEPER_CMD` for.
         """
-        proc = subprocess.Popen(["/usr/bin/sleep", "60"], start_new_session=True)
+        proc = subprocess.Popen(SLEEPER_CMD, start_new_session=True)
+        # Appended before the wait so teardown still kills it if it never shows.
         procs.append(proc)
+        deadline = time.monotonic() + 10.0
+        while base._cmdline(proc.pid) != SLEEPER_CMD:
+            if time.monotonic() >= deadline:
+                pytest.fail(f"sleeper pid {proc.pid} never reported its argv")
+            time.sleep(0.01)
         return proc
 
     yield spawn
@@ -160,6 +180,7 @@ class FakeEmulator(Emulator):
         state_file: The path state_path and state_target answer with.
         swapped_discs: Every path passed to swap_disc, in order.
         swap_ok: What swap_disc answers.
+        launch_fails: Whether launch raises instead of recording the call.
     """
 
     name = "fake"
@@ -168,6 +189,7 @@ class FakeEmulator(Emulator):
     supports_states = True
     supports_disc_swap = True
     state_slot = 3
+    launch_fails = False
 
     def __init__(self) -> None:
         """Build the fake with nothing launched and every recorder empty."""
@@ -219,7 +241,12 @@ class FakeEmulator(Emulator):
         Args:
             rom_path: The ROM handed to the emulator.
             resume_slot: The state slot to resume from, or None.
+
+        Raises:
+            RuntimeError: When launch_fails is set, so a test can drive the failure path.
         """
+        if self.launch_fails:
+            raise RuntimeError("fake launch failure")
         self.launched = (rom_path, resume_slot)
 
     def save_state(self, slot: int) -> bool:
@@ -315,12 +342,14 @@ def fake_emulator(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[FakeE
     built = []
     root = tmp_path / "fakeconfig"
     (root / "saves").mkdir(parents=True)
+    (root / "states").mkdir(parents=True)
 
     class Tracked(FakeEmulator):
         """A FakeEmulator rooted in tmp_path that appends each instance to the shared list."""
 
         save_root = root
-        save_subtrees = ("saves",)
+        save_subtrees = ("saves", "states")
+        state_subtrees = ("states",)
 
         def __init__(self) -> None:
             """Build the fake and append it to the shared list."""
@@ -344,8 +373,13 @@ def client(broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> Ite
         A client whose app lifespan is running for the duration of the test.
     """
     monkeypatch.setattr(settings, "BROKER_SECRET", "")
+    # create_app refuses to build with neither a secret nor dev mode, which is
+    # the very shape these tests drive the unauthenticated routes in. Dev mode
+    # covers the construction and comes straight back off for the requests.
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    app = create_app()
     monkeypatch.setattr(settings, "DEV_MODE", False)
-    with TestClient(create_app()) as c:
+    with TestClient(app) as c:
         yield c
 
 

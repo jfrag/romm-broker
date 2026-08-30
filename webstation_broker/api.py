@@ -10,6 +10,8 @@ SUBFOLDER prefix; the RomM-facing ones require `X-Broker-Secret` when
 import hmac
 import logging
 import os
+import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +21,7 @@ import anyio
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketState
 
 from . import callback, memcard, saves, selkies, session, settings
 from .emulators import get_emulator
@@ -26,6 +29,22 @@ from .emulators.base import Emulator, reap_orphan
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+TOKEN_CLEAR_GRACE_SECONDS = 1.5
+"""Seconds the room gets between being told the session ended and losing its tokens.
+
+Selkies errors on a connected client whose token vanished, so browsers are
+given this long to tear the stream iframe down before the token set empties.
+"""
+
+_ACTIVATE_LOCK = threading.Lock()
+"""Held for the whole of activate, so two launches never end up sharing one screen.
+
+The 409 gate reads `session.SESSION`, but every step between that read and
+`new_session` awaits, so without this two callers both pass the gate and both
+launch an emulator. Taken without blocking: a second caller is told to come
+back rather than queued behind a launch that can take a minute.
+"""
 
 
 class SaveIn(BaseModel):
@@ -90,7 +109,7 @@ class JoinIn(BaseModel):
 
 
 class InviteIn(BaseModel):
-    """A seat the controller is minting for an invite link.
+    """The permission an invite link grants to everyone who opens it.
 
     Attributes:
         permission: Either `participant` or `readonly`.
@@ -284,6 +303,98 @@ def _archive_subtrees(
     return tuple(s for s in emulator.save_subtrees if s != card), (card,)
 
 
+def _archive_identity(sess: dict[str, Any], emulator: Emulator) -> dict[str, Any]:
+    """Session identity for the dump archive's manifest.
+
+    Args:
+        sess: The active session record.
+        emulator: The emulator that just exited.
+
+    Returns:
+        The emulator, its core (for a launcher that fronts many), the platform,
+        the ROM's RomM id, name and file, and the state slot the archive was
+        taken in.
+    """
+    rom = sess.get("rom") or {}
+    return {
+        "emulator": emulator.name,
+        "core": emulator.archive_core(),
+        "platform": rom.get("platform"),
+        "rom_id": rom.get("id"),
+        "rom": rom.get("name"),
+        "rom_file": sess.get("rom_file"),
+        "state_slot": emulator.state_slot if emulator.supports_states else None,
+    }
+
+
+async def _push_seat_tokens(sess: dict[str, Any], operation: str) -> bool:
+    """Publish the session's seat tokens to selkies and say whether it took them.
+
+    A dropped push is not cosmetic: a seat whose token selkies never learned
+    cannot open the stream at all. The push itself already retries, so the job
+    here is to name the session and the operation it was for, and to hand the
+    outcome back for the route to report.
+
+    Args:
+        sess: The session whose token map is pushed.
+        operation: What the push is for, e.g. `activate`, named in the failure log.
+
+    Returns:
+        True when selkies accepted the push.
+    """
+    if await selkies.push_tokens(sess):
+        return True
+    log.error(
+        "selkies token push failed (%s, session %s): seats cannot reach the stream",
+        operation,
+        sess["id"],
+    )
+    return False
+
+
+async def _clear_seat_tokens(session_id: str) -> bool:
+    """Empty the selkies token set and say whether it took.
+
+    A token set that survives its session keeps every seat's stream credential
+    live against whatever runs next, so the outcome is logged and reported
+    rather than dropped on the floor.
+
+    Args:
+        session_id: The session being retired, named in the failure log.
+
+    Returns:
+        True when selkies accepted the empty set.
+    """
+    if await selkies.clear_tokens():
+        return True
+    log.error(
+        "selkies token clear failed (session %s): stream tokens may still be live",
+        session_id,
+    )
+    return False
+
+
+async def _send_to_controller(payload: dict[str, Any]) -> None:
+    """Send a JSON message to the controller's room socket and no one else.
+
+    The room fanout reaches anonymous invite guests too, so anything naming a
+    container path, a callback URL or a raw error goes through here instead.
+
+    Args:
+        payload: The JSON-serializable message, normally carrying a `type` key.
+    """
+    conn = session.ROOM.get("controller")
+    if not conn:
+        return
+    ws = conn["websocket"]
+    if ws.client_state != WebSocketState.CONNECTED:
+        return
+    try:
+        await ws.send_json(payload)
+    except Exception as exc:
+        log.warning("controller send failed: %s", exc)
+
+
 @router.get("/api/health")
 async def health() -> dict[str, str]:
     """Report that the broker is up."""
@@ -298,11 +409,8 @@ async def activate(
 ) -> dict[str, Any]:
     """Start a session: restore save data, launch the emulator and mint the controller seat.
 
-    Any emulator left behind by an earlier broker process is reaped first.
-    The working slot is then emptied and the save archive, if one was sent,
-    is extracted into it before the emulator boots, so the restore rather than
-    the previous session decides what is in it. The seat tokens are pushed to
-    selkies once the emulator is launching.
+    Serialized on `_ACTIVATE_LOCK`, so a second caller arriving mid-launch is
+    refused rather than left to start an emulator over the top of the first.
 
     Args:
         body: The launch request: emulator, rom, save data, callback and the multiplayer flag.
@@ -310,19 +418,51 @@ async def activate(
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
+        The launch report from `_start_session`.
+
+    Raises:
+        HTTPException: 403 on a bad secret; 409 when a session is already active
+            or another activate is still running; everything else `_start_session` raises.
+    """
+    _check_secret(x_broker_secret)
+    if not _ACTIVATE_LOCK.acquire(blocking=False):
+        log.warning("activate refused: another activate is still in progress")
+        raise HTTPException(
+            status_code=409, detail="another activate is already in progress"
+        )
+    try:
+        return await _start_session(body, request)
+    finally:
+        _ACTIVATE_LOCK.release()
+
+
+async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
+    """Do the launch itself, with the activate lock already held.
+
+    Any emulator left behind by an earlier broker process is reaped first. The
+    save archive is located and read before the working slot is emptied, so a
+    request that turns out to name an archive that is not there leaves the slot
+    as it found it. The restore is then extracted into the emptied slot before
+    the emulator boots, so the restore rather than the previous session decides
+    what is in it, and the seat tokens are pushed to selkies once the emulator
+    is launching.
+
+    Args:
+        body: The launch request: emulator, rom, save data, callback and the multiplayer flag.
+        request: The incoming request, used to derive the callback origin.
+
+    Returns:
         A dict with `status`, `session_id`, `rom_file`, `save_restore` (the
         extraction report, or None when nothing was restored),
         `selkies_tokens_pushed` and the controller's landing `url`.
 
     Raises:
-        HTTPException: 403 on a bad secret; 409 when a session is already
-            active; 422 for an unknown emulator, a missing rom on an emulator
-            that needs one, no bootable file, or a failed restore; 400 for a rom
-            path that cannot be resolved or lies outside ROM_ROOT; 404 for a rom
-            path or save archive that does not exist.
+        HTTPException: 409 when a session is already active; 422 for an unknown
+            emulator, a missing rom on an emulator that needs one, no bootable
+            file, or a failed restore; 400 for a rom path that cannot be
+            resolved or lies outside ROM_ROOT; 404 for a rom path or save
+            archive that does not exist.
     """
-    _check_secret(x_broker_secret)
-
     if session.SESSION is not None and session.SESSION.get("active"):
         raise HTTPException(
             status_code=409,
@@ -352,9 +492,10 @@ async def activate(
             rom_path = Path(body.rom.path).resolve()
         except OSError:
             raise HTTPException(status_code=400, detail="invalid rom path")
-        if not rom_path.is_relative_to(settings.ROM_ROOT):
+        rom_root = settings.rom_root()
+        if not rom_path.is_relative_to(rom_root):
             raise HTTPException(
-                status_code=400, detail=f"rom path must live under {settings.ROM_ROOT}"
+                status_code=400, detail=f"rom path must live under {rom_root}"
             )
         if not rom_path.exists():
             raise HTTPException(status_code=404, detail="rom path does not exist")
@@ -368,21 +509,25 @@ async def activate(
                 },
             )
 
-    # Restore save data before the emulator boots. The working slot is emptied
-    # first so the restore, not the previous session, decides what is in it.
-    await anyio.to_thread.run_sync(emulator.clear_working_slot)
-    restore_report = None
     save = body.save
     subtrees, excluded = _archive_subtrees(
         emulator, bool(save and save.memory_card_synced)
     )
+    # Read before the working slot is emptied: an archive that is not there
+    # has to fail with the slot still holding whatever it held.
+    content = None
     if save and save.archive and subtrees:
         archive_path = Path(save.archive)
         if not archive_path.is_file():
+            log.warning("activate: save archive not found: %s", save.archive)
             raise HTTPException(
                 status_code=404, detail=f"save archive not found: {save.archive}"
             )
         content = await anyio.to_thread.run_sync(archive_path.read_bytes)
+
+    await anyio.to_thread.run_sync(emulator.clear_working_slot)
+    restore_report = None
+    if content is not None:
         await anyio.to_thread.run_sync(emulator.prepare_restore)
         restore_report = await anyio.to_thread.run_sync(
             saves.extract_save_archive,
@@ -411,11 +556,18 @@ async def activate(
     )
 
     resume_slot = save.resume_slot if save else None
-    await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
+    try:
+        await anyio.to_thread.run_sync(emulator.launch, rom_file, resume_slot)
+    except Exception:
+        # Otherwise the session stays marked active with no emulator behind
+        # it, and every retry 409s instead of reaching launch again.
+        log.error("session %s: launch failed, retiring the session", sess["id"], exc_info=True)
+        session.retire_session()
+        raise
     # Baseline after launch: the exit dump only ships files this session wrote.
     sess["save_baseline"] = time.time()
 
-    tokens_pushed = await selkies.push_tokens(sess)
+    tokens_pushed = await _push_seat_tokens(sess, "activate")
 
     return {
         "status": "launching",
@@ -427,7 +579,9 @@ async def activate(
     }
 
 
-async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[str, Any]:
+async def _mint_viewer(
+    permission: str, user: Optional[dict[str, Any]]
+) -> tuple[dict[str, Any], bool]:
     """Add a seat to the running session and publish it to the control plane.
 
     Shared by the RomM-facing join route and the controller's invite route so
@@ -438,10 +592,13 @@ async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[
         user: The RomM user taking the seat, or None for an anonymous invite.
 
     Returns:
-        The viewer record, including its `token` and `username`.
+        The viewer record, including its `token` and `username`, and whether
+        selkies took the new token set. A seat selkies never learned about is
+        still a seat, but it cannot open the stream until a later push lands.
 
     Raises:
-        HTTPException: 409 when no session is active; 422 for an unknown permission.
+        HTTPException: 409 when no session is active; 422 for an unknown
+            permission; 429 when the room is already at its seat cap.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
@@ -452,10 +609,12 @@ async def _mint_viewer(permission: str, user: Optional[dict[str, Any]]) -> dict[
             status_code=422, detail="permission must be participant or readonly"
         )
 
-    viewer = session.add_viewer(permission, user)
-    await selkies.push_tokens(sess)
+    viewer = await session.add_viewer(permission, user)
+    if viewer is None:
+        raise HTTPException(status_code=429, detail="room is full")
+    tokens_pushed = await _push_seat_tokens(sess, f"seat a {permission}")
     await session.broadcast_state()
-    return viewer
+    return viewer, tokens_pushed
 
 
 @router.post("/api/session/join")
@@ -470,40 +629,47 @@ async def join(body: JoinIn, x_broker_secret: Optional[str] = Header(default=Non
         x_broker_secret: The shared secret RomM sends; required when `BROKER_SECRET` is set.
 
     Returns:
-        A dict with `status`, `session_id`, `permission`, `username` and the seat's landing `url`.
+        A dict with `status`, `session_id`, `permission`, `username`,
+        `selkies_tokens_pushed` and the seat's landing `url`.
 
     Raises:
         HTTPException: 403 on a bad secret; 409 when no session is active; 422
-            for an unknown permission.
+            for an unknown permission; 429 when the room is already at its
+            seat cap.
     """
     _check_secret(x_broker_secret)
 
-    viewer = await _mint_viewer(body.permission, body.user)
+    viewer, tokens_pushed = await _mint_viewer(body.permission, body.user)
     sess = session.SESSION
     return {
         "status": "joined",
         "session_id": sess["id"],
         "permission": body.permission,
         "username": viewer["username"],
+        "selkies_tokens_pushed": tokens_pushed,
         "url": _landing_url(viewer["token"]),
     }
 
 
 @router.post("/api/session/invite")
 async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
-    """Mint a seat for someone the controller will send a link to.
+    """Return the session's shareable invite link for a permission.
 
-    The room frontend does not hold the broker secret, so this is gated on the
-    controller token the same way the exit route is. The session's multiplayer
-    flag is deliberately not consulted: a link the host went out of their way
-    to copy should work whichever way they set the switch.
+    The link is the same on every call for the session and seats no one by
+    itself: each person who opens it is given their own seat by the context
+    route, so the host sends one link to everyone rather than juggling one per
+    friend. The room frontend does not hold the broker secret, so this is
+    gated on the controller token the same way the exit route is. The
+    session's multiplayer flag is deliberately not consulted: a link the host
+    went out of their way to copy should work whichever way they set the
+    switch.
 
     Args:
-        body: The permission the invited seat gets.
+        body: The permission everyone arriving on the link gets.
         token: The controller token, passed as a query parameter.
 
     Returns:
-        A dict with `status`, `session_id`, `permission`, `username` and the seat's landing `url`.
+        A dict with `status`, `session_id`, `permission` and the link's `url`.
 
     Raises:
         HTTPException: 409 when no session is active; 403 when the token is not
@@ -514,15 +680,61 @@ async def invite(body: InviteIn, token: str = Query()) -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="no active session")
     if not _ct_eq(token, sess["controller_token"]):
         raise HTTPException(status_code=403, detail="controller token required")
+    if body.permission not in ("participant", "readonly"):
+        raise HTTPException(
+            status_code=422, detail="permission must be participant or readonly"
+        )
 
-    viewer = await _mint_viewer(body.permission, None)
     return {
         "status": "invited",
         "session_id": sess["id"],
         "permission": body.permission,
-        "username": viewer["username"],
-        "url": _landing_url(viewer["token"]),
+        "url": f"{settings.PREFIX}/?invite={session.invite_token(body.permission)}",
     }
+
+
+def _exit_outcomes(
+    upload: dict[str, Any],
+    archive_path: Optional[str],
+    cb: Optional[dict[str, Any]],
+    dump_error: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Describe what became of the save archive, once for the room and once for the controller.
+
+    The room summary reaches everyone seated, anonymous invite guests included,
+    so it names no container path, no callback URL and no raw error text. The
+    controller runs the session and is the one who has to act on a failure, so
+    those details go to that seat alone.
+
+    Args:
+        upload: The upload report block, whose `mode` decides the wording.
+        archive_path: Where the archive was kept on the container, if it was.
+        cb: The session's callback block, if it has one.
+        dump_error: Why the save dump failed, or None when it did not.
+
+    Returns:
+        The phrase for the room, and the controller-only line, the latter None
+        when there is nothing further to tell them.
+    """
+    if dump_error:
+        public = "the save dump failed, so nothing was uploaded"
+        detail = f"Save dump failed: {dump_error}."
+    elif upload["mode"] == "report-only":
+        public = "nothing was uploaded (dev mode)"
+        detail = f"Dev mode: would have uploaded to {(cb or {}).get('base_url')}."
+    elif upload["mode"] == "uploaded":
+        public = "saves uploaded"
+        detail = f"Uploaded to {upload['url']}."
+    elif upload["mode"] == "skipped":
+        public = "nothing to upload"
+        detail = None
+    else:
+        public = "the save upload failed, the archive was kept on the container"
+        detail = f"Upload failed: {upload.get('error')}."
+    if archive_path:
+        kept = f"Archive kept at {archive_path}."
+        detail = f"{detail} {kept}" if detail else kept
+    return public, detail
 
 
 async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
@@ -532,16 +744,17 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
     runs: the game's own save data belongs to the player either way. In dev
     mode nothing is uploaded and the archive is written to EXPORT_DIR instead;
     a failed push also keeps the archive on disk so save data is never lost.
-    The room is told the outcome in a broker chat message before the tokens
-    are cleared and the session retired.
+    The room is told the outcome in a broker chat message, and the controller
+    gets a second one carrying the paths and errors the rest of the room has no
+    business seeing, before the tokens are cleared and the session retired.
 
     Args:
         save_slot: The state slot to save into before exiting, or None to skip the state.
 
     Returns:
         The exit report: `status`, `session_id`, `rom`, the emulator's own exit
-        fields, a `save_dump` block and an `upload` block describing what
-        happened to the archive.
+        fields, a `save_dump` block, an `upload` block describing what happened
+        to the archive, and `selkies_tokens_cleared`.
 
     Raises:
         HTTPException: 409 when no session is active.
@@ -561,11 +774,27 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         emulator.save_root,
         dump_subtrees,
         sess["save_baseline"],
+        _archive_identity(sess, emulator),
+        emulator.save_file_kind,
     )
     cb = sess.get("callback")
     archive_name = f"{sess['id']}-{int(time.time())}.zip"
     archive_path = None
-    if settings.DEV_MODE:
+    if dump["error"]:
+        # A dump that failed produced no archive, which is not the same thing as
+        # a session that changed nothing: reporting it as a successful no-op is
+        # what would have RomM record the session as saved and move on.
+        log.error(
+            "session %s: save dump failed (%s); nothing was uploaded",
+            sess["id"],
+            dump["error"],
+        )
+        upload = {
+            "mode": "failed",
+            "ok": False,
+            "error": f"save dump failed: {dump['error']}",
+        }
+    elif settings.DEV_MODE:
         if dump.get("zip_bytes"):
             archive_path = await anyio.to_thread.run_sync(saves.write_export, dump["zip_bytes"], archive_name)
         upload = {
@@ -604,35 +833,35 @@ async def _do_exit(save_slot: Optional[int]) -> dict[str, Any]:
         "upload": upload,
     }
 
-    if settings.DEV_MODE:
-        outcome = f"would upload to {cb['base_url']} (dev mode)"
-    elif upload["mode"] == "uploaded":
-        outcome = f"uploaded to {upload['url']}"
-    elif upload["mode"] == "skipped":
-        outcome = "nothing to upload"
-    else:
-        outcome = f"upload failed ({upload.get('error')}), archive kept at {archive_path}"
+    outcome, detail = _exit_outcomes(upload, archive_path, cb, dump["error"])
+    now_ms = int(time.time() * 1000)
     summary = (
         f"Session ended. Dumped {len(dump['files'])} save file(s), "
-        f"{dump['total_bytes']} bytes"
-        + (f" → {archive_path}" if archive_path else "")
-        + f"; {outcome}"
-        + f". State saved: {exit_report.get('state_saved')}."
+        f"{dump['total_bytes']} bytes; {outcome}"
+        f". State saved: {exit_report.get('state_saved')}."
     )
     await session.broadcast_to_room(
         {
             "type": "chat_message",
             "sender": "Broker",
             "message": summary,
-            "timestamp": int(time.time() * 1000),
-            "messageId": f"broker-{int(time.time() * 1000)}",
+            "timestamp": now_ms,
+            "messageId": f"broker-{now_ms}-summary",
         }
     )
+    if detail:
+        await _send_to_controller(
+            {
+                "type": "chat_message",
+                "sender": "Broker",
+                "message": detail,
+                "timestamp": now_ms,
+                "messageId": f"broker-{now_ms}-detail",
+            }
+        )
     await session.notify_session_ended()
-    # Give browsers time to tear the stream iframe down before the token set
-    # empties; selkies errors on connected clients whose token vanished.
-    await anyio.sleep(1.5)
-    await selkies.clear_tokens()
+    await anyio.sleep(TOKEN_CLEAR_GRACE_SECONDS)
+    report["selkies_tokens_cleared"] = await _clear_seat_tokens(sess["id"])
     session.retire_session()
     log.info("exit report: %s", report)
     return report
@@ -823,9 +1052,10 @@ async def swap_disc(body: DiscIn, x_broker_secret: Optional[str] = Header(defaul
         disc_path = Path(body.path).resolve()
     except OSError:
         raise HTTPException(status_code=400, detail="invalid disc path")
-    if not disc_path.is_relative_to(settings.ROM_ROOT):
+    rom_root = settings.rom_root()
+    if not disc_path.is_relative_to(rom_root):
         raise HTTPException(
-            status_code=400, detail=f"disc path must live under {settings.ROM_ROOT}"
+            status_code=400, detail=f"disc path must live under {rom_root}"
         )
     if not disc_path.exists():
         raise HTTPException(status_code=404, detail="disc path does not exist")
@@ -985,7 +1215,9 @@ async def put_state_file(
     if target is None:
         raise HTTPException(status_code=400, detail="filename is not a state this emulator would write")
 
-    tmp = target.with_name(f".{target.name}.tmp")
+    # Unique per request: two pushes sharing one temp name interleave their
+    # writes, and the os.replace below then publishes the mixture as a state.
+    tmp = target.with_name(f".{target.name}.{secrets.token_hex(8)}.tmp")
     written = 0
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -1011,6 +1243,45 @@ async def put_state_file(
 
     log.info("state-file: stored %s (%d bytes)", target.name, written)
     return {"status": "ok", "filename": target.name, "slot": emulator.state_slot}
+
+
+def _scratch_file(label: str) -> Path:
+    """Return a fresh path under IMPORT_DIR to stream a request body into.
+
+    Bodies are staged here rather than beside whatever they are destined for:
+    the memory card directory is scanned by the emulator, and a half-written
+    upload sitting in it would be read as part of the card.
+
+    Args:
+        label: What is being staged, so a file left behind is traceable.
+
+    Returns:
+        A path that does not exist yet, in a directory that does.
+    """
+    settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    return settings.IMPORT_DIR / f".{label}.{secrets.token_hex(8)}.part"
+
+
+def _refuse_while_session_active(action: str) -> None:
+    """Refuse a whole-card operation for as long as a session is running.
+
+    The emulator holds the card open for the life of the game, so a card read
+    out from under it is a card caught mid-write, and one written under it is
+    corrupted outright. RomM hydrates before activate and evacuates after exit,
+    so neither direction has to work with something running.
+
+    Args:
+        action: The verb for the reply, e.g. `capture` or `replace`.
+
+    Raises:
+        HTTPException: 409 when a session is active.
+    """
+    sess = session.SESSION
+    if sess is not None and sess.get("active"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot {action} the memory card while a session is active",
+        )
 
 
 def _memory_card(name: str, platform: Optional[str]) -> tuple[Path, Optional[str]]:
@@ -1068,8 +1339,8 @@ async def get_memory_card(
     Raises:
         HTTPException: 403 on a bad secret; 422 for an unknown emulator; 400
             when it has no memory card; 409 when another card operation is in
-            flight or the card could not be captured; 404 with
-            `X-Memory-Card: absent` when the slot is empty.
+            flight, a session is active, or the card could not be captured; 404
+            with `X-Memory-Card: absent` when the slot is empty.
     """
     _check_secret(x_broker_secret)
     card, marker = _memory_card(emulator, platform)
@@ -1078,6 +1349,7 @@ async def get_memory_card(
     if not memcard.LOCK.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="a memory card operation is in progress")
     try:
+        _refuse_while_session_active("capture")
         result = await anyio.to_thread.run_sync(memcard.build_archive, card, marker)
     finally:
         memcard.LOCK.release()
@@ -1124,32 +1396,40 @@ async def put_memory_card(
         HTTPException: 403 on a bad secret; 422 for an unknown emulator; 400
             when it has no memory card, the body is empty or the archive is
             rejected; 413 when the body exceeds SAVE_FILE_MAX_BYTES; 409 when
-            another card operation is in flight or a session is active.
+            another card operation is in flight or a session is active; 500 when
+            the body cannot be staged on disk.
     """
     _check_secret(x_broker_secret)
     card, marker = _memory_card(emulator, platform)
-    content = bytearray()
-    async for chunk in request.stream():
-        content.extend(chunk)
-        if len(content) > saves.SAVE_FILE_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="memory card exceeds size limit")
-    if not content:
-        raise HTTPException(status_code=400, detail="empty request body")
 
-    if not memcard.LOCK.acquire(blocking=False):
-        raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+    # Staged on disk rather than buffered: a card runs to the whole size limit,
+    # and holding both the body and the copy handed to memcard.replace costs
+    # twice that per caller pushing at once.
+    tmp = _scratch_file("memory-card")
+    written = 0
     try:
-        sess = session.SESSION
-        if sess is not None and sess.get("active"):
-            raise HTTPException(
-                status_code=409,
-                detail="cannot replace the memory card while a session is active",
-            )
-        result = await anyio.to_thread.run_sync(
-            memcard.replace, card, bytes(content), marker
-        )
+        with tmp.open("wb") as out:
+            async for chunk in request.stream():
+                written += len(chunk)
+                if written > saves.SAVE_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="memory card exceeds size limit")
+                await anyio.to_thread.run_sync(out.write, chunk)
+        if written == 0:
+            raise HTTPException(status_code=400, detail="empty request body")
+
+        if not memcard.LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="a memory card operation is in progress")
+        try:
+            _refuse_while_session_active("replace")
+            content = await anyio.to_thread.run_sync(tmp.read_bytes)
+            result = await anyio.to_thread.run_sync(memcard.replace, card, content, marker)
+        finally:
+            memcard.LOCK.release()
+    except OSError as exc:
+        log.error("memory-card: could not stage the upload at %s: %s", tmp, exc)
+        raise HTTPException(status_code=500, detail="could not store the memory card")
     finally:
-        memcard.LOCK.release()
+        _unlink_best_effort(tmp)
     if isinstance(result, str):
         raise HTTPException(status_code=400, detail=result)
     log.info("memory-card: replaced slot 1, %d file(s)", result)
@@ -1167,8 +1447,9 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
         `{"active": False}` when no session exists. Otherwise the session's
         `active` flag, `session_id`, `emulator`, `rom`, `rom_file` and
         `multiplayer` flag, whether the process is `emulator_alive`, the
-        emulator's `boot_failed`, `supports_states` and `state_slot` signals,
-        `started_at`, the controlling `user` and the seated `viewers`.
+        emulator's `boot_failed`, `extraction_phase`, `supports_states` and
+        `state_slot` signals, `started_at`, the controlling `user` and the
+        seated `viewers`.
 
     Raises:
         HTTPException: 403 on a bad secret.
@@ -1189,6 +1470,10 @@ async def status(x_broker_secret: Optional[str] = Header(default=None)) -> dict[
         # today, via PINE). Passive: RomM decides what to do about it, this
         # route only reports it.
         "boot_failed": sess["emulator_obj"].boot_failed,
+        # Set while a slow pre-launch extraction (shadPS4/RPCS3 pkg or
+        # archive) is running, else None. Same passive-signal shape as
+        # boot_failed: RomM decides what to show, this route only reports it.
+        "extraction_phase": sess["emulator_obj"].extraction_phase,
         # The emulator class is the authority on what it can do, so RomM reads
         # this rather than keeping its own per-emulator table.
         "supports_states": sess["emulator_obj"].supports_states,
@@ -1264,25 +1549,46 @@ async def upload_import(
 
     Raises:
         HTTPException: 403 on a bad secret; 400 for an unsafe name; 413 when
-            the body exceeds SAVE_FILE_MAX_BYTES; 422 when the body is not a zip.
+            the body exceeds SAVE_FILE_MAX_BYTES; 422 when the body is not a
+            zip; 500 when the archive cannot be written.
     """
     _check_secret(x_broker_secret)
     safe = _archive_name(name)
 
-    chunks: list[bytes] = []
+    settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
+    target = settings.IMPORT_DIR / safe
+    # Streamed through a temp file rather than buffered: an archive runs to the
+    # whole size limit, and the rename is what keeps a half-received upload from
+    # ever being handed to activate as a restore source.
+    tmp = _scratch_file(safe)
     total = 0
-    async for chunk in request.stream():
-        total += len(chunk)
-        if total > saves.SAVE_FILE_MAX_BYTES:
-            raise HTTPException(status_code=413, detail="archive too large")
-        chunks.append(chunk)
-    content = b"".join(chunks)
-    if not content.startswith(b"PK"):
-        raise HTTPException(status_code=422, detail="archive is not a zip")
+    header = b""
+    try:
+        with tmp.open("wb") as out:
+            async for chunk in request.stream():
+                if len(header) < 2:
+                    header = (header + chunk)[:2]
+                    # Refused on the first bytes, so a huge non-zip body is not
+                    # written to disk in full before being rejected.
+                    if not b"PK".startswith(header):
+                        raise HTTPException(status_code=422, detail="archive is not a zip")
+                total += len(chunk)
+                if total > saves.SAVE_FILE_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="archive too large")
+                await anyio.to_thread.run_sync(out.write, chunk)
+        if header != b"PK":
+            raise HTTPException(status_code=422, detail="archive is not a zip")
+        os.replace(tmp, target)
+    except HTTPException:
+        _unlink_best_effort(tmp)
+        raise
+    except OSError as exc:
+        _unlink_best_effort(tmp)
+        log.error("import: could not store %s: %s", safe, exc)
+        raise HTTPException(status_code=500, detail="could not store the archive")
 
-    path = await anyio.to_thread.run_sync(saves.write_import, content, safe)
     log.info("import stored: %s (%d bytes)", safe, total)
-    return {"status": "stored", "name": safe, "path": path, "size": total}
+    return {"status": "stored", "name": safe, "path": str(target), "size": total}
 
 
 @router.get("/api/session/exports")
@@ -1361,23 +1667,44 @@ async def delete_export(
 
 
 @router.get("/api/session/context")
-async def context(token: Optional[str] = Query(default=None)) -> dict[str, Any]:
+async def context(
+    token: Optional[str] = Query(default=None),
+    invite: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
     """Resolve an arriving token into the caller's role, for the frontend bootstrap.
 
+    A seat token identifies someone already in the session. An invite token
+    identifies a shareable link instead: the arrival is seated on the spot and
+    handed the new seat's token as `userToken`, which is what the room keeps
+    for the rest of its stay (and across its own reloads) so one person does
+    not take a seat per visit.
+
     Args:
-        token: The seat token from the landing URL.
+        token: The seat token from the landing URL, if the caller has one.
+        invite: The invite token from a shared link, used when `token` is absent.
 
     Returns:
         The room's bootstrap context: `sessionId`, `userRole` (`controller` or
-        `viewer`), `userToken`, `userPermission`, `username`, `gameName`,
-        `controllerName`, `multiplayer` and the stream `iframeSrc`.
+        `viewer`), `userToken`, `userPublicId` (the caller's own non-sensitive
+        id, for cross-referencing itself in `state_update` broadcasts),
+        `userPermission`, `username`, `gameName`, `controllerName`,
+        `multiplayer` and the stream `iframeSrc`.
 
     Raises:
-        HTTPException: 409 when no session is active; 401 when the token is missing or unknown.
+        HTTPException: 409 when no session is active; 401 when neither token is
+            given or the one given is unknown; 429 when an invite arrival finds
+            the room already at its seat cap.
     """
     sess = session.SESSION
     if sess is None or not sess.get("active"):
         raise HTTPException(status_code=409, detail="no active session")
+    if not token and invite:
+        permission = session.find_invite(invite)
+        if permission is None:
+            raise HTTPException(status_code=401, detail="invalid invite")
+        viewer, _ = await _mint_viewer(permission, None)
+        token = viewer["token"]
+        log.info("seated an arrival from the %s invite link", permission)
     if not token:
         raise HTTPException(status_code=401, detail="missing token")
 
@@ -1404,6 +1731,7 @@ async def context(token: Optional[str] = Query(default=None)) -> dict[str, Any]:
         "sessionId": sess["id"],
         "userRole": role,
         "userToken": token,
+        "userPublicId": session.public_id_for(token),
         "userPermission": permission if role == "viewer" else "participant",
         "username": username,
         "gameName": (sess.get("rom") or {}).get("name")

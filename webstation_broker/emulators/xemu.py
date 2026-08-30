@@ -29,7 +29,9 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 import time
 import tomllib
 from collections.abc import Iterable
@@ -38,17 +40,22 @@ from typing import IO, Any, Optional
 
 from pyfatx import Fatx
 
-from .base import Emulator, base_launch_env
+from .. import settings
+from .base import Emulator, _cmdline, base_launch_env
 
 log = logging.getLogger(__name__)
-
-ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
-"""Library root a resolved ROM must live under (env `ROM_ROOT`, default `/romm`)."""
 
 XEMU_BIN = os.environ.get("XEMU_BIN", "/opt/xemu/AppRun")
 """The xemu executable to spawn (env `XEMU_BIN`, default `/opt/xemu/AppRun`)."""
 XEMU_LOG_PATH = Path(os.environ.get("XEMU_LOG_PATH", "/config/xemu.log"))
 """The emulator log file (env `XEMU_LOG_PATH`, default `/config/xemu.log`)."""
+
+XEMU_STRAY_TERM_WAIT = float(os.environ.get("XEMU_STRAY_TERM_WAIT", "5"))
+"""Grace a stray xemu gets to exit before SIGKILL (env `XEMU_STRAY_TERM_WAIT`, default 5).
+
+QEMU flushes the HDD image on a clean shutdown and not on SIGKILL, and the save
+hooks read that image seconds later, so a stray is asked to leave first.
+"""
 
 XEMU_RENDERER = os.environ.get("XEMU_RENDERER", "OPENGL").strip().upper()
 """Renderer pinned into xemu.toml before each launch (env `XEMU_RENDERER`, default `OPENGL`).
@@ -222,6 +229,52 @@ def _pin_toml_key(text: str, section: str, key: str, value: str) -> str:
     return text[:body_start] + body + text[body_end:]
 
 
+def _write_toml(text: str) -> bool:
+    """Replace xemu.toml with `text`, atomically and only when it still parses.
+
+    xemu owns this file and every setting the user has ever changed lives in
+    it, so a truncated write or a bad edit costs them all of it. The candidate
+    is parsed before anything is written, then swapped in from a sibling temp
+    file so the config is never the half-written one.
+
+    Args:
+        text: The full replacement config.
+
+    Returns:
+        True when xemu.toml now holds `text`, False (logged) when it does not,
+        in which case the original file is untouched.
+    """
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        log.error("xemu: refusing to write %s, the pinned content does not parse (%s)",
+                  XEMU_TOML, exc)
+        return False
+    try:
+        mode = XEMU_TOML.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(XEMU_TOML.parent),
+                                   prefix=f".{XEMU_TOML.name}.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, XEMU_TOML)
+    except OSError as exc:
+        log.error("could not pin display settings in %s: %s", XEMU_TOML, exc)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError as cleanup_exc:
+                log.debug("could not remove %s: %s", tmp, cleanup_exc)
+        return False
+    return True
+
+
 def _pin_display_settings() -> None:
     """Force the display settings a streamed session needs into xemu.toml.
 
@@ -245,10 +298,7 @@ def _pin_display_settings() -> None:
 
     if updated == text:
         return
-    try:
-        XEMU_TOML.write_text(updated, encoding="utf-8")
-    except OSError as exc:
-        log.error("could not pin display settings in %s: %s", XEMU_TOML, exc)
+    if not _write_toml(updated):
         return
     log.info("pinned xemu display settings in %s", XEMU_TOML)
 
@@ -271,9 +321,9 @@ def _disc_number(rel: Path) -> int:
 def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     """Pick the best bootable disc image among `candidates`.
 
-    Hidden files, non-files and anything resolving outside `ROM_ROOT` are
-    skipped. Ranking prefers disc 1, then the `ROM_EXTENSIONS` order, then
-    the shallowest path, then the lowercased name.
+    Hidden files, non-files and anything resolving outside the ROM library
+    root are skipped. Ranking prefers disc 1, then the `ROM_EXTENSIONS` order,
+    then the shallowest path, then the lowercased name.
 
     Args:
         candidates: Paths found under `base` by the search globs.
@@ -283,6 +333,7 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
         The resolved path of the best candidate, or None when nothing qualifies.
     """
     ranked = []
+    rom_root = settings.rom_root()
     for p in candidates:
         if p.name.startswith("."):
             continue
@@ -296,7 +347,8 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
             rel = p.relative_to(base)
         except (OSError, ValueError):
             continue
-        if not real.is_relative_to(ROM_ROOT):
+        if not real.is_relative_to(rom_root):
+            log.warning("xemu: skipping %s, it resolves outside %s", p, rom_root)
             continue
         ranked.append(
             (_disc_number(rel), ROM_EXTENSIONS.index(ext), len(rel.parts), p.name.lower(), real)
@@ -372,6 +424,14 @@ _XISO_SECTOR = 2048
 """Sector size of an XISO, in bytes."""
 _XISO_MAGIC = b"MICROSOFT*XBOX*MEDIA"
 """The volume descriptor signature at sector 32 of the game partition."""
+XISO_MAX_DIR_BYTES = 8 * 1024 * 1024
+"""Ceiling on one XISO directory table read, in bytes.
+
+The root table's size is a 32-bit field taken straight from an untrusted disc
+image, so a corrupt or hostile ISO can ask for a 4 GiB allocation. A real Xbox
+root table is a few kilobytes; megabytes of it is already past anything a disc
+carries.
+"""
 _XISO_BASES = (0, 0x18300000)
 """Game-partition offsets to probe.
 
@@ -456,6 +516,10 @@ def _disc_title_id(rom_path: Path) -> Optional[str]:
                 log.warning("%s: no XISO volume descriptor found", rom_path)
                 return None
             base, dir_off, dir_size = root
+            if not 0 < dir_size <= XISO_MAX_DIR_BYTES:
+                log.warning("%s: root directory table claims %d bytes; not reading it",
+                            rom_path, dir_size)
+                return None
             fh.seek(dir_off)
             entry = _xiso_find_entry(fh.read(dir_size), b"default.xbe")
             if entry is None:
@@ -551,19 +615,156 @@ def _fatx_find_dir(fs: Fatx, parent: str, name: str) -> Optional[str]:
     return None
 
 
+def _fatx_discard(fs: Fatx, path: str) -> None:
+    """Remove a file a failed write left in an unknown state.
+
+    Args:
+        fs: The open FATX filesystem.
+        path: Absolute path of the file on the partition.
+    """
+    try:
+        fs.get_attr(path)
+    except (AssertionError, OSError):
+        return
+    try:
+        fs.unlink(path)
+    except (AssertionError, OSError) as exc:
+        log.error("could not remove the partially written %s from the HDD image: %s",
+                  path, exc)
+
+
+def _fatx_write_file(fs: Fatx, path: str, data: bytes) -> None:
+    """Write `data` to `path` on a FATX filesystem, all of it or none of it.
+
+    pyfatx's write() never shortens an existing file, so a save that shrank
+    keeps the previous one's tail unless the file is truncated. The truncate
+    runs first: done afterwards, every failure between the two leaves the two
+    saves spliced together and readable by the game as one. Anything that goes
+    wrong takes the file with it for the same reason.
+
+    Args:
+        fs: The open FATX filesystem.
+        path: Absolute path of the file on the partition.
+        data: The full file contents.
+
+    Raises:
+        AssertionError: Raised by pyfatx for any libfatx level failure.
+        OSError: If the image itself cannot be written.
+        RuntimeError: If the file ends up on the image at the wrong size.
+    """
+    try:
+        existing = fs.get_attr(path).file_size
+    except (AssertionError, OSError):
+        existing = 0
+    try:
+        if existing > len(data):
+            fs.truncate(path, len(data))
+        fs.write(path, data)
+        landed = fs.get_attr(path).file_size
+    except (AssertionError, OSError):
+        _fatx_discard(fs, path)
+        raise
+    if landed != len(data):
+        _fatx_discard(fs, path)
+        raise RuntimeError(f"{path} landed as {landed} bytes, expected {len(data)}")
+
+
+def _remove_tree(path: Path) -> None:
+    """Delete a directory tree, logging rather than raising when it will not go.
+
+    Args:
+        path: The directory to remove.
+    """
+    if not path.is_dir():
+        return
+    try:
+        shutil.rmtree(path)
+    except OSError as exc:
+        log.warning("could not fully remove %s: %s", path, exc)
+
+
 # ── Provider ─────────────────────────────────────────────────────────────────
 
 
-def _reap_strays() -> None:
-    """SIGKILL any xemu the broker does not own.
+def _proc_pids() -> list[int]:
+    """Every pid currently visible in `/proc`.
 
-    An orphan busy-loops CPU cores and, worst, keeps writing the HDD image
-    the save hooks are about to touch. Matched by full command line so other
-    AppImage emulators (duckstation is also comm "AppRun") are left alone.
+    Returns:
+        The pids, or an empty list (logged) when `/proc` cannot be listed.
     """
-    if subprocess.run(["pkill", "-9", "-f", XEMU_BIN], capture_output=True).returncode == 0:
-        log.info("reaped stray xemu process(es)")
-        time.sleep(0.5)
+    try:
+        return [int(entry) for entry in os.listdir("/proc") if entry.isdigit()]
+    except OSError as exc:
+        log.warning("could not list /proc to find stray xemu processes: %s", exc)
+        return []
+
+
+def _is_xemu(pid: int) -> bool:
+    """Whether a pid is running the configured xemu binary.
+
+    Args:
+        pid: The process to check.
+
+    Returns:
+        True when the process's argv carries `XEMU_BIN` as a whole element.
+    """
+    return XEMU_BIN in _cmdline(pid)
+
+
+def _stray_xemu_pids() -> list[int]:
+    """The pids running xemu right now.
+
+    Matched on whole argv elements rather than a substring of the command
+    line: a substring match also hits every process that merely names the
+    binary, a shell, a log tail or a grep among them, and those would be
+    killed too. Re-checking argv also means a pid recycled between the scan
+    and the signal is left alone.
+
+    Returns:
+        The matching pids, this process excluded.
+    """
+    own = os.getpid()
+    return [pid for pid in _proc_pids() if pid != own and _is_xemu(pid)]
+
+
+def _reap_strays() -> None:
+    """Stop any xemu the broker does not own, SIGTERM first.
+
+    An orphan busy-loops CPU cores and, worse, keeps writing the HDD image the
+    save hooks are about to read. QEMU flushes that image on SIGTERM and not on
+    SIGKILL, so killing a stray outright tears its writes apart moments before
+    the extraction reads them; SIGKILL is only the escalation once the stray
+    has had `XEMU_STRAY_TERM_WAIT` seconds to go on its own.
+    """
+    pids = _stray_xemu_pids()
+    if not pids:
+        return
+    log.warning("stray xemu process(es) %s hold the HDD image; asking them to exit",
+                ", ".join(str(pid) for pid in pids))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            log.warning("could not SIGTERM stray xemu pid %d: %s", pid, exc)
+    deadline = time.monotonic() + XEMU_STRAY_TERM_WAIT
+    while True:
+        pids = [pid for pid in pids if _is_xemu(pid)]
+        if not pids:
+            log.info("stray xemu process(es) exited on SIGTERM")
+            return
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    for pid in pids:
+        log.warning("stray xemu pid %d ignored SIGTERM for %.0fs; killing it",
+                    pid, XEMU_STRAY_TERM_WAIT)
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError as exc:
+            log.warning("could not SIGKILL stray xemu pid %d: %s", pid, exc)
+    # The image is opened right after this returns, and a kill only queues the
+    # exit.
+    time.sleep(0.5)
 
 
 class Xemu(Emulator):
@@ -574,8 +775,8 @@ class Xemu(Emulator):
     gives QEMU a clean shutdown that flushes the HDD image the post-close
     extraction then reads, so the grace window is long enough for the flush
     to land before the SIGKILL escalation tears it. Any xemu the broker does
-    not own is reaped with SIGKILL before every hook, because an orphan keeps
-    writing the image the hooks are about to touch. Display settings
+    not own is stopped before every hook, SIGTERM first, because an orphan
+    keeps writing the image the hooks are about to touch. Display settings
     (renderer and fullscreen) are pinned into xemu.toml before each launch,
     since xemu rewrites that file on exit and drops both.
 
@@ -637,11 +838,7 @@ class Xemu(Emulator):
 
     def _clear_staging(self) -> None:
         """Remove the staging directory and everything under it, logging a failure."""
-        if self.staging_dir.is_dir():
-            try:
-                shutil.rmtree(self.staging_dir)
-            except OSError as exc:
-                log.warning("could not fully clear %s: %s", self.staging_dir, exc)
+        _remove_tree(self.staging_dir)
 
     def _inject_saves(self) -> int:
         """Pre-launch hook: write every staged file into the FATX E partition.
@@ -670,55 +867,53 @@ class Xemu(Emulator):
         # (case-bearing) components, so an archive whose case differs from the
         # disk's lands in the existing directory instead of a twin beside it.
         resolved: dict[tuple[str, ...], str] = {(): ""}
-        for p in files:
-            parts = p.relative_to(self.staging_dir).parts
-            try:
-                parent = ""
-                for i in range(1, len(parts)):
-                    key = parts[:i]
-                    if key in resolved:
-                        parent = resolved[key]
-                        continue
-                    found = _fatx_find_dir(fs, parent or "/", parts[i - 1])
-                    if found is None:
-                        found = f"{parent}/{parts[i - 1]}"
-                        fs.mkdir(found)
-                    resolved[key] = found
-                    parent = found
-                fatx_path = f"{parent}/{parts[-1]}"
-                data = p.read_bytes()
-                fs.write(fatx_path, data)
-                # pyfatx write() never shrinks an existing file; drop the old
-                # tail or a shorter save lands corrupt.
-                if fs.get_attr(fatx_path).file_size != len(data):
-                    fs.truncate(fatx_path, len(data))
-                written += 1
-            except (AssertionError, OSError) as exc:
-                log.warning("could not inject %s into the HDD image: %s",
-                            "/".join(parts), exc)
-        # pyfatx has no close()/flush(); __del__ is the only way to trigger
-        # fatx_close_device and commit these writes to the image.
-        del fs
+        try:
+            for p in files:
+                parts = p.relative_to(self.staging_dir).parts
+                try:
+                    parent = ""
+                    for i in range(1, len(parts)):
+                        key = parts[:i]
+                        if key in resolved:
+                            parent = resolved[key]
+                            continue
+                        found = _fatx_find_dir(fs, parent or "/", parts[i - 1])
+                        if found is None:
+                            found = f"{parent}/{parts[i - 1]}"
+                            fs.mkdir(found)
+                        resolved[key] = found
+                        parent = found
+                    _fatx_write_file(fs, f"{parent}/{parts[-1]}", p.read_bytes())
+                    written += 1
+                except (AssertionError, OSError, RuntimeError) as exc:
+                    log.warning("could not inject %s into the HDD image %s: %s",
+                                "/".join(parts), self.hdd_image, exc)
+        finally:
+            # pyfatx has no close()/flush(); dropping the handle is the only
+            # way to trigger fatx_close_device and commit these writes, so an
+            # exception on the way out must not skip it.
+            del fs
         return written
 
-    def _extract_saves(self) -> int:
-        """Post-close hook: copy the title's save data out of the FATX E partition.
+    def _save_roots(self, fs: Fatx) -> Optional[list[str]]:
+        """The partition directories this session's saves live under.
 
-        Files land in the (already cleared) staging dir carrying fresh mtimes,
-        so the dump's launch-baseline filter ships them all: the archive is
-        the title's complete save set, not a delta. Without a title id every
-        title's UDATA and TDATA is extracted.
+        Args:
+            fs: The open FATX filesystem.
 
         Returns:
-            The number of files staged.
+            The absolute partition paths to extract, empty when the title has
+            simply never saved, or None when neither top level save directory
+            can be read, which is the image failing to answer rather than an
+            empty save set.
         """
-        fs = _open_fatx_e(self.hdd_image)
-        if fs is None:
-            return 0
+        tops = [top for top in ("UDATA", "TDATA") if _fatx_isdir(fs, f"/{top}")]
+        if not tops:
+            log.error("neither /UDATA nor /TDATA could be read on %s; treating this "
+                      "as a failed read, not as a title with no saves", self.hdd_image)
+            return None
         roots = []
-        for top in ("UDATA", "TDATA"):
-            if not _fatx_isdir(fs, f"/{top}"):
-                continue
+        for top in tops:
             if not self._title_id:
                 roots.append(f"/{top}")
                 continue
@@ -728,12 +923,31 @@ class Xemu(Emulator):
             else:
                 roots.append(src)
         if not roots:
-            log.warning("no save directories found on %s for title %s; the "
-                        "archive will be empty", self.hdd_image, self._title_id or "<all>")
+            log.info("title %s has no save directory on %s; nothing to extract",
+                     self._title_id, self.hdd_image)
+        return roots
+
+    def _extract_into(self, fs: Fatx, roots: Iterable[str], dest: Path) -> Optional[int]:
+        """Copy every file under `roots` out of the image into `dest`.
+
+        Args:
+            fs: The open FATX filesystem.
+            roots: Absolute partition paths to walk.
+            dest: Host directory the files are written under.
+
+        Returns:
+            The number of files written, or None when a directory listing
+            failed, which leaves the save set only partly known.
+        """
         extracted = 0
-        staging_real = self.staging_dir.resolve()
+        dest_real = dest.resolve()
         for src in roots:
-            for root, _dirs, filenames in fs.walk(src):
+            try:
+                tree = list(fs.walk(src))
+            except (AssertionError, OSError) as exc:
+                log.error("could not list %s on %s: %s", src, self.hdd_image, exc)
+                return None
+            for root, _dirs, filenames in tree:
                 for name in filenames:
                     fatx_path = root.rstrip("/") + "/" + name
                     try:
@@ -742,24 +956,86 @@ class Xemu(Emulator):
                         log.warning("could not read %s from the HDD image: %s",
                                     fatx_path, exc)
                         continue
-                    dest = self.staging_dir / fatx_path.lstrip("/")
+                    target = dest / fatx_path.lstrip("/")
                     # Defense in depth: fs.walk()/read() surface whatever the
                     # emulated guest wrote to its save partition, so a `..`
                     # component (however unlikely from libfatx) is rejected
-                    # here rather than trusted to stay under staging_dir.
-                    if not dest.resolve().is_relative_to(staging_real):
+                    # here rather than trusted to stay under dest.
+                    if not target.resolve().is_relative_to(dest_real):
                         log.warning("save path escapes staging dir: %s", fatx_path)
                         continue
                     try:
-                        dest.parent.mkdir(parents=True, exist_ok=True)
-                        dest.write_bytes(data)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(data)
                     except OSError as exc:
-                        log.warning("could not stage %s: %s", dest, exc)
+                        log.warning("could not stage %s: %s", target, exc)
                         continue
                     extracted += 1
-        # pyfatx has no close()/flush(); __del__ is the only way to trigger
-        # fatx_close_device and release the image.
-        del fs
+        return extracted
+
+    def _swap_staging(self, scratch: Path) -> bool:
+        """Put a finished extraction in place as the staging directory.
+
+        Args:
+            scratch: The finished extraction, a sibling of the staging dir.
+
+        Returns:
+            True when the staging directory now holds the extraction, False
+            (logged) when it does not.
+        """
+        self._clear_staging()
+        if self.staging_dir.exists():
+            log.error("could not clear %s, so the extracted saves cannot be moved in",
+                      self.staging_dir)
+            return False
+        try:
+            os.replace(scratch, self.staging_dir)
+        except OSError as exc:
+            log.error("could not move the extracted saves into %s: %s", self.staging_dir, exc)
+            return False
+        return True
+
+    def _extract_saves(self) -> Optional[int]:
+        """Post-close hook: copy the title's save data out of the FATX E partition.
+
+        The extraction runs into a scratch directory and is swapped over the
+        staging one only once it has finished. The dump ships whatever staging
+        holds, so clearing it up front would turn a failed read into an empty
+        archive uploaded over the title's real saves; leaving the session's
+        restored files in place instead means the dump finds nothing newer than
+        the launch baseline and uploads nothing at all.
+
+        Files land carrying fresh mtimes, so that baseline filter ships all of
+        them: the archive is the title's complete save set, not a delta.
+        Without a title id every title's UDATA and TDATA is extracted.
+
+        Returns:
+            The number of files staged, or None when the image could not be
+            read, in which case the staging directory is left as it was.
+        """
+        fs = _open_fatx_e(self.hdd_image)
+        if fs is None:
+            return None
+        scratch = self.staging_dir.with_name(f".{self.staging_dir.name}.new")
+        try:
+            roots = self._save_roots(fs)
+            if roots is None:
+                return None
+            _remove_tree(scratch)
+            try:
+                scratch.mkdir(parents=True)
+            except OSError as exc:
+                log.error("could not prepare %s for the extraction: %s", scratch, exc)
+                return None
+            extracted = self._extract_into(fs, roots, scratch)
+        finally:
+            # pyfatx has no close()/flush(); dropping the handle is the only
+            # way to trigger fatx_close_device and release the image, so an
+            # exception on the way out must not skip it.
+            del fs
+        if extracted is None or not self._swap_staging(scratch):
+            _remove_tree(scratch)
+            return None
         return extracted
 
     def resolve_rom_file(self, path: Path) -> Optional[Path]:
@@ -771,14 +1047,17 @@ class Xemu(Emulator):
         Returns:
             The file itself, the best-ranked `.iso` in the folder, or None.
         """
+        rom_root = settings.rom_root()
         if path.is_file():
-            # Defense in depth: api.py already validates path is under
-            # ROM_ROOT before calling in, but this checks it independently
-            # rather than trusting every future caller to do the same.
+            # Defense in depth: api.py already validates path is under the ROM
+            # root before calling in, but this checks it independently rather
+            # than trusting every future caller to do the same.
             try:
-                if not path.resolve().is_relative_to(ROM_ROOT):
+                if not path.resolve().is_relative_to(rom_root):
+                    log.warning("xemu: refusing %s, it resolves outside %s", path, rom_root)
                     return None
-            except OSError:
+            except OSError as exc:
+                log.warning("xemu: could not resolve %s (%s)", path, exc)
                 return None
             return path
         if not path.is_dir():
@@ -787,7 +1066,8 @@ class Xemu(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
+            except OSError as exc:
+                log.warning("xemu: could not search %s for a disc image (%s)", path, exc)
                 return None
         return _pick_rom_file(candidates, path)
 
@@ -847,6 +1127,10 @@ class Xemu(Emulator):
         Args:
             slot: Ignored; there are no save states.
 
+        A failed extraction leaves the staging directory alone rather than
+        emptying it, so the dump uploads nothing instead of an empty archive
+        over the title's real saves.
+
         Returns:
             The state fields all None (`state_saved`, `state_slot`,
             `state_file`), plus `title_id` and `saves_extracted`, the number
@@ -855,14 +1139,20 @@ class Xemu(Emulator):
         self.stop()
         _reap_strays()
         extracted = 0
-        if self.hdd_image.is_file():
-            self._clear_staging()
-            extracted = self._extract_saves()
-            log.info("post-close: staged %d save file(s) for title %s",
-                     extracted, self._title_id or "<all>")
-        else:
+        if not self.hdd_image.is_file():
             log.error("post-close: HDD image %s is missing; nothing to extract",
                       self.hdd_image)
+        else:
+            staged = self._extract_saves()
+            if staged is None:
+                log.error("post-close: could not read saves out of %s for title %s; "
+                          "the staging dir keeps what this session restored so the "
+                          "dump does not ship an empty archive",
+                          self.hdd_image, self._title_id or "<all>")
+            else:
+                extracted = staged
+                log.info("post-close: staged %d save file(s) for title %s",
+                         extracted, self._title_id or "<all>")
         return {
             "state_saved": None,
             "state_slot": None,

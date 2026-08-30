@@ -69,7 +69,7 @@ from typing import Any, Optional, Union
 
 import httpx
 
-from .base import Emulator, base_launch_env
+from .base import Emulator, _record_pid, base_launch_env
 
 log = logging.getLogger(__name__)
 
@@ -477,6 +477,21 @@ def _write_broker_cfg(thumbnail: bool = True) -> Path:
     return BROKER_CFG
 
 
+def _state_suffix(slot: int) -> str:
+    """The slot suffix RetroArch appends to a state's content basename.
+
+    Args:
+        slot: The slot number; negative means the auto slot.
+
+    Returns:
+        `.state` for slot 0, `.state<n>` for slot n, `.state.auto` for the
+        auto slot.
+    """
+    if slot < 0:
+        return ".state.auto"
+    return ".state" if slot == 0 else f".state{slot}"
+
+
 def _state_name(base: str, slot: int) -> str:
     """RetroArch's state filename for a slot.
 
@@ -488,9 +503,7 @@ def _state_name(base: str, slot: int) -> str:
         `base.state` for slot 0, `base.state<n>` for slot n, and
         `base.state.auto` for the auto slot.
     """
-    if slot < 0:
-        return f"{base}.state.auto"
-    return base + (".state" if slot == 0 else f".state{slot}")
+    return base + _state_suffix(slot)
 
 
 _STATE_SUFFIX_RE = re.compile(r"\.state(?:\d{1,2}|\.auto)?$")
@@ -750,6 +763,39 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path, extensions: tuple[str
     return min(ranked)[5]
 
 
+def _find_reply(buf: bytes, prefixes: tuple[str, ...]) -> Optional[tuple[str, int]]:
+    """Find the first reply line in `buf` beginning with one of `prefixes`.
+
+    Matching is anchored to the start of a line: an unanchored search lets the
+    basename inside a `GET_STATUS PLAYING <core>,<basename>` line answer a wait
+    for `OK` or `NO`. The offset is counted in bytes rather than decoded
+    characters, because the caller slices a byte buffer with it and a non-ASCII
+    basename would otherwise leave half a line behind and corrupt every reply
+    after it.
+
+    Args:
+        buf: The bytes read off RetroArch's stdout and not yet consumed.
+        prefixes: Reply prefixes the caller is waiting for.
+
+    Returns:
+        The matched line and the number of bytes to drop from the front of
+        `buf` to consume it, or None when no line matches. A match with no
+        newline after it consumes the whole buffer, since the bare echoes of
+        the `*_SLOT` commands and `GET_STATUS CONTENTLESS` are not
+        newline-terminated.
+    """
+    start = 0
+    while True:
+        newline = buf.find(b"\n", start)
+        end = len(buf) if newline == -1 else newline
+        line = buf[start:end].decode("utf-8", errors="replace")
+        if line.startswith(prefixes):
+            return line, len(buf) if newline == -1 else newline + 1
+        if newline == -1:
+            return None
+        start = newline + 1
+
+
 class Retroarch(Emulator):
     """RetroArch driven over its stdin command interface.
 
@@ -763,8 +809,8 @@ class Retroarch(Emulator):
         display_name: Shown as "RetroArch".
         save_root: `RA_DATA_DIR`, the broker-managed data root.
         log_path: `RA_LOG_PATH`, where RetroArch's stderr goes.
-        supports_states: On; save states work for every core unless its
-            platform entry opts out of `savestate`.
+        supports_states: Whether the loaded platform's core can save states.
+        state_subtrees: `states`, where savestates land.
         supports_disc_swap: On; discs are swapped through the virtual tray.
         state_slot: `STATE_SLOT`, the one slot the broker works in.
         state_dir: `STATE_DIR`, the broker-managed savestate directory.
@@ -779,10 +825,10 @@ class Retroarch(Emulator):
     """Name the UI shows for RetroArch."""
     save_root = RA_DATA_DIR
     """The broker-managed data root; saves and states live under it."""
+    state_subtrees = ("states",)
+    """Savestates live under `states`, whichever subtrees the platform scopes the dump to."""
     log_path = RA_LOG_PATH
     """Where RetroArch's stderr is appended."""
-    supports_states = True
-    """Save states work for every core unless its platform entry opts out."""
     supports_disc_swap = True
     """Discs are swapped through RetroArch's virtual tray."""
     state_slot = STATE_SLOT
@@ -810,6 +856,12 @@ class Retroarch(Emulator):
         """Replies read off RetroArch's stdout and not yet consumed."""
         self._stdout_lock = threading.Lock()
         """Guards `_stdout_buf` between the reader thread and the callers waiting on replies."""
+        self._reply_lock = threading.Lock()
+        """Serializes command/reply exchanges.
+
+        Replies carry no request id, so two threads waiting at once would each
+        be free to consume the other's line.
+        """
         self._reader: Optional[threading.Thread] = None
         """The thread draining RetroArch's stdout into `_stdout_buf`."""
         self._playlist: Optional[Path] = None
@@ -840,6 +892,25 @@ class Retroarch(Emulator):
         info = _platform_info(self.platform)
         scoped = info.get("save_subtrees") if info else None
         return scoped or ("states", "saves")
+
+    @property
+    def supports_states(self) -> bool:
+        """Whether the loaded platform's core can save and load states.
+
+        A core that stubs out the libretro serialize calls (jaguar) opts out
+        in its platform entry, so the flag has to follow the platform rather
+        than the launcher.
+
+        Returns:
+            True unless the platform entry sets `savestate` false.
+        """
+        info = _platform_info(self.platform)
+        return True if info is None else bool(info.get("savestate", True))
+
+    def archive_core(self) -> Optional[str]:
+        """The libretro core booting the loaded platform, or None when unmapped."""
+        info = _platform_info(self.platform)
+        return info["core"] if info else None
 
     @property
     def rom_extensions(self) -> tuple[str, ...]:
@@ -892,8 +963,9 @@ class Retroarch(Emulator):
         """Spawn with a real stdout pipe (stderr to the log).
 
         stdout carries the command replies, so it must stay clean. A reader
-        thread drains it into `_stdout_buf`. Unlike the shared `_spawn`, this
-        does not record the pid.
+        thread drains it into `_stdout_buf`. The pid is recorded the way the
+        shared `_spawn` records it, so a broker that restarts mid-session can
+        still reap the RetroArch it no longer has a handle on.
 
         Args:
             cmd: The argv to run.
@@ -919,6 +991,7 @@ class Retroarch(Emulator):
         finally:
             if log_fh:
                 log_fh.close()
+        _record_pid(self.name, self._proc.pid, cmd)
         self._stdout_buf = bytearray()
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -939,76 +1012,91 @@ class Retroarch(Emulator):
         except (OSError, ValueError):
             pass
 
-    def _wait_for_reply(self, prefixes: Union[str, tuple[str, ...]], timeout: float) -> Optional[str]:
-        """Wait for a stdout reply matching one of `prefixes`; consume it and return it.
+    def _wait_for_reply(self, prefixes: tuple[str, ...], timeout: float) -> Optional[str]:
+        """Poll the reply buffer for a line beginning with one of `prefixes`.
 
-        Replies are newline-terminated except the bare echoes of the `*_SLOT`
-        commands and `GET_STATUS CONTENTLESS`, so a match with no newline after
-        it is taken as the whole rest of the buffer.
+        Only `_send` calls this, and only while holding `_reply_lock`, so the
+        line consumed here belongs to the command that exchange just sent.
 
         Args:
-            prefixes: One prefix, or several of which the earliest match wins.
+            prefixes: Reply prefixes the caller is waiting for.
             timeout: Seconds to keep polling the buffer.
 
         Returns:
-            The matched line, with everything up to it dropped from the buffer,
-            or None on timeout or if the process dies first.
+            The matched line, with everything up to and including it dropped
+            from the buffer, or None on timeout or if the process dies first.
         """
-        if isinstance(prefixes, str):
-            prefixes = (prefixes,)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if not self.alive():
                 return None
             with self._stdout_lock:
-                buf = bytes(self._stdout_buf)
-            text = buf.decode("utf-8", errors="replace")
-            best: Optional[tuple[int, str]] = None
-            for pfx in prefixes:
-                idx = text.find(pfx)
-                if idx != -1 and (best is None or idx < best[0]):
-                    best = (idx, pfx)
-            if best is not None:
-                idx = best[0]
-                end = text.find("\n", idx)
-                if end == -1:
-                    line = text[idx:]
-                    with self._stdout_lock:
-                        del self._stdout_buf[:len(text)]
-                else:
-                    line = text[idx:end]
-                    with self._stdout_lock:
-                        del self._stdout_buf[:end + 1]
-                return line
+                found = _find_reply(bytes(self._stdout_buf), prefixes)
+                if found is not None:
+                    line, consumed = found
+                    del self._stdout_buf[:consumed]
+                    return line
             time.sleep(0.05)
         return None
 
-    def _send(
-        self, cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
-    ) -> Optional[str]:
-        """Write one command to RetroArch's stdin, optionally waiting for its reply.
+    def _write_cmd(self, cmd: str) -> bool:
+        """Write one command line to RetroArch's stdin.
 
         Args:
             cmd: The command line to send; the newline is added here.
-            wait_prefix: Reply prefix(es) to wait for, or None for a command
-                with no reply.
-            timeout: Seconds to wait for the reply.
 
         Returns:
-            The reply line when one was waited for and arrived, otherwise None,
-            including when the process is gone or the pipe is broken.
+            True once the line is flushed. False when there is no running
+            process or the pipe is broken, which the caller has to treat as a
+            command that never reached the emulator: nothing but this return
+            says a press was dropped.
         """
         proc = self._proc
         if proc is None or proc.stdin is None or proc.poll() is not None:
-            return None
+            log.warning(
+                "retroarch: dropping %r, no running process (platform=%s, rom=%s)",
+                cmd, self.platform, self._rom_base,
+            )
+            return False
         try:
             proc.stdin.write(f"{cmd}\n".encode())
             proc.stdin.flush()
-        except (BrokenPipeError, OSError):
-            return None
-        if wait_prefix:
-            return self._wait_for_reply(wait_prefix, timeout)
-        return None
+        except (BrokenPipeError, OSError) as exc:
+            log.warning(
+                "retroarch: could not send %r (platform=%s, rom=%s): %s",
+                cmd, self.platform, self._rom_base, exc,
+            )
+            return False
+        return True
+
+    def _send(
+        self, cmd: str, wait_prefix: Union[str, tuple[str, ...]], timeout: float = 5.0
+    ) -> Optional[str]:
+        """Send one command and return the reply it answers with.
+
+        A reply carries nothing naming the command that produced it, so one
+        exchange runs at a time and the buffer is emptied before the command
+        goes out. Without that, a background `GET_STATUS` poll consumes the
+        `OK` or the `LOAD_STATE_SLOT` echo another thread is waiting on, and a
+        reply left over from an earlier command answers this one.
+
+        Args:
+            cmd: The command line to send; the newline is added here.
+            wait_prefix: One reply prefix, or several of which the earliest
+                matching line wins.
+            timeout: Seconds to wait for the reply.
+
+        Returns:
+            The reply line, or None when the command could not be sent or no
+            reply arrived in time.
+        """
+        prefixes = (wait_prefix,) if isinstance(wait_prefix, str) else tuple(wait_prefix)
+        with self._reply_lock:
+            with self._stdout_lock:
+                self._stdout_buf.clear()
+            if not self._write_cmd(cmd):
+                return None
+            return self._wait_for_reply(prefixes, timeout)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
         """Start RetroArch on `rom_path` with the platform's core.
@@ -1037,9 +1125,13 @@ class Retroarch(Emulator):
         _ensure_core_assets(info.get("assets", {}))
         cfg_path = _write_broker_cfg(info.get("thumbnail", True))
 
+        env = base_launch_env()
         binary = os.environ.get("RETROARCH_BIN", "retroarch")
-        if "/" not in binary and shutil.which(binary) is None:
-            raise RuntimeError(f"retroarch binary not found in PATH: {binary}")
+        # Probed against the PATH the child gets, not the broker's own: the
+        # launch env appends /usr/games, where the packaged binary lives.
+        launch_path = env.get("PATH")
+        if "/" not in binary and shutil.which(binary, path=launch_path) is None:
+            raise RuntimeError(f"retroarch binary not found in PATH ({launch_path}): {binary}")
 
         self._rom_base = rom_path.stem
         # A fresh process starts on whatever slot the config left it on.
@@ -1064,14 +1156,21 @@ class Retroarch(Emulator):
             rom_path,
             resume_slot,
         )
-        self._spawn_ra(cmd, base_launch_env())
+        self._spawn_ra(cmd, env)
 
         # Slot 0 is a real slot here, so the gate is on the request, not on the
         # number: `if resume_slot` would drop every resume this broker asks for.
         if resume_slot is not None:
-            threading.Thread(
-                target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
-            ).start()
+            if self.supports_states:
+                threading.Thread(
+                    target=self._deferred_load_state, args=(resume_slot, seq), daemon=True
+                ).start()
+            else:
+                log.warning(
+                    "retroarch: ignoring resume_slot=%s, platform %r has no savestate support",
+                    resume_slot,
+                    self.platform,
+                )
 
     def _deferred_load_state(self, slot: int, seq: int) -> None:
         """Load `slot` once RetroArch reports the content PLAYING.
@@ -1190,17 +1289,24 @@ class Retroarch(Emulator):
                 return False
 
             steps = (index - self._disc_index) % len(entries)
-            self._send("DISK_EJECT_TOGGLE")
+            # A command that never reached the emulator leaves the tray
+            # somewhere other than where the tracked index would say.
+            if not self._write_cmd("DISK_EJECT_TOGGLE"):
+                log.warning("disc swap: tray open not delivered, index %d not committed", index)
+                return False
             time.sleep(DISC_TRAY_SETTLE)
             for _ in range(steps):
                 # Re-checked between every step: a relaunch landing here must
                 # not keep sending DISK_NEXT into the new process's stdin.
                 if self._launch_seq != seq:
                     break
-                self._send("DISK_NEXT")
+                if not self._write_cmd("DISK_NEXT"):
+                    log.warning("disc swap: disc step not delivered, index %d not committed", index)
+                    return False
                 time.sleep(DISC_STEP_DELAY)
-            if self._launch_seq == seq:
-                self._send("DISK_EJECT_TOGGLE")
+            if self._launch_seq == seq and not self._write_cmd("DISK_EJECT_TOGGLE"):
+                log.warning("disc swap: tray close not delivered, index %d not committed", index)
+                return False
             # The wait can outlast the session it started for (a relaunch bumps
             # _launch_seq) or the core can die mid-sequence; either way nothing
             # confirms the commands above actually landed, so the tracked index
@@ -1214,19 +1320,38 @@ class Retroarch(Emulator):
         finally:
             self._disc_lock.release()
 
-    def _home_state_slot(self) -> None:
+    def _home_state_slot(self) -> bool:
         """Park RetroArch's current state slot on `STATE_SLOT`.
 
         Absolute, not relative: MINUS runs the slot down onto its -1 floor
-        first, so this holds no matter where the slot was.
+        first, so this holds wherever the slot was, as long as it was no
+        higher than `SLOT_HOME_STEPS` presses above the floor. Nothing in the
+        protocol reads the slot back, so a player who cycled past that is only
+        caught by the save confirmation missing the slot afterwards.
+
+        Returns:
+            True when every press was delivered. A dropped press leaves the
+            slot somewhere unknown, so `_slot_homed` stays off and the next
+            save homes again rather than trusting this one.
         """
         for _ in range(SLOT_HOME_STEPS):
-            self._send("STATE_SLOT_MINUS")
+            if not self._write_cmd("STATE_SLOT_MINUS"):
+                log.warning(
+                    "retroarch: slot homing lost a press (platform=%s, rom=%s)",
+                    self.platform, self._rom_base,
+                )
+                return False
             time.sleep(SLOT_STEP_DELAY)
         for _ in range(STATE_SLOT + 1):
-            self._send("STATE_SLOT_PLUS")
+            if not self._write_cmd("STATE_SLOT_PLUS"):
+                log.warning(
+                    "retroarch: slot homing lost a press (platform=%s, rom=%s)",
+                    self.platform, self._rom_base,
+                )
+                return False
             time.sleep(SLOT_STEP_DELAY)
         self._slot_homed = True
+        return True
 
     def _try_save(self) -> bool:
         """Send `SAVE_STATE` once and confirm the file landed in `STATE_SLOT`.
@@ -1236,7 +1361,8 @@ class Retroarch(Emulator):
             `STATE_CONFIRM_WAIT`.
         """
         before = _state_snapshot(STATE_DIR, self._rom_base)
-        self._send("SAVE_STATE")
+        if not self._write_cmd("SAVE_STATE"):
+            return False
         return _wait_for_state_file(before, STATE_DIR, self._rom_base, STATE_SLOT, STATE_CONFIRM_WAIT)
 
     def save_state(self, slot: int) -> bool:
@@ -1259,8 +1385,12 @@ class Retroarch(Emulator):
         """
         if not self.alive():
             return False
-        if not self._slot_homed:
-            self._home_state_slot()
+        if not self._slot_homed and not self._home_state_slot():
+            log.warning(
+                "retroarch: state slot not parked on %d, saving into whatever slot is current "
+                "(platform=%s, rom=%s)",
+                STATE_SLOT, self.platform, self._rom_base,
+            )
         if self._try_save():
             return True
         if not self.alive():
@@ -1325,6 +1455,38 @@ class Retroarch(Emulator):
         shot = state.with_name(f"{state.name}.png")
         return shot if shot.is_file() else None
 
+    def clear_working_slot(self) -> None:
+        """Delete every content's state in the broker's slot, and its thumbnail.
+
+        RetroArch names a state after the loaded content, so a leftover for a
+        different game is already invisible to a resume. One for the *same*
+        game is not: in a shared container the previous player's state would
+        be served to the next, since nothing about the name says whose it is.
+
+        Searched recursively, since a core may redirect states into a subdir
+        of its own.
+        """
+        if not STATE_DIR.is_dir():
+            return
+        suffix = _state_suffix(STATE_SLOT)
+        try:
+            stale_states = [p for p in STATE_DIR.rglob(f"*{suffix}") if p.is_file()]
+        except OSError as exc:
+            log.warning("could not scan %s for stale states: %s", STATE_DIR, exc)
+            return
+        for stale in stale_states:
+            try:
+                stale.unlink()
+                log.info("cleared stale state %s", stale.name)
+            except OSError as exc:
+                log.warning("could not clear stale state %s: %s", stale.name, exc)
+                continue
+            shot = stale.with_name(f"{stale.name}.png")
+            try:
+                shot.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not clear stale state thumbnail %s: %s", shot.name, exc)
+
     def state_target(self, filename: str) -> Optional[Path]:
         """Where a pushed state called `filename` belongs.
 
@@ -1349,12 +1511,44 @@ class Retroarch(Emulator):
             return existing
         return STATE_DIR / _state_name(self._rom_base, STATE_SLOT)
 
+    def _flush_sram(self) -> bool:
+        """Ask RetroArch to write the game's SRAM out before the archive is dumped.
+
+        `SAVE_FILES` answers `OK` or `NO`, and a refusal has to be reported:
+        the dump that follows ships whatever is on disk either way, so an
+        unflushed session ships the previous save as if it were current.
+
+        Returns:
+            True when RetroArch answered `OK`; False when it refused or never
+            answered, both of which are logged with the loaded content.
+        """
+        reply = self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
+        if reply is None:
+            log.error(
+                "retroarch: no SAVE_FILES reply within %.1fs, the save archive may ship stale "
+                "save data (platform=%s, rom=%s, core=%s)",
+                SAVE_FILES_WAIT, self.platform, self._rom_base, self.archive_core(),
+            )
+            return False
+        if reply.startswith("NO"):
+            log.error(
+                "retroarch: SAVE_FILES refused, SRAM was not flushed and the save archive may "
+                "ship stale save data (platform=%s, rom=%s, core=%s)",
+                self.platform, self._rom_base, self.archive_core(),
+            )
+            return False
+        log.info("retroarch: SRAM flushed for %s", self._rom_base)
+        return True
+
     def save_and_exit(self, slot: Optional[int]) -> dict[str, Any]:
         """Save state when asked, flush SRAM, and quit RetroArch.
 
         The state save is skipped when `slot` is None or the platform entry
-        opts out of `savestate`. `SAVE_FILES` is always sent so the save dump
-        ships current save data, then the process is quit through `_quit`.
+        opts out of `savestate`. The SRAM flush always runs so the save dump
+        ships current save data, then the process is quit through `_quit`. A
+        flush RetroArch refuses is logged by `_flush_sram`; the exit still goes
+        ahead, since holding the session open would not make the refusal any
+        more likely to succeed.
 
         Args:
             slot: The slot to save into, or None to exit without writing a
@@ -1369,8 +1563,12 @@ class Retroarch(Emulator):
         saved = False
         state_file = None
         if self.alive():
-            info = _platform_info(self.platform)
-            if slot is not None and (info is None or info.get("savestate", True)):
+            if slot is not None and not self.supports_states:
+                log.warning(
+                    "retroarch: not saving state on exit, platform %r has no savestate support",
+                    self.platform,
+                )
+            if slot is not None and self.supports_states:
                 saved = self.save_state(slot)
                 if saved:
                     p = self.state_path()
@@ -1382,8 +1580,7 @@ class Retroarch(Emulator):
                             saved = False
                         else:
                             state_file = {"path": str(p), "size": st.st_size, "mtime": st.st_mtime}
-            # Flush SRAM so the save dump ships current save data.
-            self._send("SAVE_FILES", wait_prefix=("OK", "NO"), timeout=SAVE_FILES_WAIT)
+            self._flush_sram()
         self._quit()
         return {
             "state_saved": saved,

@@ -61,7 +61,7 @@ not as settled.
 | Platform | Core | Setup | Details |
 | --- | --- | --- | --- |
 | PlayStation | `swanstation` | Required | Region BIOS (e.g. `scph5501.bin`). Not listed on libretro's hub under this exact core name (a newer, DuckStation-derived core), but every PS1 core needs a real BIOS. |
-| PSP | `ppsspp` | None | PPSSPP fully HLEs PSP firmware, no BIOS file to source. The broker auto-symlinks the container's standalone PPSSPP asset tree (`/usr/share/ppsspp/assets`) into RetroArch's system dir, since the core refuses to boot without it; this only works if that package ships in the image. |
+| PSP | `ppsspp` | None | The recommended path for PSP over the standalone PPSSPP module. PPSSPP fully HLEs PSP firmware, no BIOS file to source. The broker auto-symlinks the container's standalone PPSSPP asset tree (`/usr/share/ppsspp/assets`) into RetroArch's system dir, since the core refuses to boot without it; this only works if that package ships in the image. |
 
 ## NEC PC Engine
 

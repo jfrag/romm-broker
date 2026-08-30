@@ -20,12 +20,13 @@ Endpoints fall into three groups:
 | --- | --- | --- |
 | Lifecycle: activate, join, swap-disc | RomM's backend | `X-Broker-Secret` |
 | State and archive transfer: save-state, load-state, state-file, state-screenshot, imports, exports, memory card | RomM's backend | `X-Broker-Secret` |
-| Host actions: invite, exit | the room UI | the controller token as `?token=`; exit also accepts the secret |
-| Room: context, the collab websocket | the room UI | a personal token in the URL |
+| Host actions: invite, exit | the room UI (invite), RomM (exit) | the controller token as `?token=`; exit also accepts the secret |
+| Room: context, the collab websocket | the room UI | a personal token, or an invite token, in the URL |
 | Status and health | anyone | none |
 
-The room UI never holds the secret. Its exit and invite buttons carry the
-controller token instead, which is why exit accepts either.
+The room UI never holds the secret. Its invite tile carries the controller
+token instead; exit accepts either so RomM and the controller token both
+work.
 
 ## Endpoints
 

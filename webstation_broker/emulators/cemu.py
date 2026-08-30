@@ -99,14 +99,21 @@ check_update phones home at startup; the rest keep the session free of
 dialogs and chrome.
 """
 
+_AUDIO_DEVICE_PATCHES: dict[str, str] = {
+    "TVDevice": "default",
+    "PadDevice": "default",
+}
+"""`Audio/<key>` values forced before every launch, all children of `<content>/Audio`.
+
+Cemu ships these blank. `IAudioAPI::CreateDeviceFromConfig` treats an empty
+device string as "no device" and silently skips opening any audio stream at
+all, rather than falling back to the system default. `default` is the
+sentinel `CubebAPI::GetDevices()` reserves for a null device id, the only
+string that path resolves to "let cubeb pick the system default".
+"""
+
 _PAD_NAME = os.environ.get("CEMU_PAD_NAME", "Microsoft X-Box 360 pad")
-"""The selkies virtual pad's name as the kernel xpad driver presents it (env `CEMU_PAD_NAME`)."""
-_PAD_VENDOR = 0x045E
-"""USB vendor id of the virtual pad (Microsoft)."""
-_PAD_PRODUCT = 0x028E
-"""USB product id of the virtual pad (Xbox 360 controller)."""
-_PAD_VERSION = 0x0110
-"""USB device version of the virtual pad."""
+"""The selkies virtual pad's name as the interposer presents it (env `CEMU_PAD_NAME`)."""
 
 _VPAD_SDL_MAPPINGS: tuple[tuple[int, int], ...] = (
     (1, 1),    # A -> east
@@ -161,10 +168,13 @@ def _crc16(data: bytes) -> int:
 
 
 def _sdl_guid(crc: int) -> str:
-    """A Linux evdev SDL joystick GUID for the virtual pad.
+    """The SDL joystick GUID the interposer's virtual pad actually reports.
 
-    Bus, name CRC, vendor, product and version as little-endian u16 fields
-    padded to 16 bytes.
+    The interposer only exposes the pad through the legacy /dev/input/jsN
+    nodes, which carry no vendor/product ioctls, so SDL can't build the usual
+    bus+vendor+product GUID and falls back to its name-based form instead:
+    a zero bus, the name CRC, then the name itself (11 bytes, NUL-padded)
+    filling the rest.
 
     Args:
         crc: The name CRC field, zero for SDL before 2.24.
@@ -172,8 +182,12 @@ def _sdl_guid(crc: int) -> str:
     Returns:
         The 32-character lowercase hex GUID.
     """
-    fields = (0x03, crc, _PAD_VENDOR, 0, _PAD_PRODUCT, 0, _PAD_VERSION, 0)
-    return "".join(f"{f & 0xFF:02x}{(f >> 8) & 0xFF:02x}" for f in fields)
+    tail = _PAD_NAME.encode()[:11] + b"\x00"
+    guid = bytearray(16)
+    guid[2] = crc & 0xFF
+    guid[3] = (crc >> 8) & 0xFF
+    guid[4 : 4 + len(tail)] = tail
+    return guid.hex()
 
 
 def _pad_uuids() -> list[str]:
@@ -235,7 +249,15 @@ def _patch_settings() -> None:
 
     A missing file is seeded, which also skips the first-start Getting
     Started dialog. Patched key-wise so every other setting the user tuned
-    through the GUI survives untouched. Failures are logged, not raised.
+    through the GUI survives untouched.
+
+    A failure is raised rather than logged and stepped over: without a
+    settings.xml Cemu parks on the Getting Started modal, so the launch that
+    would go ahead anyway hands the player a blocked stream while the
+    activate reports success.
+
+    Raises:
+        RuntimeError: When settings.xml cannot be written.
     """
     try:
         root = None
@@ -251,12 +273,23 @@ def _patch_settings() -> None:
             if node is None:
                 node = ET.SubElement(root, key)
             node.text = value
+        audio = root.find("Audio")
+        if audio is None:
+            audio = ET.SubElement(root, "Audio")
+        for key, value in _AUDIO_DEVICE_PATCHES.items():
+            node = audio.find(key)
+            if node is None:
+                node = ET.SubElement(audio, key)
+            node.text = value
         SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = SETTINGS_PATH.with_suffix(".tmp")
         ET.ElementTree(root).write(tmp, encoding="UTF-8", xml_declaration=True)
         tmp.replace(SETTINGS_PATH)
-    except Exception:
-        log.exception("settings.xml patch failed, broker settings NOT applied")
+    except OSError as exc:
+        log.error("cemu: settings.xml patch failed at %s: %s", SETTINGS_PATH, exc)
+        raise RuntimeError(
+            f"could not apply broker settings to {SETTINGS_PATH}: {exc}"
+        ) from exc
 
 
 def _pad_profile_xml() -> str:
@@ -312,7 +345,7 @@ class Cemu(Emulator):
     Cemu has no control API, so the broker pins settings.xml before every
     launch (no update check, no Discord presence, no boot sound, no menubar),
     seeds the player-0 GamePad profile once, and boots the game fullscreen
-    with `-f -g`. Cemu installs no signal handler, so the stop is a hard
+    with `-f -m -g`. Cemu installs no signal handler, so the stop is a hard
     SIGTERM kill; that is safe because the game's own save data is already
     on disk the moment the game writes it.
 
@@ -346,9 +379,16 @@ class Cemu(Emulator):
     """
 
     def __init__(self) -> None:
-        """Initialise the process handle and a zero session baseline."""
+        """Initialise the process handle and the session baseline."""
         super().__init__()
-        self._session_start = 0.0
+        self._session_start = float("inf")
+        """Unix time `launch` started Cemu at; infinity until it does.
+
+        Infinity rather than zero so an instance that never launched matches
+        no file at all. Zero is newer than nothing, so every title in the
+        container would read as written this session and `save_and_exit`
+        would restamp and ship all of them.
+        """
 
     def prepare_restore(self) -> None:
         """Stop a running Cemu so the archive can be extracted under it."""
@@ -381,6 +421,10 @@ class Cemu(Emulator):
         Args:
             rom_path: The file to boot.
             resume_slot: Ignored with a log line; Cemu has no save states.
+
+        Raises:
+            RuntimeError: When settings.xml cannot be patched, which would
+                leave Cemu parked on its Getting Started modal.
         """
         self.stop()
         _patch_settings()
@@ -393,20 +437,24 @@ class Cemu(Emulator):
             )
         self._session_start = time.time()
         binary = os.environ.get("CEMU_BIN", "Cemu")
-        cmd = [binary, "-f"]
-        # Without an explicit override, Cemu's own default resolves to the
-        # same mlc01 this broker dumps from.
-        if os.environ.get("CEMU_MLC_DIR"):
-            cmd += ["-m", str(MLC_DIR)]
-        cmd += ["-g", str(rom_path)]
-        log.info("launching cemu (rom=%s)", rom_path)
+        # CEMU_MLC_DIR is only one of three ways MLC_DIR moves: CEMU_DATA_DIR
+        # and XDG_DATA_HOME shift it too, and Cemu resolves neither the same
+        # way. Stating the path every launch is what keeps the emulator
+        # writing saves into the tree the dump reads back.
+        try:
+            MLC_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("cemu: could not create the mlc at %s: %s", MLC_DIR, exc)
+        cmd = [binary, "-f", "-m", str(MLC_DIR), "-g", str(rom_path)]
+        log.info("launching cemu (rom=%s, mlc=%s)", rom_path, MLC_DIR)
         self._spawn(cmd, base_launch_env())
 
     def _modified_title_saves(self) -> list[Path]:
         """Title save dirs holding a file written while the session ran.
 
         Returns:
-            The `usr/save/<titleHigh>/<titleLow>` directories touched since launch.
+            The `usr/save/<titleHigh>/<titleLow>` directories touched since
+            launch, or nothing at all when no launch set a baseline.
         """
         selected = []
         if not SAVE_DIR.is_dir():

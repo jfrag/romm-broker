@@ -1,6 +1,6 @@
 ---
 title: "Using the room"
-description: "A player's guide to the collab room: joining, chat, webcam, controller assignment, and the other buttons in the sidebar."
+description: "A player's guide to the collab room: joining, chat, webcam, controller assignment, and the rest of the bottom bar."
 ---
 
 This page is for players, not integrators. It explains what you see and click
@@ -39,9 +39,12 @@ Everyone in the room has one of three levels of access:
 - **Spectator** (read-only) - joined with a "Read Only" invite. Can watch and
   chat, but has no webcam/mic controls and can never be handed input.
 
-If you're the host, you'll see an invite button in the sidebar (the
-person-plus icon) that mints both kinds of link and copies them to your
-clipboard, ready to send.
+If you're the host, the last tile in the bottom bar is a dashed one with a
+big plus on it. Tap it and it flips over to two buttons, **Player Invite
+Link** and **Viewer Invite Link**; either copies that link to your clipboard,
+ready to send. Each is one link for the whole session: send the same one to
+everyone you want in, and each person who opens it gets their own seat.
+Links stop working when the session ends.
 
 <Callout type="info">
 In a solo session, chat and webcam are hidden until someone else joins, so a
@@ -50,33 +53,39 @@ Opening an invite link always shows the full room, even into a session that
 started solo.
 </Callout>
 
-## The sidebar
+## The bottom bar
 
-The panel down the side (tap the handle on its edge to open or close it) is
-where everything but the game itself lives:
+Everything but the game itself lives in the bar along the bottom (swipe it
+down, or tap the handle at the bottom edge, to hide it and get the whole
+screen back). Left to right:
 
-- **Title bar icons**, left to right: a gaming-mode/fullscreen toggle, a
-  light/dark theme switch, a reload button for the stream if it ever freezes,
-  a settings gear, and, for the host only, invite and exit buttons.
-- **Media controls**: buttons to turn your microphone and webcam on or off,
-  and a separate volume slider/mute button for the *game's own audio* (not
-  your voice chat).
-- **Chat**, at the bottom, with a box to type into.
+- **The controller tray** (host only), then **your own tile**, then a tile
+  for everyone else in the room.
+- **The invite tile** (host only), described above.
+- **Chat**, on the right: the most recent messages with a box to type into.
+  Tap into the box and it grows up over the bottom half of the game to show
+  the whole history; tap anywhere else (or press Esc) and it drops back
+  down. While it's closed, new messages pop up briefly above it so you don't
+  miss them. On a small screen, once there are enough tiles to need the
+  room, chat folds to a narrow tab at the right edge with a dot for unread
+  messages; tap the tab to open it.
 
-Spectators don't get the media buttons or the settings gear, since there's
-nothing for either to control.
+Game volume, fullscreen, saving and stopping the game are RomM's own
+controls, on the bar RomM shows above the stream, not the room's.
 
-### Settings
+### Your own tile
 
-The gear icon opens a small dialog for picking which microphone and camera to
-use, if your device has more than one. Your choice is remembered for next
-time.
+Hover over your own video (or tap it on a touch screen) and three buttons
+appear over it: microphone on/off, webcam on/off, and a settings gear. They
+only show while you're pointing at the tile, so the rest of the time it's
+just your video.
 
-### Fullscreen / gaming mode
+The gear opens a small dialog for picking which microphone and camera to
+use, if your device has more than one (your choice is remembered for next
+time), and a **Reload Stream** button for the rare case the stream freezes.
 
-The controller icon in the header requests fullscreen on the game stream
-itself, not the whole browser tab, so the sidebar and chat stay reachable if
-you back out.
+Spectators have no tile of their own and so none of these, since there's
+nothing for them to control.
 
 ## Chat and webcam
 
@@ -147,10 +156,11 @@ rather focus on the game.
 
 ## Ending the session
 
-Only the host sees the exit button (the power icon). It asks for
-confirmation, since it ends the session for everyone: the game saves, the
-emulator stops, and every link into the room stops working. After exit, a
-short summary shows what got saved and how much save data was written out.
+Only the host can end the session, with the stop button on RomM's own bar
+above the stream. It ends the session for everyone: the game saves, the
+emulator stops, and every link into the room stops working. Guests who
+leave (close the tab, lose signal) keep their seat and can come back on the
+same link; any controller they were holding goes back to the tray.
 
 ## Language
 

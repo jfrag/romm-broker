@@ -18,6 +18,7 @@ No authentication. With no session it answers `{"active": false}`. With one:
 | `multiplayer` | The flag fixed at activate. |
 | `emulator_alive` | Whether the emulator process is still running. |
 | `boot_failed` | Set by an emulator that can tell its process is alive but never reached a running game, the boot-error-dialog case. Passive: the broker surfaces it and takes no action of its own. |
+| `extraction_phase` | `null`, `"extracting_archive"`, or `"extracting_pkg"`. Set while shadPS4 or RPCS3 is unpacking a slow `.pkg`/archive ROM, cleared once unpacking ends (the emulator has not started yet at that point, so a `null` phase does not mean the game is up; read `emulator_alive` for that). Passive, like `boot_failed`: poll it to show an indeterminate spinner while non-null, there is no percentage. |
 | `supports_states` | Whether the state routes will work for this emulator, so the parent needs no per-emulator table. |
 | `state_slot` | The one slot this emulator works in; every save and load echoes it. |
 | `started_at` | Unix time the session was created. |

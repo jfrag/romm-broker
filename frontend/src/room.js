@@ -24,6 +24,32 @@ import { getTranslator } from './translation.js';
 const hasWindowTrackProcessor = (typeof MediaStreamTrackProcessor !== 'undefined');
 const hasWindowTrackGenerator = (typeof MediaStreamTrackGenerator !== 'undefined');
 
+// ---------------------------------------------------------------------------
+// Camera orientation. Nothing downstream re-orients a frame (the receiver
+// paints whatever arrives), so the sender has to hand the encoder upright
+// pixels. Chromium stamps each VideoFrame with rotation/flip and applies them
+// in drawImage. Mobile WebKit delivers sensor-fixed frames with no metadata
+// at all, and the only thing that says which way is up is the window
+// orientation relative to the one the sensor is upright in.
+// ---------------------------------------------------------------------------
+
+const hasFrameOrientation = typeof VideoFrame !== 'undefined'
+    && typeof VideoFrame.prototype === 'object'
+    && 'rotation' in VideoFrame.prototype;
+
+// The window orientation at which the camera sensor delivers upright frames
+// on the engines that hand its own orientation over.
+const SENSOR_UPRIGHT_ORIENTATION = -90;
+
+// Only mobile WebKit derives orientation: no frame metadata, but a numeric
+// window.orientation to derive it from.
+const canDeriveOrientation = () =>
+    !hasFrameOrientation && typeof window.orientation === 'number';
+
+// Clockwise degrees that make a sensor-orientation frame upright right now.
+const deriveRotation = () =>
+    ((window.orientation - SENSOR_UPRIGHT_ORIENTATION) % 360 + 360) % 360;
+
 // Frames a worker-hosted generator may be behind before new ones are dropped, and
 // the consecutive-drop count after which a generator is considered stalled for good.
 const SINK_MAX_IN_FLIGHT = 3;
@@ -54,6 +80,9 @@ async function startSource(id, track) {
         self.postMessage({ type: 'sourceFailed', id: id });
         return;
     }
+    // Settles the page's rung choice before any frame: on failure it falls
+    // through to its own processor in the same call instead of erroring later.
+    self.postMessage({ type: 'sourceStarted', id: id });
     const state = { reader: reader, track: track, inFlight: 0 };
     sources.set(id, state);
     try {
@@ -155,10 +184,19 @@ self.onmessage = (e) => {
 // packs it into AudioData. Kept tiny because it runs on the audio render thread.
 const SHIM_AUDIO_WORKLET_SRC = `
 registerProcessor('mstp-shim', class extends AudioWorkletProcessor {
+    constructor() {
+        super();
+        // Handed a port, channel data goes straight to its holder (the socket
+        // worker) instead of through the page.
+        this.out = this.port;
+        this.port.onmessage = (e) => {
+            if (e.data && e.data.port) this.out = e.data.port;
+        };
+    }
     process(inputs) {
         const input = inputs[0];
         if (input && input.length > 0 && input[0] && input[0].length > 0) {
-            this.port.postMessage(input);
+            this.out.postMessage(input);
         }
         return true;
     }
@@ -168,6 +206,9 @@ registerProcessor('mstp-shim', class extends AudioWorkletProcessor {
 let mediaWorker = null;
 let mediaWorkerProbe = null;
 let mediaWorkerSeq = 0;
+// Set once the worker's processor failed to read a transferred track: a second
+// track would fail the same way, so the worker capture rung is not offered again.
+let mediaWorkerTrackUnsupported = false;
 const mediaWorkerSources = new Map();
 const mediaWorkerSinks = new Map();
 
@@ -250,8 +291,14 @@ const ensureMediaWorker = () => {
                     else m.frame.close();
                     return;
                 }
+                case 'sourceStarted': {
+                    const source = mediaWorkerSources.get(m.id);
+                    if (source) source.onStart();
+                    return;
+                }
                 case 'sourceEnd':
                 case 'sourceFailed': {
+                    if (m.type === 'sourceFailed') mediaWorkerTrackUnsupported = true;
                     const source = mediaWorkerSources.get(m.id);
                     if (source) source.onEnd(m.type === 'sourceFailed');
                     return;
@@ -281,7 +328,9 @@ const ensureMediaWorker = () => {
 
 // Standard capture path: the track is transferred into the worker, which reads it
 // with the real MediaStreamTrackProcessor and transfers frames back one at a time.
-const createWorkerTrackProcessor = (track) => {
+// Resolves null when the worker cannot read the track, so the caller can take a
+// page rung in the same call instead of erroring at the first read.
+const createWorkerTrackProcessor = async (track) => {
     if (!mediaWorker) return null;
     // The page keeps the original track for the local preview and the enabled
     // toggle -- transferring it would detach it -- so the worker gets a clone.
@@ -307,10 +356,13 @@ const createWorkerTrackProcessor = (track) => {
     };
 
     let streamController = null;
+    let settleStart = null;
+    const started = new Promise((resolve) => { settleStart = resolve; });
     const readable = new ReadableStream({
         start(controller) {
             streamController = controller;
             mediaWorkerSources.set(id, {
+                onStart() { settleStart(true); },
                 onFrame(frame) {
                     if (stopped) { frame.close(); return; }
                     // Enqueue only what the encoder is keeping up with.
@@ -319,6 +371,7 @@ const createWorkerTrackProcessor = (track) => {
                     if (mediaWorker) mediaWorker.postMessage({ type: 'sourceAck', id });
                 },
                 onEnd(failed) {
+                    settleStart(false);
                     mediaWorkerSources.delete(id);
                     if (stopped) return;
                     stopped = true;
@@ -343,6 +396,7 @@ const createWorkerTrackProcessor = (track) => {
         return null;
     }
 
+    if (!(await started)) return null;
     return { readable, close: stop };
 };
 
@@ -535,7 +589,20 @@ const createShimTrackProcessor = (track) => {
 };
 
 // Capture side. Returns a MediaStreamTrackProcessor-alike: { readable, close() }.
+// A worker reader keeps every frame off the page's thread, so it is asked first;
+// the page's own processor is the rung below it, not above. The standard
+// processor is worker-only and video-only, so audio starts at the page rung.
 const createTrackProcessor = async (track) => {
+    if (track.kind === 'video' && !mediaWorkerTrackUnsupported) {
+        const caps = await ensureMediaWorker();
+        if (caps && caps.processor) {
+            const processor = await createWorkerTrackProcessor(track);
+            if (processor) {
+                logMediaPath('video capture: MediaStreamTrackProcessor in the media worker.');
+                return processor;
+            }
+        }
+    }
     if (hasWindowTrackProcessor) {
         try {
             const processor = new MediaStreamTrackProcessor({ track });
@@ -545,17 +612,6 @@ const createTrackProcessor = async (track) => {
             return { readable: processor.readable, close: () => {} };
         } catch (err) {
             console.warn('[Media] page MediaStreamTrackProcessor failed:', err);
-        }
-    }
-    // The standard processor is worker-only, and video-only.
-    if (track.kind === 'video') {
-        const caps = await ensureMediaWorker();
-        if (caps && caps.processor) {
-            const processor = createWorkerTrackProcessor(track);
-            if (processor) {
-                logMediaPath('video capture: MediaStreamTrackProcessor in the media worker.');
-                return processor;
-            }
         }
     }
     return createShimTrackProcessor(track);
@@ -680,17 +736,10 @@ const createWorkerVideoSink = async (onFail) => {
 // Presentation side. Resolves to { track, write(frame), close() }, or null when the
 // browser has no generator at all and the caller should paint a canvas instead.
 // onFail is called if a live sink dies later, so the caller can go back to canvas.
+// The worker's VideoTrackGenerator outranks the page's MediaStreamTrackGenerator,
+// so the worker is asked first and the page generator is taken only once it has
+// reported it holds no generator of its own.
 const createVideoSink = async (onFail) => {
-    // No shipping browser exposes both a page-side MediaStreamTrackGenerator and a
-    // worker-side VideoTrackGenerator, so taking this one directly skips starting a
-    // worker on Chromium; revisit the short-circuit if one ever exposes both.
-    if (hasWindowTrackGenerator) {
-        const sink = createWindowVideoSink(onFail);
-        if (sink) {
-            logMediaPath('video sink: MediaStreamTrackGenerator on the page.');
-            return sink;
-        }
-    }
     const caps = await ensureMediaWorker();
     if (caps && caps.generator) {
         const sink = await createWorkerVideoSink(onFail);
@@ -699,10 +748,360 @@ const createVideoSink = async (onFail) => {
             return sink;
         }
     }
+    if (hasWindowTrackGenerator) {
+        const sink = createWindowVideoSink(onFail);
+        if (sink) {
+            logMediaPath('video sink: MediaStreamTrackGenerator on the page.');
+            return sink;
+        }
+    }
     logMediaPath('video sink: 2D canvas - no track generator in this browser, so every '
         + 'frame is drawn by hand instead of being handed to a <video> element.');
     return null;
 };
+
+const MSG_TYPE = {
+    VIDEO_FRAME: 0x01,
+    AUDIO_FRAME: 0x02,
+    VIDEO_CONFIG: 0x03,
+    PCM_FRAME: 0x04,
+};
+
+// ---------------------------------------------------------------------------
+// Room socket in a worker. The page's thread is otherwise between the socket
+// and every remote voice: anything occupying it -- a getUserMedia prompt, a
+// start-menu render -- stops audio being delivered for as long as it lasts.
+// Here the worker owns the WebSocket, decodes AUDIO_FRAME (Opus) itself, and
+// hands PCM straight down a port to the speaking tile's worklet; PCM_FRAME is
+// upsampled the same way. Everything else -- JSON control, video -- reaches
+// the page unchanged, and sends keep their order through the worker's port.
+// The microphone runs here too: capture frames arrive over a transferred
+// track-processor stream or the capture worklet's port, are encoded in this
+// worker, and leave framed -- so a stalled page delays outgoing voice no
+// more than incoming.
+// Gecko still routes a worker's WebSocket delivery through the page's main
+// thread, so there a page stall costs what the playback buffer cannot cover;
+// Chromium and WebKit deliver to the worker directly.
+// ---------------------------------------------------------------------------
+
+const ROOM_SOCKET_WORKER_SRC = `
+const AUDIO_FRAME = ${MSG_TYPE.AUDIO_FRAME};
+const PCM_FRAME = ${MSG_TYPE.PCM_FRAME};
+let ws = null;
+const ports = new Map();
+const muted = new Set();
+const decoders = new Map();
+const idDecoder = new TextDecoder();
+const hasAudioDecoder = (typeof AudioDecoder !== 'undefined');
+
+function portFor(publicId) {
+    const port = ports.get(publicId);
+    return (port && !muted.has(publicId)) ? port : null;
+}
+
+function decoderFor(publicId) {
+    let dec = decoders.get(publicId);
+    if (dec && dec.state === 'configured') return dec;
+    if (dec) { try { dec.close(); } catch (e) {} }
+    dec = new AudioDecoder({
+        output: (frame) => {
+            const port = portFor(publicId);
+            if (!port) { frame.close(); return; }
+            const pcm = new Float32Array(frame.allocationSize({ planeIndex: 0, format: 'f32' }) / 4);
+            frame.copyTo(pcm, { planeIndex: 0, format: 'f32' });
+            frame.close();
+            port.postMessage(pcm, [pcm.buffer]);
+        },
+        // A fresh decoder recovers on the next packet.
+        error: () => { decoders.delete(publicId); },
+    });
+    dec.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
+    decoders.set(publicId, dec);
+    return dec;
+}
+
+// True when the frame was consumed here; anything else goes to the page.
+function divertAudio(data) {
+    if (data.byteLength < 10) return false;
+    const type = new Uint8Array(data, 8, 1)[0];
+    if (type !== AUDIO_FRAME && type !== PCM_FRAME) return false;
+    const publicId = idDecoder.decode(new Uint8Array(data, 0, 8));
+    if (!ports.has(publicId)) return false;
+    if (muted.has(publicId)) return true;
+    if (type === AUDIO_FRAME) {
+        if (!hasAudioDecoder) return false;
+        try {
+            decoderFor(publicId).decode(new EncodedAudioChunk({
+                type: 'key', timestamp: performance.now() * 1000, data: data.slice(10) }));
+        } catch (err) {
+            const dec = decoders.get(publicId);
+            if (dec) { decoders.delete(publicId); try { dec.close(); } catch (e) {} }
+        }
+        return true;
+    }
+    // 16 kHz mono int16 from an iOS sender, tripled to the 48 kHz context rate.
+    const int16 = new Int16Array(data.slice(9));
+    const pcm = new Float32Array(int16.length * 3);
+    for (let i = 0; i < int16.length; i++) {
+        const s = int16[i] < 0 ? int16[i] / 0x8000 : int16[i] / 0x7FFF;
+        const at = i * 3;
+        pcm[at] = s; pcm[at + 1] = s; pcm[at + 2] = s;
+    }
+    const port = portFor(publicId);
+    if (port) port.postMessage(pcm, [pcm.buffer]);
+    return true;
+}
+
+// Microphone uplink: capture frames reach this worker directly (a
+// transferred track-processor stream, or the capture worklet's port), are
+// encoded here, and go out framed -- a stalled page then delays outgoing
+// voice no more than incoming.
+let micEncoder = null, micActive = false, micId = null, micCursor = 0;
+const hasAudioEncoder = (typeof AudioEncoder !== 'undefined');
+
+function micEnsureEncoder() {
+    if (!hasAudioEncoder) return null;
+    if (micEncoder && micEncoder.state === 'configured') return micEncoder;
+    if (micEncoder) { try { micEncoder.close(); } catch (e) {} }
+    micEncoder = new AudioEncoder({
+        output: (chunk) => {
+            if (!micActive || !micId || !ws || ws.readyState !== 1) return;
+            const msg = new Uint8Array(10 + chunk.byteLength);
+            msg.set(micId, 0);
+            msg[8] = AUDIO_FRAME;
+            msg[9] = 0x00;
+            chunk.copyTo(msg.subarray(10));
+            try { ws.send(msg.buffer); } catch (err) {}
+        },
+        error: () => { micEncoder = null; },
+    });
+    micEncoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1, bitrate: 128000 });
+    return micEncoder;
+}
+
+function micEncode(frame) {
+    const enc = micActive ? micEnsureEncoder() : null;
+    if (enc) { try { enc.encode(frame); } catch (err) {} }
+    frame.close();
+}
+
+self.onmessage = (e) => {
+    const m = e.data;
+    if (m.type === 'micState') {
+        if (m.active !== undefined) micActive = !!m.active;
+        if (m.id !== undefined) micId = m.id;
+        return;
+    }
+    if (m.type === 'micStream') {
+        const reader = m.readable.getReader();
+        (async () => {
+            for (;;) {
+                let r;
+                try { r = await reader.read(); } catch (err) { break; }
+                if (r.done) break;
+                micEncode(r.value);
+            }
+        })();
+        return;
+    }
+    if (m.type === 'micPort') {
+        // Channel arrays from the capture worklet; mono, at its context rate.
+        const rate = m.sampleRate || 48000;
+        micCursor = 0;
+        m.port.onmessage = (ev) => {
+            const channels = ev.data;
+            if (!micActive || !channels || !channels[0]) return;
+            const n = channels[0].length;
+            const frame = new AudioData({
+                format: 'f32', sampleRate: rate, numberOfFrames: n,
+                numberOfChannels: 1,
+                timestamp: Math.round(micCursor / rate * 1e6), data: channels[0] });
+            micCursor += n;
+            micEncode(frame);
+        };
+        return;
+    }
+    if (m.type === 'micStop') {
+        micActive = false;
+        if (micEncoder) { try { micEncoder.close(); } catch (err) {} micEncoder = null; }
+        return;
+    }
+    if (m.type === 'audioPort') { ports.set(m.publicId, m.port); return; }
+    if (m.type === 'audioState') { m.active ? muted.delete(m.publicId) : muted.add(m.publicId); return; }
+    if (m.type === 'audioClose') {
+        ports.delete(m.publicId);
+        muted.delete(m.publicId);
+        const dec = decoders.get(m.publicId);
+        if (dec) { decoders.delete(m.publicId); try { dec.close(); } catch (err) {} }
+        return;
+    }
+    if (m.type === 'open') {
+        ws = new WebSocket(m.url);
+        ws.binaryType = 'arraybuffer';
+        ws.onopen = () => self.postMessage({ type: 'open' });
+        ws.onerror = () => self.postMessage({ type: 'error' });
+        ws.onclose = (ev) => {
+            self.postMessage({ type: 'close', code: ev.code, reason: ev.reason, wasClean: ev.wasClean });
+            ws = null;
+        };
+        ws.onmessage = (ev) => {
+            const d = ev.data;
+            if (d instanceof ArrayBuffer) {
+                if (divertAudio(d)) return;
+                self.postMessage({ type: 'message', data: d }, [d]);
+                return;
+            }
+            self.postMessage({ type: 'message', data: d });
+        };
+        return;
+    }
+    if (!ws) return;
+    if (m.type === 'send') {
+        try { ws.send(m.data); } catch (err) { /* a closing socket reports through onclose */ }
+        return;
+    }
+    if (m.type === 'close') { try { ws.close(m.code, m.reason); } catch (err) {} }
+};
+`;
+
+// A WebSocket-shaped handle onto the socket the worker owns. Call sites keep
+// the API they had; only the thread the bytes are read on changes.
+class RoomSocket {
+    constructor(url) {
+        this.readyState = WebSocket.CONNECTING;
+        this.binaryType = 'arraybuffer';
+        this.onopen = this.onmessage = this.onerror = this.onclose = null;
+        this._listeners = {};
+        // Called instead of onclose when the worker itself dies before it ever
+        // spoke: a policy that blocks blob workers reports there, not as a
+        // synchronous throw, and the caller retries on a page socket.
+        this.onworkerdead = null;
+        this._workerSpoke = false;
+        const workerURL = URL.createObjectURL(new Blob([ROOM_SOCKET_WORKER_SRC], { type: 'text/javascript' }));
+        try {
+            this._worker = new Worker(workerURL);
+        } finally {
+            URL.revokeObjectURL(workerURL);
+        }
+        this._worker.onmessage = (e) => {
+            const m = e.data;
+            this._workerSpoke = true;
+            if (m.type === 'message') {
+                const ev = { data: m.data };
+                if (this.onmessage) this.onmessage(ev);
+                this._emit('message', ev);
+                return;
+            }
+            if (m.type === 'open') {
+                this.readyState = WebSocket.OPEN;
+                if (this.onopen) this.onopen();
+                this._emit('open', {});
+                return;
+            }
+            if (m.type === 'error') { if (this.onerror) this.onerror(m); this._emit('error', m); return; }
+            if (m.type === 'close') {
+                this.readyState = WebSocket.CLOSED;
+                if (this.onclose) this.onclose(m);
+                this._emit('close', m);
+                this._retire();
+            }
+        };
+        // A worker that died reports like a failed socket, not a silent hang.
+        this._worker.onerror = (event) => {
+            if (this.readyState === WebSocket.CLOSED) return;
+            this.readyState = WebSocket.CLOSED;
+            this._retire();
+            if (!this._workerSpoke && this.onworkerdead) { this.onworkerdead(event); return; }
+            if (this.onerror) this.onerror(event);
+            if (this.onclose) this.onclose({ code: 1006, reason: '', wasClean: false });
+        };
+        this._worker.postMessage({ type: 'open', url });
+    }
+
+    send(data) {
+        if (this.readyState !== WebSocket.OPEN) return;
+        if (typeof data === 'string') {
+            this._worker.postMessage({ type: 'send', data });
+            return;
+        }
+        // An ArrayBuffer is transferred rather than copied, so a caller must
+        // not keep it; a view is copied.
+        const buf = data instanceof ArrayBuffer ? data
+            : ArrayBuffer.isView(data)
+                ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+                : data;
+        this._worker.postMessage({ type: 'send', data: buf }, [buf]);
+    }
+
+    close(code, reason) {
+        this.readyState = WebSocket.CLOSING;
+        try { this._worker.postMessage({ type: 'close', code, reason }); } catch (err) { /* already gone */ }
+        this._retire();
+    }
+
+    // Transfers a native track-processor stream for the worker to read,
+    // encode and send: the whole microphone chain then skips the page.
+    connectMicStream(readable) {
+        try { this._worker.postMessage({ type: 'micStream', readable }, [readable]); } catch (err) {}
+    }
+
+    // The capture worklet's line, for engines with no page processor.
+    connectMicPort(port, sampleRate) {
+        try { this._worker.postMessage({ type: 'micPort', port, sampleRate }, [port]); } catch (err) {}
+    }
+
+    setMicActive(active) {
+        try { this._worker.postMessage({ type: 'micState', active }); } catch (err) {}
+    }
+
+    setMicId(idBytes) {
+        try { this._worker.postMessage({ type: 'micState', id: idBytes }); } catch (err) {}
+    }
+
+    stopMic() {
+        try { this._worker.postMessage({ type: 'micStop' }); } catch (err) {}
+    }
+
+    addEventListener(type, fn) {
+        (this._listeners[type] || (this._listeners[type] = [])).push(fn);
+    }
+
+    removeEventListener(type, fn) {
+        const list = this._listeners[type];
+        if (!list) return;
+        const at = list.indexOf(fn);
+        if (at >= 0) list.splice(at, 1);
+    }
+
+    // Calls every listener for the type; one throwing does not stop the rest.
+    _emit(type, ev) {
+        const list = this._listeners[type];
+        if (!list) return;
+        for (const fn of list.slice()) {
+            try { fn(ev); } catch (err) {}
+        }
+    }
+
+    // Hands the worker a speaking tile's line into its playback worklet.
+    connectAudio(publicId, port) {
+        try { this._worker.postMessage({ type: 'audioPort', publicId, port }, [port]); } catch (err) {}
+    }
+
+    setAudioActive(publicId, active) {
+        try { this._worker.postMessage({ type: 'audioState', publicId, active }); } catch (err) {}
+    }
+
+    closeAudio(publicId) {
+        try { this._worker.postMessage({ type: 'audioClose', publicId }); } catch (err) {}
+    }
+
+    // Ends the worker once, whichever side closed the socket.
+    _retire() {
+        if (this._retiring) return;
+        this._retiring = true;
+        setTimeout(() => { try { this._worker.terminate(); } catch (err) {} }, 2000);
+    }
+}
 
 function applyTranslations(scope, t) {
   scope.querySelectorAll('[data-i18n]').forEach(el => {
@@ -724,13 +1123,29 @@ document.addEventListener('DOMContentLoaded', async () => {
     const t = translator.t;
     document.title = t('pageTitle');
 
-    // Bootstrap: resolve the arriving ?token= into our role/personal token.
-    const arrivalToken = new URLSearchParams(window.location.search).get('token');
+    // Bootstrap: resolve the arrival into our role and personal token. A
+    // ?token= is a seat we already hold. An ?invite= is a shared link that
+    // seats us on first use; the seat it hands back is kept for this tab so
+    // a reload lands in the same seat instead of taking another.
+    const params = new URLSearchParams(window.location.search);
+    const arrivalToken = params.get('token');
+    const inviteToken = params.get('invite');
+    const seatKey = inviteToken ? `collab_seat_${inviteToken}` : null;
+    const query = new URLSearchParams();
+    if (arrivalToken) {
+        query.set('token', arrivalToken);
+    } else if (seatKey && sessionStorage.getItem(seatKey)) {
+        query.set('token', sessionStorage.getItem(seatKey));
+    } else if (inviteToken) {
+        query.set('invite', inviteToken);
+    }
     let COLLAB_DATA;
     try {
-        const resp = await fetch(`api/session/context${arrivalToken ? `?token=${encodeURIComponent(arrivalToken)}` : ''}`);
+        const queryString = query.toString();
+        const resp = await fetch(`api/session/context${queryString ? `?${queryString}` : ''}`);
         if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || `HTTP ${resp.status}`);
         COLLAB_DATA = await resp.json();
+        if (seatKey) sessionStorage.setItem(seatKey, COLLAB_DATA.userToken);
     } catch (err) {
         console.error('Session context unavailable:', err);
         document.getElementById('disconnection-overlay').classList.remove('hidden');
@@ -746,12 +1161,23 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The flag only sets the baseline. Presence can reveal the comms surface
     // but never hide it, so someone arriving on an invite link into a session
     // launched as singleplayer still lands somewhere they can talk.
+    // Solo, the only chrome left is the invite tile in the corner of the
+    // stream. It shows itself for a moment on entering solo mode so people
+    // know it is there, then stays hidden until the corner is hovered.
+    const SOLO_INVITE_PEEK_MS = 4000;
+    let soloPeekTimer = null;
     const applyCommsVisibility = (viewers) => {
         const onlineCount = Array.isArray(viewers)
             ? viewers.filter((u) => u.online).length
             : 0;
         const visible = Boolean(COLLAB_DATA.multiplayer) || onlineCount > 1;
+        const wasSolo = document.body.classList.contains('solo-mode');
         document.body.classList.toggle('solo-mode', !visible);
+        if (!visible && !wasSolo) {
+            document.body.classList.add('solo-peek');
+            clearTimeout(soloPeekTimer);
+            soloPeekTimer = setTimeout(() => document.body.classList.remove('solo-peek'), SOLO_INVITE_PEEK_MS);
+        }
     };
     applyCommsVisibility(null);
 
@@ -783,36 +1209,47 @@ document.addEventListener('DOMContentLoaded', async () => {
     let preferredMicId = localStorage.getItem('collab_preferredMicId') || null;
     let preferredCamId = localStorage.getItem('collab_preferredCamId') || null;
     let localAudioAnalyser = null;
+    let localAudioContext = null;
+    let localSpeakingData = null;
     let animationFrameId = null;
+    // Matches the tile size in room.css and the remote canvas below.
+    const WEBCAM_WIDTH = 240;
+    const WEBCAM_HEIGHT = 180;
     let lastKnownVolume = parseFloat(localStorage.getItem('collab_iframe_volume')) || 1.0;
     let isIframeMuted = false;
+
+    // RomM is normally same-origined under its SUBFOLDER, but it can also run
+    // on its own hostname, so the parent's origin is whatever framed this page.
+    // Pinning to it keeps the relay off a wildcard target without breaking the
+    // cross-origin mount.
+    let parentOrigin = null;
+    if (window.parent !== window && document.referrer) {
+        try {
+            parentOrigin = new URL(document.referrer).origin;
+        } catch (err) {
+            console.warn('[Room] could not read the parent origin from the referrer:', err);
+        }
+    }
 
     const sendVolumeToIframe = () => {
         const iframe = document.getElementById('session-frame');
         if (iframe && iframe.contentWindow) {
             const vol = isIframeMuted ? 0 : lastKnownVolume;
-            iframe.contentWindow.postMessage({ type: 'setVolume', value: vol }, '*');
-            if (isIframeMuted) iframe.contentWindow.postMessage({ type: 'setMute', value: true }, '*');
+            iframe.contentWindow.postMessage({ type: 'setVolume', value: vol }, window.location.origin);
+            if (isIframeMuted) iframe.contentWindow.postMessage({ type: 'setMute', value: true }, window.location.origin);
         }
     };
 
-    // RomM's control bar sits outside this frame and cannot reach the stream
-    // across origins, so its volume and mute arrive here as messages and take
-    // the same path as the sidebar's own controls. Announcing on load is how
-    // the parent learns it has somewhere to send them.
-    const syncAudioControls = () => {
-        if (iframeMuteBtn) {
-            iframeMuteBtn.querySelector('i').className = isIframeMuted
-                ? 'fas fa-volume-mute'
-                : 'fas fa-volume-up';
-        }
-        if (iframeVolumeSlider) {
-            iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        }
-    };
-
+    // RomM's control bar owns game volume: it sits outside this frame and
+    // cannot reach the stream across origins, so its volume and mute arrive
+    // here as messages and are relayed on. Announcing on load is how the
+    // parent learns it has somewhere to send them.
     window.addEventListener('message', (event) => {
         if (event.source !== window.parent) return;
+        if (parentOrigin && event.origin !== parentOrigin) {
+            console.warn('[Room] ignoring a parent message from an unexpected origin:', event.origin);
+            return;
+        }
         const data = event.data;
         if (!data || typeof data !== 'object') return;
         if (data.type === 'setVolume') {
@@ -826,12 +1263,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else {
             return;
         }
-        syncAudioControls();
         sendVolumeToIframe();
     });
 
     if (window.parent !== window) {
-        window.parent.postMessage({ type: 'roomReady' }, '*');
+        window.parent.postMessage({ type: 'roomReady' }, parentOrigin || '*');
     }
 
     const handlePageInteraction = () => {
@@ -853,21 +1289,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         username = COLLAB_DATA.username;
         sessionStorage.setItem('collab_hasJoined_' + COLLAB_DATA.sessionId, 'true');
     }
-    let isSidebarVisible = false;
+    let isChatOpen = false;
     let messageStore = {};
     // A long-lived room otherwise grows messageStore and the chat DOM
     // forever -- both are pruned to this many most-recent entries.
     const MAX_STORED_MESSAGES = 200;
     let replyingTo = null;
+    // How long a peeked message stays up, how many stack before the oldest
+    // goes, and how long an invite button shows its copied/failed text.
+    const PEEK_LIFETIME_MS = 6000;
+    const MAX_PEEK_BUBBLES = 3;
+    const INVITE_FLASH_MS = 1200;
     let notificationAudioCtx;
     let gamepadIcons = {};
     let mkIcon = null;
     const GAMEPAD_COUNT = 4;
     let currentUserState = [];
-    let publicIdToTokenMap = {};
+    let mediaIdToPublicIdMap = {};
     let currentDesignatedSpeaker = null;
-    let localPublicId = null;
-    let localPublicIdBytes = null;
+    let localMediaId = null;
+    let localMediaIdBytes = null;
     const textEncoder = new TextEncoder();
     let clientResolutions = {};
     let isResolutionLocked = false;
@@ -875,48 +1316,51 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const applyAutoResolution = () => {
         if (COLLAB_DATA.userRole !== 'controller') return;
-        const targetToken = currentMkOwner || COLLAB_DATA.userToken;
+        const targetPublicId = currentMkOwner || COLLAB_DATA.userPublicId;
         const iframe = document.getElementById('session-frame');
         if (!iframe || !iframe.contentWindow) return;
 
         if (isResolutionLocked) return;
 
-        if (targetToken === COLLAB_DATA.userToken) {
+        if (targetPublicId === COLLAB_DATA.userPublicId) {
             console.log("[Controller] MK owner is controller. Resetting resolution to window.");
             iframe.contentWindow.postMessage({ type: 'resetResolutionToWindow' }, window.location.origin);
         } else {
-            const res = clientResolutions[targetToken];
+            const res = clientResolutions[targetPublicId];
             if (res) {
-                console.log(`[Controller] Auto-syncing resolution to MK owner (${targetToken}): ${res.width}x${res.height}`);
+                console.log(`[Controller] Auto-syncing resolution to MK owner (${targetPublicId}): ${res.width}x${res.height}`);
                 iframe.contentWindow.postMessage({ type: 'setManualResolution', width: res.width, height: res.height }, window.location.origin);
             }
         }
     };
 
-    const sidebarEl = document.getElementById('sidebar');
-    const toggleHandle = document.getElementById('sidebar-toggle-handle');
     const videoToggleHandle = document.getElementById('video-toggle-handle');
     let isVideoGridVisible = true;
     const settingsModalOverlay = document.getElementById('settings-modal-overlay');
     const settingsModalCloseBtn = document.getElementById('settings-modal-close');
+    const usernameModalOverlay = document.getElementById('username-modal-overlay');
     const audioInputSelect = document.getElementById('audio-input-select');
     const videoInputSelect = document.getElementById('video-input-select');
+    const reloadStreamBtn = document.getElementById('reload-stream-btn');
     const videoGrid = document.getElementById('video-grid');
+    const videoStrip = document.getElementById('video-strip');
     const videoGridContent = document.getElementById('video-grid-content');
     const localVideo = document.getElementById('local-video');
     const localContainer = document.getElementById('local-user-container');
-    const toastContainer = document.getElementById('toast-container');
-    let toggleMicBtn, toggleVideoBtn, iframeMuteBtn, iframeVolumeSlider; 
-    
-    localContainer.dataset.userToken = COLLAB_DATA.userToken;
+    const toggleMicBtn = document.getElementById('toggle-mic-btn');
+    const toggleVideoBtn = document.getElementById('toggle-video-btn');
+    const settingsBtn = document.getElementById('settings-btn');
+    const chatForm = document.getElementById('chat-form');
+    const chatInput = document.getElementById('chat-input');
+    const chatDock = document.getElementById('chat-dock');
+    const chatTab = document.getElementById('chat-tab');
+    const chatScroll = document.getElementById('chat-messages-scroll');
+    const chatPeek = document.getElementById('chat-peek');
+    const inviteTile = document.getElementById('invite-tile');
+    const inviteBtn = document.getElementById('invite-btn');
 
-    const MSG_TYPE = {
-        VIDEO_FRAME: 0x01,
-        AUDIO_FRAME: 0x02,
-        VIDEO_CONFIG: 0x03,
-        PCM_FRAME: 0x04,
-    };
-    
+    localContainer.dataset.userPublicId = COLLAB_DATA.userPublicId;
+
     const initNotificationAudio = () => {
         if (notificationAudioCtx) return;
         try {
@@ -950,14 +1394,37 @@ document.addEventListener('DOMContentLoaded', async () => {
           this.audioBufferQueue = [];
           this.currentAudioData = null;
           this.currentDataOffset = 0;
-          this.MAX_BUFFER_PACKETS = 5; 
+          // Adaptive jitter depth. Output starts once target packets are
+          // queued; each mid-stream underrun deepens the target by one, a
+          // clean stretch decays it back, and standing depth above it is
+          // trimmed a packet at a time -- so steady latency sits at the
+          // smallest depth the delivery path has recently proven to hold.
+          this.TARGET_MIN = 2;
+          this.TARGET_MAX = 4;
+          this.MAX_BUFFER_PACKETS = 5;
+          this.target = this.TARGET_MIN;
+          this.priming = true;
+          this.overCount = 0;
+          this.cleanCount = 0;
+          // Packets left at the moment one is pulled, tracked at its minimum:
+          // the slack that proves a shallower target safe.
+          this.shiftSlackMin = Infinity;
 
-          this.port.onmessage = (event) => {
-            const pcmData = event.data;
+          this.enqueue = (pcmData) => {
             if (this.audioBufferQueue.length >= this.MAX_BUFFER_PACKETS) {
                 this.audioBufferQueue.shift(); // Drop the oldest packet to reduce latency
             }
             this.audioBufferQueue.push(pcmData);
+          };
+          this.port.onmessage = (event) => {
+            const data = event.data;
+            // The socket worker's own line in: packets then reach this
+            // processor whatever the page's thread is doing.
+            if (data && data.port) {
+                data.port.onmessage = (m) => this.enqueue(m.data);
+                return;
+            }
+            this.enqueue(data);
           };
         }
 
@@ -965,27 +1432,61 @@ document.addEventListener('DOMContentLoaded', async () => {
             const outputChannel = outputs[0][0];
             if (!outputChannel) return true;
 
+            if (this.priming) {
+                if (this.audioBufferQueue.length < this.target) {
+                    outputChannel.fill(0);
+                    return true;
+                }
+                this.priming = false;
+            }
+
             const samplesPerBuffer = outputChannel.length;
             let currentSampleIndex = 0;
 
             while (currentSampleIndex < samplesPerBuffer) {
                 if (!this.currentAudioData || this.currentDataOffset >= this.currentAudioData.length) {
                     if (this.audioBufferQueue.length > 0) {
+                        const slack = this.audioBufferQueue.length - 1;
+                        if (slack < this.shiftSlackMin) this.shiftSlackMin = slack;
                         this.currentAudioData = this.audioBufferQueue.shift();
                         this.currentDataOffset = 0;
                     } else {
                         outputChannel.fill(0, currentSampleIndex);
+                        this.priming = true;
+                        this.target = Math.min(this.target + 1, this.TARGET_MAX);
+                        this.overCount = 0;
+                        this.cleanCount = 0;
+                        this.shiftSlackMin = Infinity;
                         return true;
                     }
                 }
 
                 const samplesToCopy = Math.min(samplesPerBuffer - currentSampleIndex, this.currentAudioData.length - this.currentDataOffset);
                 const chunkToCopy = this.currentAudioData.subarray(this.currentDataOffset, this.currentDataOffset + samplesToCopy);
-                
+
                 outputChannel.set(chunkToCopy, currentSampleIndex);
 
                 this.currentDataOffset += samplesToCopy;
                 currentSampleIndex += samplesToCopy;
+            }
+
+            // Reclaims latency: depth held above target is a standing delay,
+            // dropped one packet per window; long clean runs shrink the target.
+            if (this.audioBufferQueue.length > this.target) {
+                if (++this.overCount >= 250) {
+                    this.audioBufferQueue.shift();
+                    this.overCount = 0;
+                }
+            } else {
+                this.overCount = 0;
+            }
+            if (++this.cleanCount >= 2000) {
+                this.cleanCount = 0;
+                // Decay only over proven slack: a whole packet must have
+                // stayed spare at every pull, else a shallower target is a
+                // periodic audible probe rather than a reclaim.
+                if (this.target > this.TARGET_MIN && this.shiftSlackMin >= 2) this.target--;
+                this.shiftSlackMin = Infinity;
             }
 
             return true;
@@ -994,11 +1495,18 @@ document.addEventListener('DOMContentLoaded', async () => {
       registerProcessor('audio-player-processor', AudioPlayerProcessor);
     `;
 
+    // Browsers cap AudioContexts per page, so every device switch has to give
+    // the previous analyser's context back rather than just drop the reference.
+    const closeLocalAudioContext = () => {
+        if (!localAudioContext) return;
+        if (localAudioContext.state !== 'closed') {
+            localAudioContext.close().catch(err => console.warn('[Media] local analyser context close failed:', err));
+        }
+        localAudioContext = null;
+    };
+
     const startMedia = async () => {
-        const isStreamingSupported = 'VideoEncoder' in window && 'AudioEncoder' in window;
-        
-        if (COLLAB_DATA.userPermission === 'readonly' || !isStreamingSupported) {
-            if (COLLAB_DATA.userPermission !== 'readonly') alert(t('alerts.webcodecsUnsupported'));
+        if (COLLAB_DATA.userPermission === 'readonly') {
             return false;
         }
         if (mediaInitialized) {
@@ -1015,10 +1523,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 channelCount: 1,
             };
 
+            // Tiles render at 240x180, so capturing and encoding anything
+            // larger is bandwidth and CPU spent on pixels nobody sees.
             const videoConstraints = {
                 deviceId: preferredCamId ? { exact: preferredCamId } : undefined,
-                width: 320,
-                height: 240,
+                width: WEBCAM_WIDTH,
+                height: WEBCAM_HEIGHT,
                 frameRate: 30
             };
 
@@ -1041,10 +1551,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 };
             }
 
-            const audioCtx = new AudioContext();
-            const source = audioCtx.createMediaStreamSource(localStream);
-            localAudioAnalyser = audioCtx.createAnalyser();
+            closeLocalAudioContext();
+            localAudioContext = new AudioContext();
+            const source = localAudioContext.createMediaStreamSource(localStream);
+            localAudioAnalyser = localAudioContext.createAnalyser();
             localAudioAnalyser.fftSize = 512;
+            localSpeakingData = null;
             source.connect(localAudioAnalyser);
 
             localStream.getAudioTracks().forEach(t => t.enabled = isMicOn);
@@ -1090,6 +1602,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (type === 'mic') {
             isMicOn = !isMicOn;
             if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = isMicOn);
+            if (ws && ws.setMicActive) ws.setMicActive(isMicOn);
             sendControlMessage('audio_state', isMicOn);
         } else if (type === 'video') {
             if (localStream && localStream.getVideoTracks().length > 0) {
@@ -1121,10 +1634,63 @@ document.addEventListener('DOMContentLoaded', async () => {
         videoEncoder = null;
         audioEncoder = null;
         localAudioAnalyser = null;
+        localSpeakingData = null;
+        closeLocalAudioContext();
         mediaInitialized = false;
     };
 
+    // The device pickers restart capture, so they need the same in-flight guard
+    // handleMediaToggle uses: two overlapping starts strand one start's
+    // processors and encoders with nothing left holding a reference to close them.
+    const restartMediaForDeviceChange = async () => {
+        if (!mediaInitialized) return;
+        if (isInitializingMedia) {
+            console.warn('[Media] device switch ignored: media initialization is already in progress.');
+            return;
+        }
+        isInitializingMedia = true;
+        try {
+            await startMedia();
+        } finally {
+            isInitializingMedia = false;
+        }
+    };
+
+    // Every camera frame is drawn onto this canvas before it is encoded:
+    // rotated upright where the engine does not do that itself, and fitted
+    // inside the tile's aspect with black bars rather than stretched, so a
+    // portrait phone camera arrives pillarboxed instead of smeared across
+    // the tile. The encoder then only ever sees WEBCAM_WIDTH x WEBCAM_HEIGHT,
+    // whatever size the camera actually settled on.
+    const composeCanvas = typeof OffscreenCanvas !== 'undefined'
+        ? new OffscreenCanvas(WEBCAM_WIDTH, WEBCAM_HEIGHT)
+        : Object.assign(document.createElement('canvas'), { width: WEBCAM_WIDTH, height: WEBCAM_HEIGHT });
+    const composeCtx = composeCanvas.getContext('2d', { alpha: false, desynchronized: true });
+    let composeFailed = false;
+
+    const composeFrame = (frame) => {
+        const dw = frame.displayWidth || frame.codedWidth;
+        const dh = frame.displayHeight || frame.codedHeight;
+        const turn = canDeriveOrientation() ? deriveRotation() : 0;
+        const sideways = turn % 180 === 90;
+        const uprightW = sideways ? dh : dw;
+        const uprightH = sideways ? dw : dh;
+        const scale = Math.min(WEBCAM_WIDTH / uprightW, WEBCAM_HEIGHT / uprightH);
+        composeCtx.fillStyle = '#000';
+        composeCtx.fillRect(0, 0, WEBCAM_WIDTH, WEBCAM_HEIGHT);
+        composeCtx.save();
+        composeCtx.translate(WEBCAM_WIDTH / 2, WEBCAM_HEIGHT / 2);
+        if (turn) composeCtx.rotate((turn * Math.PI) / 180);
+        // Drawn at the frame's own proportions about the centre; the rotation
+        // above is what turns a sideways box into the upright one measured.
+        composeCtx.drawImage(frame, (-dw * scale) / 2, (-dh * scale) / 2, dw * scale, dh * scale);
+        composeCtx.restore();
+        return new VideoFrame(composeCanvas, { timestamp: frame.timestamp });
+    };
+
     const setupVideoEncoder = async () => {
+        // No VideoEncoder leaves the session audio-only; audio has a PCM floor.
+        if (typeof VideoEncoder === 'undefined') return;
         const [videoTrack] = localStream.getVideoTracks();
         if (!videoTrack) return;
 
@@ -1141,12 +1707,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         videoEncoder = new VideoEncoder({
             output: (chunk, meta) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN || !localPublicIdBytes) return;
+                if (!ws || ws.readyState !== WebSocket.OPEN || !localMediaIdBytes) return;
 
                 if (meta && meta.decoderConfig && meta.decoderConfig.description) {
                     const description = meta.decoderConfig.description;
                     const message = new Uint8Array(8 + 1 + description.byteLength);
-                    message.set(localPublicIdBytes, 0);
+                    message.set(localMediaIdBytes, 0);
                     message[8] = MSG_TYPE.VIDEO_CONFIG;
                     message.set(new Uint8Array(description), 9);
                     ws.send(message.buffer);
@@ -1156,7 +1722,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
                 const isKeyFrame = chunk.type === 'key';
                 const chunkData = new Uint8Array(8 + chunk.byteLength + 2);
-                chunkData.set(localPublicIdBytes, 0);
+                chunkData.set(localMediaIdBytes, 0);
                 chunkData[8] = MSG_TYPE.VIDEO_FRAME;
                 chunkData[9] = isKeyFrame ? 0x01 : 0x00;
                 chunk.copyTo(chunkData.subarray(10));
@@ -1167,8 +1733,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         videoEncoder.configure({
             codec: 'vp8',
-            width: 320,
-            height: 240,
+            width: WEBCAM_WIDTH,
+            height: WEBCAM_HEIGHT,
             bitrate: 1_000_000,
             framerate: 30,
             latencyMode: 'realtime',
@@ -1180,10 +1746,21 @@ document.addEventListener('DOMContentLoaded', async () => {
                 
                 if (videoEncoder.state === 'configured' && isWebcamOn) {
                     const needsKeyFrame = (frameCounter % 120 === 0);
-                    videoEncoder.encode(frame, { keyFrame: needsKeyFrame });
+                    let upright = frame;
+                    if (!composeFailed) {
+                        try {
+                            upright = composeFrame(frame);
+                        } catch (e) {
+                            // Raw frames still stream, just as the camera delivered them.
+                            composeFailed = true;
+                            logMediaPath(`webcam compose: canvas path unavailable (${e.message}); encoding raw frames.`);
+                        }
+                    }
+                    videoEncoder.encode(upright, { keyFrame: needsKeyFrame });
+                    if (upright !== frame) upright.close();
                     frameCounter++;
                 }
-                
+
                 frame.close();
                 readFrame();
             }).catch(e => console.error("[Encoder] Video reader error", e));
@@ -1191,10 +1768,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         readFrame();
     };
 
+    // Encode in the socket worker, else on the page; a ScriptProcessorNode
+    // sending raw PCM is the floor, taken only where WebCodecs audio is
+    // missing altogether (older iOS Safari).
     const setupAudioEncoder = async () => {
-        const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+        const hasAudioCodec = (typeof AudioEncoder !== 'undefined' && typeof AudioData !== 'undefined');
 
-        if (isIOS) {
+        if (!hasAudioCodec) {
+            logMediaPath('audio capture: ScriptProcessorNode PCM (no WebCodecs audio).');
             const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
             const source = ctx.createMediaStreamSource(localStream);
             const processor = ctx.createScriptProcessor(1024, 1, 1);
@@ -1203,7 +1784,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             processor.connect(ctx.destination);
 
             processor.onaudioprocess = (e) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN || !isMicOn || !localPublicIdBytes) return;
+                if (!ws || ws.readyState !== WebSocket.OPEN || !isMicOn || !localMediaIdBytes) return;
 
                 const inputData = e.inputBuffer.getChannelData(0);
                 const pcm16 = new Int16Array(inputData.length);
@@ -1214,7 +1795,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 }
 
                 const chunkData = new Uint8Array(9 + pcm16.byteLength);
-                chunkData.set(localPublicIdBytes, 0);
+                chunkData.set(localMediaIdBytes, 0);
                 chunkData[8] = MSG_TYPE.PCM_FRAME;
                 chunkData.set(new Uint8Array(pcm16.buffer), 9);
                 ws.send(chunkData.buffer);
@@ -1228,6 +1809,47 @@ document.addEventListener('DOMContentLoaded', async () => {
                     ctx.close();
                 }
             };
+        } else if (ws && ws.connectMicStream) {
+            const [audioTrack] = localStream.getAudioTracks();
+            if (!audioTrack) return;
+            ws.setMicActive(isMicOn);
+            if (localMediaIdBytes) ws.setMicId(localMediaIdBytes);
+            let wired = false;
+            if (hasWindowTrackProcessor) {
+                try {
+                    const processor = new MediaStreamTrackProcessor({ track: audioTrack });
+                    ws.connectMicStream(processor.readable);
+                    logMediaPath('audio capture: MediaStreamTrackProcessor read in the socket worker.');
+                    // The native readable ends with the track; the worker side is
+                    // told to drop its encoder.
+                    audioProcessor = { close: () => { try { ws.stopMic(); } catch (err) {} } };
+                    wired = true;
+                } catch (err) {
+                    console.warn('[Media] mic stream transfer failed:', err);
+                }
+            }
+            if (!wired) {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const workletURL = URL.createObjectURL(new Blob([SHIM_AUDIO_WORKLET_SRC], { type: 'application/javascript' }));
+                try {
+                    await ctx.audioWorklet.addModule(workletURL);
+                } finally {
+                    URL.revokeObjectURL(workletURL);
+                }
+                const source = ctx.createMediaStreamSource(new MediaStream([audioTrack]));
+                const node = new AudioWorkletNode(ctx, 'mstp-shim');
+                const line = new MessageChannel();
+                node.port.postMessage({ port: line.port1 }, [line.port1]);
+                ws.connectMicPort(line.port2, ctx.sampleRate);
+                source.connect(node);
+                logMediaPath('audio capture: worklet feeding the socket worker.');
+                audioProcessor = { close: () => {
+                    try { ws.stopMic(); } catch (err) {}
+                    try { source.disconnect(); node.disconnect(); } catch (err) {}
+                    if (ctx.state !== 'closed') ctx.close().catch(() => {});
+                } };
+            }
+            audioEncoder = { state: 'configured', close: () => { try { ws.stopMic(); } catch (err) {} } };
         } else {
             const [audioTrack] = localStream.getAudioTracks();
             if (!audioTrack) return;
@@ -1243,9 +1865,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             audioEncoder = new AudioEncoder({
                 output: (chunk, meta) => {
-                    if (ws && ws.readyState === WebSocket.OPEN && isMicOn && localPublicIdBytes) {
+                    if (ws && ws.readyState === WebSocket.OPEN && isMicOn && localMediaIdBytes) {
                         const chunkData = new Uint8Array(8 + chunk.byteLength + 2);
-                        chunkData.set(localPublicIdBytes, 0);
+                        chunkData.set(localMediaIdBytes, 0);
                         chunkData[8] = MSG_TYPE.AUDIO_FRAME;
                         chunkData[9] = 0x00;
                         chunk.copyTo(chunkData.subarray(10));
@@ -1276,8 +1898,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const handleRemoteStream = (token, data) => {
-        const stream = remoteStreams[token];
+    const handleRemoteStream = (publicId, data) => {
+        const stream = remoteStreams[publicId];
         if (!stream) return;
 
         const mediaType = new Uint8Array(data, 0, 1)[0];
@@ -1289,7 +1911,6 @@ document.addEventListener('DOMContentLoaded', async () => {
                     const config = { codec: 'vp8', description: description };
                     if (stream.videoDecoder.state !== 'closed') {
                         stream.videoDecoder.configure(config);
-                        stream.isConfigured = true;
                     }
                     break;
 
@@ -1317,7 +1938,8 @@ document.addEventListener('DOMContentLoaded', async () => {
                     break;
 
                 case MSG_TYPE.AUDIO_FRAME:
-                    if (stream.audioDecoder.state !== 'configured' || stream.audioMuted) return;
+                    // The decoder lands a turn after the tile, once its worklet loads.
+                    if (!stream.audioDecoder || stream.audioDecoder.state !== 'configured' || stream.audioMuted) return;
                     const audioChunkData = data.slice(2);
                     const audioChunk = new EncodedAudioChunk({
                         type: 'key',
@@ -1346,7 +1968,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                     break;
             }
         } catch (e) {
-            console.error(`[Decoder:${token}] Error handling remote stream data:`, e);
+            console.error(`[Decoder:${publicId}] Error handling remote stream data:`, e);
         }
     };
 
@@ -1409,21 +2031,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         frame.close();
     };
 
-    const addRemoteStream = async (token, username) => {
-        if (remoteStreams[token]) return;
+    const addRemoteStream = async (publicId, username, mediaId) => {
+        if (remoteStreams[publicId]) return;
 
         const container = document.createElement('div');
         container.className = 'video-container reorderable';
-        container.id = `container-${token}`;
-        container.dataset.userToken = token;
-        container.draggable = true;
-        
+        container.id = `container-${publicId}`;
+        container.dataset.userPublicId = publicId;
+
         const canvas = document.createElement('canvas');
-        canvas.width = 240;
-        canvas.height = 180;
+        canvas.width = WEBCAM_WIDTH;
+        canvas.height = WEBCAM_HEIGHT;
         const ctx = canvas.getContext('2d', { desynchronized: true });
         ctx.fillStyle = '#222';
-        ctx.fillRect(0, 0, 240, 180);
+        ctx.fillRect(0, 0, WEBCAM_WIDTH, WEBCAM_HEIGHT);
 
         // Overlays the canvas, and is only shown once a track generator is feeding it.
         const video = document.createElement('video');
@@ -1437,8 +2058,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         let controllerControls = '';
         if (COLLAB_DATA.userRole === 'controller') {
             controllerControls = `
-                <button class="remote-control-btn resize-to-client" data-token="${token}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
-                <button class="remote-control-btn designate-speaker" data-token="${token}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
+                <button class="remote-control-btn resize-to-client" data-public-id="${publicId}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
+                <button class="remote-control-btn designate-speaker" data-public-id="${publicId}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
         const overlay = document.createElement('div');
@@ -1447,51 +2068,84 @@ document.addEventListener('DOMContentLoaded', async () => {
             <span class="username">${escapeHTML(username)}</span>
             <div class="remote-controls">
                 ${controllerControls}
-                <button class="remote-control-btn mute-audio" data-token="${token}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
-                <button class="remote-control-btn mute-video" data-token="${token}" title="${t('tooltips.toggleRemoteVideo')}"><i class="fas fa-video"></i></button>
+                <button class="remote-control-btn mute-audio" data-public-id="${publicId}" title="${t('tooltips.toggleRemoteAudio')}"><i class="fas fa-microphone"></i></button>
+                <button class="remote-control-btn mute-video" data-public-id="${publicId}" title="${t('tooltips.toggleRemoteVideo')}"><i class="fas fa-video"></i></button>
             </div>
         `;
         
         container.appendChild(canvas);
         container.appendChild(video);
         container.appendChild(overlay);
-        videoGridContent.appendChild(container);
+        // The invite tile stays the last thing in the row.
+        videoGridContent.insertBefore(container, inviteTile);
 
         const stream = {
-            username, container, canvas, ctx, video,
+            username, container, canvas, ctx, video, mediaId,
             videoMuted: false, audioMuted: false,
-            isConfigured: true,
             hasReceivedKeyFrame: false,
             sink: null, sinkShown: false, sinkRevealed: false, sinkGeneration: 0
         };
 
         const videoDecoder = new VideoDecoder({
             output: (frame) => {
-                if (remoteStreams[token] !== stream) {
+                if (remoteStreams[publicId] !== stream) {
                     frame.close();
                     return;
                 }
                 presentRemoteFrame(stream, frame);
             },
-            error: (e) => console.error(`[Decoder:${token}] VideoDecoder error:`, e)
+            error: (e) => console.error(`[Decoder:${publicId}] VideoDecoder error:`, e)
         });
 
         videoDecoder.configure({ codec: 'vp8' });
 
-        const audioContext = new AudioContext({ sampleRate: 48000 });
-        if (isAudioUnlocked && audioContext.state === 'suspended') {
-            audioContext.resume();
+        // Claims the slot before the worklet's module load: a second state_update
+        // for this peer arriving mid-load would otherwise pass the guard above and
+        // build a rival tile, decoder and AudioContext, orphaning this one.
+        stream.videoDecoder = videoDecoder;
+        remoteStreams[publicId] = stream;
+
+        let audioContext;
+        let workletNode;
+        let analyser;
+        try {
+            audioContext = new AudioContext({ sampleRate: 48000 });
+            if (isAudioUnlocked && audioContext.state === 'suspended') {
+                audioContext.resume();
+            }
+
+            const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
+            const workletURL = URL.createObjectURL(workletBlob);
+            try {
+                await audioContext.audioWorklet.addModule(workletURL);
+            } finally {
+                URL.revokeObjectURL(workletURL);
+            }
+            workletNode = new AudioWorkletNode(audioContext, 'audio-player-processor');
+
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 512;
+            workletNode.connect(analyser);
+            analyser.connect(audioContext.destination);
+        } catch (err) {
+            console.error(`[Media] audio playback setup failed for ${publicId}:`, err);
+            if (audioContext && audioContext.state !== 'closed') {
+                audioContext.close().catch(e => console.warn(`[Media] audio context close failed for ${publicId}:`, e));
+            }
+            // A tile with no audio path is dead weight, so it goes rather than
+            // sitting in the strip for the rest of the session.
+            if (remoteStreams[publicId] === stream) removeRemoteStream(publicId);
+            return;
         }
-        
-        const workletBlob = new Blob([audioWorkletCode], { type: 'application/javascript' });
-        const workletURL = URL.createObjectURL(workletBlob);
-        await audioContext.audioWorklet.addModule(workletURL);
-        const workletNode = new AudioWorkletNode(audioContext, 'audio-player-processor');
-        
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 512;
-        workletNode.connect(analyser);
-        analyser.connect(audioContext.destination);
+
+        // Removed while the module was loading.
+        if (remoteStreams[publicId] !== stream) {
+            workletNode.disconnect();
+            if (audioContext.state !== 'closed') {
+                audioContext.close().catch(e => console.warn(`[Media] audio context close failed for ${publicId}:`, e));
+            }
+            return;
+        }
 
         const audioDecoder = new AudioDecoder({
             output: (frame) => {
@@ -1500,28 +2154,35 @@ document.addEventListener('DOMContentLoaded', async () => {
                 workletNode.port.postMessage(buffer, [buffer.buffer]);
                 frame.close();
             },
-            error: (e) => console.error(`[Decoder:${token}] AudioDecoder error:`, e),
+            error: (e) => console.error(`[Decoder:${publicId}] AudioDecoder error:`, e),
         });
         audioDecoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
 
-        Object.assign(stream, { videoDecoder, audioDecoder, audioContext, workletNode, analyser });
-        remoteStreams[token] = stream;
+        Object.assign(stream, { audioDecoder, audioContext, workletNode, analyser });
+
+        // The socket worker decodes this speaker and feeds the worklet down its
+        // own line; the in-page decoder above is the path for a page-owned socket.
+        if (mediaId && ws && ws.connectAudio) {
+            const line = new MessageChannel();
+            workletNode.port.postMessage({ port: line.port1 }, [line.port1]);
+            ws.connectAudio(mediaId, line.port2);
+        }
 
         // The handshake can involve a worker round-trip, so the canvas renders until
         // it lands -- and again from wherever the sink gives out.
         createVideoSink(() => {
-            if (remoteStreams[token] === stream) detachRemoteSink(stream);
+            if (remoteStreams[publicId] === stream) detachRemoteSink(stream);
         }).then((sink) => {
             if (!sink) return;
             // Removed, or the sink already gave out, while the handshake was in flight.
-            if (remoteStreams[token] !== stream || !sink.alive) {
+            if (remoteStreams[publicId] !== stream || !sink.alive) {
                 sink.close();
                 return;
             }
             try {
                 video.srcObject = new MediaStream([sink.track]);
             } catch (err) {
-                console.warn(`[Media] video sink attach failed for ${token}:`, err);
+                console.warn(`[Media] video sink attach failed for ${publicId}:`, err);
                 sink.close();
                 return;
             }
@@ -1529,8 +2190,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     };
 
-    const removeRemoteStream = (token) => {
-        const stream = remoteStreams[token];
+    const removeRemoteStream = (publicId) => {
+        const stream = remoteStreams[publicId];
+        if (stream && stream.mediaId && ws && ws.closeAudio) ws.closeAudio(stream.mediaId);
         if (stream) {
             if (stream.sink) {
                 stream.sink.close();
@@ -1558,7 +2220,7 @@ document.addEventListener('DOMContentLoaded', async () => {
                 stream.container.remove();
             }
 
-            delete remoteStreams[token];
+            delete remoteStreams[publicId];
         }
     };
 
@@ -1598,11 +2260,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
     
     const updateSpeakingIndicators = () => {
+        if (sessionEnded) {
+            animationFrameId = null;
+            return;
+        }
         const speakingThreshold = 5;
-        let isAnyoneSpeaking = false; 
-        
+        let isAnyoneSpeaking = false;
+
+        // The buffers are kept per analyser: this runs every frame for every
+        // tile, so a fresh Uint8Array each time is pure allocation churn.
         if (localAudioAnalyser && isMicOn) {
-            const dataArray = new Uint8Array(localAudioAnalyser.frequencyBinCount);
+            if (!localSpeakingData || localSpeakingData.length !== localAudioAnalyser.frequencyBinCount) {
+                localSpeakingData = new Uint8Array(localAudioAnalyser.frequencyBinCount);
+            }
+            const dataArray = localSpeakingData;
             localAudioAnalyser.getByteFrequencyData(dataArray);
             const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
             localContainer.classList.toggle('speaking', avg > speakingThreshold);
@@ -1613,7 +2284,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
         Object.values(remoteStreams).forEach(stream => {
             if (stream.analyser && !stream.audioMuted && stream.container) {
-                const dataArray = new Uint8Array(stream.analyser.frequencyBinCount);
+                if (!stream.speakingData || stream.speakingData.length !== stream.analyser.frequencyBinCount) {
+                    stream.speakingData = new Uint8Array(stream.analyser.frequencyBinCount);
+                }
+                const dataArray = stream.speakingData;
                 stream.analyser.getByteFrequencyData(dataArray);
                 const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
                 stream.container.classList.toggle('speaking', avg > speakingThreshold);
@@ -1628,29 +2302,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         animationFrameId = requestAnimationFrame(updateSpeakingIndicators);
-    };
-
-    const initTheme = () => {
-        const savedTheme = localStorage.getItem('theme') || 'dark';
-        document.documentElement.setAttribute('data-theme', savedTheme);
-        const themeToggle = sidebarEl.querySelector('.theme-toggle');
-        if (themeToggle) {
-            themeToggle.classList.toggle('light', savedTheme === 'light');
-        }
-    };
-
-    const toggleTheme = () => {
-        const currentTheme = document.documentElement.getAttribute('data-theme');
-        const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-theme', newTheme);
-        localStorage.setItem('theme', newTheme);
-        initTheme();
-    };
-    
-    const toggleSidebar = () => {
-        isSidebarVisible = !isSidebarVisible;
-        sidebarEl.classList.toggle('visible', isSidebarVisible);
-        document.querySelector('.content').classList.toggle('sidebar-visible', isSidebarVisible);
     };
 
     const toggleVideoGrid = () => {
@@ -1672,7 +2323,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        const self = currentUserState.find(u => u.token === COLLAB_DATA.userToken);
+        const self = currentUserState.find(u => u.publicId === COLLAB_DATA.userPublicId);
         const hasInput = self && (self.slot || self.has_mk);
 
         if (hasInput) {
@@ -1683,35 +2334,15 @@ document.addEventListener('DOMContentLoaded', async () => {
     };
 
     const initGestures = () => {
-        let sbTouchStartX = 0;
-        let sbTouchStartY = 0;
-        
-        sidebarEl.addEventListener('touchstart', (e) => {
-            sbTouchStartX = e.changedTouches[0].screenX;
-            sbTouchStartY = e.changedTouches[0].screenY;
-        }, { passive: true });
-
-        sidebarEl.addEventListener('touchend', (e) => {
-            const sbTouchEndX = e.changedTouches[0].screenX;
-            const sbTouchEndY = e.changedTouches[0].screenY;
-            
-            const deltaX = sbTouchEndX - sbTouchStartX;
-            const deltaY = Math.abs(sbTouchEndY - sbTouchStartY);
-
-            if (deltaX > 50 && deltaY < 50) { 
-                if (isSidebarVisible) toggleSidebar();
-            }
-        }, { passive: true });
-
         let vbTouchStartX = 0;
         let vbTouchStartY = 0;
 
-        videoGrid.addEventListener('touchstart', (e) => {
+        videoStrip.addEventListener('touchstart', (e) => {
             vbTouchStartX = e.changedTouches[0].screenX;
             vbTouchStartY = e.changedTouches[0].screenY;
         }, { passive: true });
 
-        videoGrid.addEventListener('touchend', (e) => {
+        videoStrip.addEventListener('touchend', (e) => {
             const vbTouchEndX = e.changedTouches[0].screenX;
             const vbTouchEndY = e.changedTouches[0].screenY;
 
@@ -1730,213 +2361,261 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const currentTime = new Date().getTime();
                 const tapLength = currentTime - lastTapTime;
                 if (tapLength < 300 && tapLength > 0) {
-                    e.preventDefault(); 
-                    
-                    const anyVisible = isSidebarVisible || isVideoGridVisible;
-                    if (anyVisible) {
-                        if (isSidebarVisible) toggleSidebar();
-                        if (isVideoGridVisible) toggleVideoGrid();
-                    } else {
-                        if (!isSidebarVisible) toggleSidebar();
-                        if (!isVideoGridVisible) toggleVideoGrid();
-                    }
+                    e.preventDefault();
+                    toggleVideoGrid();
                 }
                 lastTapTime = currentTime;
             });
         }
     };
 
+    // A reconnect leaves the mic encoding into a worker whose socket is already
+    // closed, and a fresh worker knows none of the tiles, so both ends have to
+    // be handed over again on every open after the first.
+    const adoptSocketWorker = async () => {
+        if (!ws) return;
+        if (ws.connectAudio) {
+            for (const stream of Object.values(remoteStreams)) {
+                if (!stream.mediaId || !stream.workletNode) continue;
+                const line = new MessageChannel();
+                stream.workletNode.port.postMessage({ port: line.port1 }, [line.port1]);
+                ws.connectAudio(stream.mediaId, line.port2);
+                ws.setAudioActive(stream.mediaId, !stream.audioMuted);
+            }
+        }
+        if (!mediaInitialized) return;
+        if (audioProcessor) {
+            try { audioProcessor.close(); } catch (err) { console.warn('[Media] mic teardown failed:', err); }
+            audioProcessor = null;
+        }
+        if (audioEncoder && audioEncoder.state !== 'closed') {
+            try { audioEncoder.close(); } catch (err) { console.warn('[Media] mic encoder teardown failed:', err); }
+        }
+        audioEncoder = null;
+        await setupAudioEncoder();
+    };
+
     const connectWebSocket = () => {
         const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         // Base-relative so the SUBFOLDER prefix carries through.
         const basePath = new URL('.', window.location.href).pathname;
-        const url = `${proto}//${window.location.host}${basePath}ws/room?token=${COLLAB_DATA.userToken}`;
-        ws = new WebSocket(url);
-        ws.binaryType = 'arraybuffer';
-
-        ws.onopen = () => {
-            console.log('[WS] Collaboration WebSocket connected.');
-            reconnectAttempts = 0;
-            if (COLLAB_DATA.userRole === 'controller') {
-                ws.send(JSON.stringify({ action: 'request_resolutions' }));
-            }
-            const iframe = document.getElementById('session-frame')
-            if (iframe) {
-                ws.send(JSON.stringify({ action: 'client_resolution', width: iframe.clientWidth, height: iframe.clientHeight }));
-                if (COLLAB_DATA.userRole === 'controller') {
-                    clientResolutions[COLLAB_DATA.userToken] = { width: iframe.clientWidth, height: iframe.clientHeight };
-                }
-            }
+        const url = `${proto}//${window.location.host}${basePath}ws/room?token=${encodeURIComponent(COLLAB_DATA.userToken)}`;
+        // No worker to be had (a policy forbidding blob workers, say -- reported
+        // as a throw or as the worker dying unspoken, depending on the engine).
+        // The socket then runs here and audio takes the in-page decode path.
+        const usePageSocket = () => {
+            console.warn('[WS] socket worker unavailable, reading on the page.');
+            ws = new WebSocket(url);
+            ws.binaryType = 'arraybuffer';
+            attachSocketHandlers();
         };
+        try {
+            ws = new RoomSocket(url);
+            ws.onworkerdead = usePageSocket;
+            attachSocketHandlers();
+        } catch (err) {
+            console.warn('[WS] socket worker could not start:', err);
+            usePageSocket();
+        }
+        function attachSocketHandlers() {
 
-        ws.onmessage = (event) => {
-            if (event.data instanceof ArrayBuffer) {
-                const publicId = new TextDecoder().decode(event.data.slice(0, 8));
-                const token = publicIdToTokenMap[publicId];
-                if (!token) return;
-                const payload = event.data.slice(8);
-                handleRemoteStream(token, payload);
-                return;
-            }
-
-            const data = JSON.parse(event.data);
-            switch (data.type) {
-                case 'session_ended':
-                    handleControllerDisconnect();
-                    break;
-                case 'request_resolutions': {
-                    const reqIframe = document.getElementById('session-frame');
-                    if (reqIframe && ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ action: 'client_resolution', width: reqIframe.clientWidth, height: reqIframe.clientHeight }));
-                    }
-                    break;
+            ws.onopen = () => {
+                console.log('[WS] Collaboration WebSocket connected.');
+                reconnectAttempts = 0;
+                adoptSocketWorker();
+                if (COLLAB_DATA.userRole === 'controller') {
+                    ws.send(JSON.stringify({ action: 'request_resolutions' }));
                 }
-                case 'resolution_update':
-                    clientResolutions[data.token] = { width: data.width, height: data.height };
-                    if (COLLAB_DATA.userRole === 'controller' && !isResolutionLocked && currentMkOwner === data.token) {
-                        applyAutoResolution();
+                const iframe = document.getElementById('session-frame')
+                if (iframe) {
+                    ws.send(JSON.stringify({ action: 'client_resolution', width: iframe.clientWidth, height: iframe.clientHeight }));
+                    if (COLLAB_DATA.userRole === 'controller') {
+                        clientResolutions[COLLAB_DATA.userPublicId] = { width: iframe.clientWidth, height: iframe.clientHeight };
                     }
-                    break;
-                case 'state_update':
-                    const hasJoined = sessionStorage.getItem('collab_hasJoined_' + COLLAB_DATA.sessionId);
-                    if (COLLAB_DATA.userRole === 'viewer' && !hasJoined) {
-                        return;
-                    }
-                    currentUserState = data.viewers;
-                    applyCommsVisibility(data.viewers);
-                    const controllerUser = data.viewers.find(u => u.permission === 'controller');
-                    const waitingOverlay = document.getElementById('waiting-overlay');
-                    const iframe = document.getElementById('session-frame');
-                    if (controllerUser && controllerUser.online) {
-                        if (iframe && iframe.getAttribute('src') === 'about:blank' && iframe.dataset.src) {
-                            iframe.src = iframe.dataset.src;
+                }
+            };
+
+            const dispatchSocketMessage = (event) => {
+                if (event.data instanceof ArrayBuffer) {
+                    const mediaId = new TextDecoder().decode(event.data.slice(0, 8));
+                    const publicId = mediaIdToPublicIdMap[mediaId];
+                    if (!publicId) return;
+                    const payload = event.data.slice(8);
+                    handleRemoteStream(publicId, payload);
+                    return;
+                }
+
+                let data;
+                try {
+                    data = JSON.parse(event.data);
+                } catch (err) {
+                    console.error('[WS] dropping an unparseable frame:', err);
+                    return;
+                }
+                if (!data || typeof data !== 'object') {
+                    console.warn('[WS] dropping a frame that is not a JSON object.');
+                    return;
+                }
+                switch (data.type) {
+                    case 'session_ended':
+                        handleControllerDisconnect();
+                        break;
+                    case 'request_resolutions': {
+                        const reqIframe = document.getElementById('session-frame');
+                        if (reqIframe && ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ action: 'client_resolution', width: reqIframe.clientWidth, height: reqIframe.clientHeight }));
                         }
-                        if (waitingOverlay && COLLAB_DATA.userRole === 'viewer') {
-                            waitingOverlay.classList.add('hidden');
-                        }
-                    } else {
-                        if (waitingOverlay && COLLAB_DATA.userRole === 'viewer') {
-                            waitingOverlay.classList.remove('hidden');
-                        }
+                        break;
                     }
-
-                    currentDesignatedSpeaker = data.designated_speaker;
-
-                    const self = data.viewers.find(u => u.token === COLLAB_DATA.userToken);
-                    if (self && self.publicId && self.publicId !== localPublicId) {
-                        localPublicId = self.publicId;
-                        localPublicIdBytes = textEncoder.encode(localPublicId);
-                    }
-
-                    publicIdToTokenMap = {};
-                    data.viewers.forEach(user => {
-                        if (user.publicId) publicIdToTokenMap[user.publicId] = user.token;
-                    });
-
-                    document.querySelectorAll('.video-container').forEach(el => el.classList.remove('designated-speaker'));
-                    document.querySelectorAll('.designate-speaker').forEach(el => el.classList.remove('active'));
-                    if (currentDesignatedSpeaker) {
-                        const speakerContainer = document.querySelector(`[data-user-token="${currentDesignatedSpeaker}"]`);
-                        if (speakerContainer) {
-                            speakerContainer.classList.add('designated-speaker');
-                            const speakerButton = speakerContainer.querySelector('.designate-speaker');
-                            if (speakerButton) speakerButton.classList.add('active');
-                        }
-                    }
-
-                    updateGestureOverlay();
-
-                    const mkOwnerUser = data.viewers.find(u => u.has_mk);
-                    const newMkOwner = mkOwnerUser ? mkOwnerUser.token : COLLAB_DATA.userToken;
-                    
-                    const gamingModeBtn = document.getElementById('gaming-mode-btn');
-                    if (gamingModeBtn) {
-                        const isController = COLLAB_DATA.userRole === 'controller';
-                        const iHaveMk = (mkOwnerUser && mkOwnerUser.token === COLLAB_DATA.userToken) || (!mkOwnerUser && isController);
-                        if (iHaveMk) {
-                            gamingModeBtn.classList.remove('hidden');
-                        } else {
-                            gamingModeBtn.classList.add('hidden');
-                        }
-                    }
-
-                    if (COLLAB_DATA.userRole === 'controller' && currentMkOwner !== newMkOwner) {
-                        currentMkOwner = newMkOwner;
-                        if (!isResolutionLocked) {
+                    case 'resolution_update':
+                        clientResolutions[data.public_id] = { width: data.width, height: data.height };
+                        if (COLLAB_DATA.userRole === 'controller' && !isResolutionLocked && currentMkOwner === data.public_id) {
                             applyAutoResolution();
                         }
-                    }
-
-                    const participantsToShow = data.viewers.filter(u =>
-                        u.permission !== 'readonly' &&
-                        u.online &&
-                        u.token !== COLLAB_DATA.userToken
-                    );
-                    const serverTokens = new Set(participantsToShow.map(u => u.token));
-                    const clientTokens = new Set(Object.keys(remoteStreams));
-
-                    for (const token of clientTokens) {
-                        if (!serverTokens.has(token)) {
-                            removeRemoteStream(token);
+                        break;
+                    case 'state_update':
+                        if (!Array.isArray(data.viewers)) {
+                            console.warn('[WS] dropping a state_update with no viewers list.');
+                            break;
                         }
-                    }
-
-                    for (const user of participantsToShow) {
-                        const stream = remoteStreams[user.token];
-                        if (!stream) {
-                            addRemoteStream(user.token, user.username);
-                        } else if (stream.username !== user.username) {
-                            stream.username = user.username;
-                            const usernameEl = stream.container.querySelector('.username');
-                            if (usernameEl) {
-                                usernameEl.textContent = user.username;
+                        const hasJoined = sessionStorage.getItem('collab_hasJoined_' + COLLAB_DATA.sessionId);
+                        if (COLLAB_DATA.userRole === 'viewer' && !hasJoined) {
+                            return;
+                        }
+                        currentUserState = data.viewers;
+                        applyCommsVisibility(data.viewers);
+                        const controllerUser = data.viewers.find(u => u.permission === 'controller');
+                        const waitingOverlay = document.getElementById('waiting-overlay');
+                        const iframe = document.getElementById('session-frame');
+                        if (controllerUser && controllerUser.online) {
+                            if (iframe && iframe.getAttribute('src') === 'about:blank' && iframe.dataset.src) {
+                                iframe.src = iframe.dataset.src;
+                            }
+                            if (waitingOverlay && COLLAB_DATA.userRole === 'viewer') {
+                                waitingOverlay.classList.add('hidden');
+                            }
+                        } else {
+                            if (waitingOverlay && COLLAB_DATA.userRole === 'viewer') {
+                                waitingOverlay.classList.remove('hidden');
                             }
                         }
-                    }
-                    
-                    updateGamepadIcons(data.viewers);
-                    break;
-                case 'chat_message':
-                    messageStore[data.messageId] = data;
-                    while (Object.keys(messageStore).length > MAX_STORED_MESSAGES) {
-                        delete messageStore[Object.keys(messageStore)[0]];
-                    }
-                    appendChatMessage(data, 'chat');
-                    break;
-                case 'user_joined':
-                case 'user_left':
-                case 'username_changed':
-                case 'gamepad_change':
-                case 'mk_change':
-                    appendChatMessage(data, 'system');
-                    break;
-                case 'control':
-                    handleControlMessage(data.payload);
-                    break;
-                case 'controller_disconnected':
-                    break;
-                case 'error':
-                     alert(data.message);
-                     break;
-            }
-        };
 
-        ws.onclose = (event) => {
-            console.log('[WS] WebSocket closed.', event.code);
-            // 1008 is the server explicitly rejecting the token/session (room.py)
-            // so retrying would just be rejected again; anything else (most
-            // commonly 1006, an abnormal closure with no close frame - a broker
-            // restart from uvicorn --reload, a session-teardown race, a network
-            // blip) is worth a few reconnect attempts before giving up.
-            if (sessionEnded || event.code === 1008 || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                handleControllerDisconnect();
-                return;
-            }
-            reconnectAttempts += 1;
-            const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 10000);
-            reconnectTimer = setTimeout(connectWebSocket, delay);
-        };
-        ws.onerror = (err) => console.error('[WS] WebSocket error:', err);
+                        currentDesignatedSpeaker = data.designated_speaker;
+
+                        const self = data.viewers.find(u => u.publicId === COLLAB_DATA.userPublicId);
+                        if (self && self.mediaId && self.mediaId !== localMediaId) {
+                            localMediaId = self.mediaId;
+                            localMediaIdBytes = textEncoder.encode(localMediaId);
+                            if (ws && ws.setMicId) ws.setMicId(localMediaIdBytes);
+                        }
+
+                        mediaIdToPublicIdMap = {};
+                        data.viewers.forEach(user => {
+                            if (user.mediaId) mediaIdToPublicIdMap[user.mediaId] = user.publicId;
+                        });
+
+                        document.querySelectorAll('.video-container').forEach(el => el.classList.remove('designated-speaker'));
+                        document.querySelectorAll('.designate-speaker').forEach(el => el.classList.remove('active'));
+                        if (currentDesignatedSpeaker) {
+                            const speakerContainer = document.querySelector(`[data-user-public-id="${currentDesignatedSpeaker}"]`);
+                            if (speakerContainer) {
+                                speakerContainer.classList.add('designated-speaker');
+                                const speakerButton = speakerContainer.querySelector('.designate-speaker');
+                                if (speakerButton) speakerButton.classList.add('active');
+                            }
+                        }
+
+                        updateGestureOverlay();
+
+                        const mkOwnerUser = data.viewers.find(u => u.has_mk);
+                        const newMkOwner = mkOwnerUser ? mkOwnerUser.publicId : COLLAB_DATA.userPublicId;
+
+                        if (COLLAB_DATA.userRole === 'controller' && currentMkOwner !== newMkOwner) {
+                            currentMkOwner = newMkOwner;
+                            if (!isResolutionLocked) {
+                                applyAutoResolution();
+                            }
+                        }
+
+                        const participantsToShow = data.viewers.filter(u =>
+                            u.permission !== 'readonly' &&
+                            u.online &&
+                            u.publicId !== COLLAB_DATA.userPublicId
+                        );
+                        const serverPublicIds = new Set(participantsToShow.map(u => u.publicId));
+                        const clientPublicIds = new Set(Object.keys(remoteStreams));
+
+                        for (const publicId of clientPublicIds) {
+                            if (!serverPublicIds.has(publicId)) {
+                                removeRemoteStream(publicId);
+                            }
+                        }
+
+                        for (const user of participantsToShow) {
+                            const stream = remoteStreams[user.publicId];
+                            if (!stream) {
+                                addRemoteStream(user.publicId, user.username, user.mediaId);
+                            } else if (stream.username !== user.username) {
+                                stream.username = user.username;
+                                const usernameEl = stream.container.querySelector('.username');
+                                if (usernameEl) {
+                                    usernameEl.textContent = user.username;
+                                }
+                            }
+                        }
+
+                        updateGamepadIcons(data.viewers);
+                        break;
+                    case 'chat_message':
+                        messageStore[data.messageId] = data;
+                        while (Object.keys(messageStore).length > MAX_STORED_MESSAGES) {
+                            delete messageStore[Object.keys(messageStore)[0]];
+                        }
+                        appendChatMessage(data, 'chat');
+                        break;
+                    case 'user_joined':
+                    case 'user_left':
+                    case 'username_changed':
+                    case 'gamepad_change':
+                    case 'mk_change':
+                        appendChatMessage(data, 'system');
+                        break;
+                    case 'control':
+                        handleControlMessage(data.payload);
+                        break;
+                    case 'error':
+                         alert(data.message);
+                         break;
+                }
+            };
+
+            // One bad frame must not take the socket's reader down with it, or
+            // every later message is lost along with the one that threw.
+            ws.onmessage = (event) => {
+                try {
+                    dispatchSocketMessage(event);
+                } catch (err) {
+                    console.error('[WS] dropping a frame the handler could not process:', err);
+                }
+            };
+
+            ws.onclose = (event) => {
+                console.log('[WS] WebSocket closed.', event.code);
+                // 1008 is the server explicitly rejecting the token/session (room.py)
+                // so retrying would just be rejected again; anything else (most
+                // commonly 1006, an abnormal closure with no close frame - a broker
+                // restart from uvicorn --reload, a session-teardown race, a network
+                // blip) is worth a few reconnect attempts before giving up.
+                if (sessionEnded || event.code === 1008 || reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+                    handleControllerDisconnect();
+                    return;
+                }
+                reconnectAttempts += 1;
+                const delay = Math.min(1000 * 2 ** (reconnectAttempts - 1), 10000);
+                reconnectTimer = setTimeout(connectWebSocket, delay);
+            };
+            ws.onerror = (err) => console.error('[WS] WebSocket error:', err);
+        }
     };
 
     const handleControllerDisconnect = () => {
@@ -1945,34 +2624,22 @@ document.addEventListener('DOMContentLoaded', async () => {
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+        if (animationFrameId !== null) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
         document.getElementById('disconnection-overlay').classList.remove('hidden');
         const iframe = document.getElementById('session-frame');
         if (iframe) iframe.remove();
         if (ws && ws.readyState !== WebSocket.CLOSED) ws.close();
+        // The camera light stays on until the tracks themselves are stopped, so
+        // a session declared over has to release the devices here.
+        stopMedia();
     };
 
-    // Show the exit report on top of the session-ended overlay.
-    const showExitReport = (report) => {
-        handleControllerDisconnect();
-        const detail = document.getElementById('disconnection-detail');
-        const pre = document.getElementById('exit-report');
-        if (detail) {
-            const dump = report.save_dump || {};
-            detail.textContent = t('exit.summary', {
-                state: report.state_saved ? `slot ${report.state_slot}` : 'no',
-                files: (dump.files || []).length,
-                bytes: dump.total_bytes || 0,
-            });
-        }
-        if (pre) {
-            pre.textContent = JSON.stringify(report, null, 2);
-            pre.classList.remove('hidden');
-        }
-    };
-    
     const handleControlMessage = (payload) => {
-        const { action, sender_token, state } = payload;
-        
+        const { action, sender_public_id, state } = payload;
+
         if (action === 'force_cursor_render') {
             if (COLLAB_DATA.userRole === 'controller') {
                 const iframe = document.getElementById('session-frame');
@@ -1983,7 +2650,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             return;
         }
 
-        const stream = remoteStreams[sender_token];
+        const stream = remoteStreams[sender_public_id];
         if (!stream) return;
 
         if (action === 'video_state') {
@@ -1997,36 +2664,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    const renderSidebar = () => {
+    const renderRoom = () => {
         const hasJoined = sessionStorage.getItem('collab_hasJoined_' + COLLAB_DATA.sessionId);
         if (COLLAB_DATA.userRole === 'viewer' && !hasJoined) {
-            renderUsernamePrompt();
+            showUsernamePrompt();
         } else {
-            renderMainSidebar();
+            renderMainRoom();
         }
-        initTheme();
     };
-    
-    const renderUsernamePrompt = () => {
-        sidebarEl.innerHTML = `
-            <div class="sidebar-content">
-                <div class="username-prompt">
-                    <h3>${t('usernamePrompt.title')}</h3>
-                    <p>${t('usernamePrompt.description')}</p>
-                    <form id="username-form">
-                        <input type="text" id="username-input" placeholder="${t('usernamePrompt.placeholder')}" maxlength="25" required>
-                        <button type="submit">${t('usernamePrompt.joinButton')}</button>
-                    </form>
-                </div>
-            </div>`;
+
+    const showUsernamePrompt = () => {
         const usernameInput = document.getElementById('username-input');
         if (username) {
             usernameInput.value = username;
         }
-        document.getElementById('username-form').addEventListener('submit', handleUsernameSubmit);
+        usernameModalOverlay.classList.remove('hidden');
+        usernameInput.focus();
     };
 
-    const renderMainSidebar = () => {
+    // The dock and the self view are static markup wired up once at
+    // bootstrap; this only fills in what depends on who is looking: the
+    // local tile's label and controller-only buttons, the invite button,
+    // and the gamepad tray.
+    const renderMainRoom = () => {
+        usernameModalOverlay.classList.add('hidden');
         const isController = COLLAB_DATA.userRole === 'controller';
         const isParticipant = COLLAB_DATA.userRole === 'viewer' && COLLAB_DATA.userPermission === 'participant';
 
@@ -2034,144 +2695,118 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (isController) {
             localControls = `
                 <button class="remote-control-btn toggle-resolution-lock" title="${t('tooltips.lockResolution')}"><i class="fas fa-lock-open"></i></button>
-                <button class="remote-control-btn resize-to-client" data-token="${COLLAB_DATA.userToken}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
-                <button class="remote-control-btn designate-speaker" data-token="${COLLAB_DATA.userToken}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
+                <button class="remote-control-btn resize-to-client" data-public-id="${COLLAB_DATA.userPublicId}" title="${t('tooltips.resizeClient')}"><i class="fas fa-desktop"></i></button>
+                <button class="remote-control-btn designate-speaker" data-public-id="${COLLAB_DATA.userPublicId}" title="${t('tooltips.designateSpeaker')}"><i class="fas fa-star"></i></button>
             `;
         }
-        document.querySelector('#local-user-container .video-overlay').innerHTML = `
-            <span class="username">${isController ? 'Controller' : (username || 'You')}</span>
+        localContainer.querySelector('.video-overlay').innerHTML = `
+            <span class="username">${escapeHTML(isController ? (COLLAB_DATA.controllerName || t('localUsername')) : (username || t('localUsername')))}</span>
             <div class="remote-controls">${localControls}</div>`;
 
-        sidebarEl.innerHTML = `
-            <div class="sidebar-header">
-                <h2 id="sidebar-app-title">${escapeHTML(COLLAB_DATA.gameName || t('sidebar.title'))}</h2>
-                <div class="header-controls">
-                    <button id="gaming-mode-btn" class="settings-button hidden" title="${t('tooltips.gamingMode')}">
-                        <svg viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" fill="none" width="18" height="18">
-                            <circle cx="12" cy="12" r="1.5" fill="currentColor" />
-                            <path d="M12 5V9M12 15V19M5 12H9M15 12H19" stroke-linecap="round" />
-                        </svg>
-                    </button>
-                    <div class="theme-toggle">
-                        <div class="icon sun-icon"><svg viewBox="0 0 24 24"><path d="M12 2.25a.75.75 0 01.75.75v2.25a.75.75 0 01-1.5 0V3a.75.75 0 01.75-.75zM7.5 12a4.5 4.5 0 119 0 4.5 4.5 0 01-9 0zM18.894 6.106a.75.75 0 010 1.06l-1.591 1.59a.75.75 0 11-1.06-1.06l1.59-1.59a.75.75 0 011.06 0zM21.75 12a.75.75 0 01-.75.75h-2.25a.75.75 0 010-1.5h2.25a.75.75 0 01.75.75zM17.836 17.836a.75.75 0 01-1.06 0l-1.59-1.591a.75.75 0 111.06-1.06l1.59 1.59a.75.75 0 010 1.061zM12 21.75a.75.75 0 01-.75-.75v-2.25a.75.75 0 011.5 0v2.25a.75.75 0 01-.75-.75zM5.636 17.836a.75.75 0 010-1.06l1.591-1.59a.75.75 0 111.06 1.06l-1.59 1.59a.75.75 0 01-1.06 0zM3.75 12a.75.75 0 01.75-.75h2.25a.75.75 0 010 1.5H4.5a.75.75 0 01-.75-.75zM6.106 6.106a.75.75 0 011.06 0l1.59 1.591a.75.75 0 11-1.06 1.06l-1.59-1.59a.75.75 0 010-1.06z"/></svg></div>
-                        <div class="icon moon-icon"><svg viewBox="0 0 24 24"><path d="M21.752 15.002A9.718 9.718 0 0118 15.75c-5.385 0-9.75-4.365-9.75-9.75 0-1.33.266-2.597.748-3.752A9.753 9.753 0 003 11.25C3 16.635 7.365 21 12.75 21c3.73 0 7.01-1.939 8.71-4.922.482-.97.74-2.053.742-3.176z"/></svg></div>
-                    </div>
-                    <button id="reload-stream-btn" class="settings-button" title="${t('tooltips.reloadStream')}"><i class="fas fa-sync"></i></button>
-                    <button id="settings-btn" class="settings-button"><i class="fas fa-cog"></i></button>
-                    ${isController ? `<button id="invite-btn" class="settings-button" title="${t('tooltips.invite')}"><i class="fas fa-user-plus"></i></button>` : ''}
-                    ${isController ? `<button id="exit-session-btn" class="settings-button exit-button" title="${t('tooltips.exitSession')}"><i class="fas fa-power-off"></i></button>` : ''}
-                </div>
-            </div>
-            <div class="sidebar-media-controls">
-                <button id="toggle-mic-btn" class="control-btn" title="${t('tooltips.toggleLocalMic')}">
-                    <i class="fas fa-microphone"></i>
-                </button>
-                <button id="toggle-video-btn" class="control-btn" title="${t('tooltips.toggleLocalWebcam')}">
-                    <i class="fas fa-video"></i>
-                </button>
-                <div class="iframe-audio-controls">
-                    <button id="iframe-mute-btn" class="control-btn" title="${t('tooltips.toggleSessionAudio')}">
-                        <i class="fas fa-volume-up"></i>
-                    </button>
-                    <input type="range" id="iframe-volume-slider" min="0" max="1" step="0.01" value="1" title="${t('tooltips.sessionVolume')}">
-                </div>
-            </div>
-            ${isController ? `
-            <div id="invite-section" class="sidebar-invite-section hidden">
-                <h3>${t('inviteLinks.heading')}</h3>
-                <button class="control-btn invite-copy" data-permission="participant">${t('inviteLinks.participant')}</button>
-                <button class="control-btn invite-copy" data-permission="readonly">${t('inviteLinks.readonly')}</button>
-            </div>` : ''}
-            <div id="sidebar-main-content" class="sidebar-content"></div>
-            <div id="chat-reply-banner"></div>
-            <div id="chat-form-container">
-                <form id="chat-form">
-                    <input type="text" id="chat-input" placeholder="${t('chat.inputPlaceholder')}" autocomplete="off" maxlength="500">
-                    <button type="submit"><i class="fas fa-paper-plane"></i></button>
-                </form>
-            </div>`;
-        
-        applyTranslations(sidebarEl, t);
-
-        if (isController) {
+        if (isController || isParticipant) {
             initGamepadControls();
-        } else if (isParticipant) {
-             initGamepadControls();
         }
-
-        if (COLLAB_DATA.userPermission === 'readonly') {
-            const mediaControls = document.querySelector('.sidebar-media-controls');
-            if (mediaControls) {
-                mediaControls.classList.add('readonly-view');
-                mediaControls.querySelector('#toggle-mic-btn').style.display = 'none';
-                mediaControls.querySelector('#toggle-video-btn').style.display = 'none';
-            }
-            const settingsBtn = document.querySelector('#settings-btn');
-            if (settingsBtn) {
-                settingsBtn.style.display = 'none';
-            }
-        }
-
-        toggleMicBtn = document.getElementById('toggle-mic-btn');
-        toggleVideoBtn = document.getElementById('toggle-video-btn');
-        iframeMuteBtn = document.getElementById('iframe-mute-btn');
-        iframeVolumeSlider = document.getElementById('iframe-volume-slider');
-        toggleMicBtn.addEventListener('click', () => handleMediaToggle('mic'));
-        toggleVideoBtn.addEventListener('click', () => handleMediaToggle('video'));
+        inviteTile.classList.toggle('hidden', !isController);
         updateMediaButtonUI();
+    };
 
-        const gameIframe = document.getElementById('session-frame');
-        iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        if (isIframeMuted) iframeMuteBtn.querySelector('i').className = 'fas fa-volume-mute';
+    // --- chat: the bar's chat column grows up over the play space while it has focus ---
+    const scrollChatToBottom = () => {
+        chatScroll.scrollTop = chatScroll.scrollHeight;
+    };
 
-        if (gameIframe) {
-            gameIframe.addEventListener('load', sendVolumeToIframe);
-        }
+    const openChat = () => {
+        if (isChatOpen) return;
+        isChatOpen = true;
+        chatTab.classList.remove('unread');
+        chatDock.classList.add('open');
+        // The height transition has to land before the bottom is the bottom.
+        chatDock.addEventListener('transitionend', scrollChatToBottom, { once: true });
+        scrollChatToBottom();
+    };
 
-        iframeMuteBtn.addEventListener('click', () => {
-            isIframeMuted = !isIframeMuted;
-            sendVolumeToIframe();
-            iframeMuteBtn.querySelector('i').className = isIframeMuted ? 'fas fa-volume-mute' : 'fas fa-volume-up';
-            iframeVolumeSlider.value = isIframeMuted ? 0 : lastKnownVolume;
-        });
+    const closeChat = () => {
+        if (!isChatOpen) return;
+        isChatOpen = false;
+        chatDock.classList.remove('open');
+        chatDock.addEventListener('transitionend', scrollChatToBottom, { once: true });
+        if (document.activeElement === chatInput) chatInput.blur();
+    };
 
-        iframeVolumeSlider.addEventListener('input', (e) => {
-            const newVolume = parseFloat(e.target.value);
+    // --- invite: the blank tile at the end of the row flips to the link buttons ---
+    const isInviteOpen = () => inviteTile.classList.contains('open');
+    const openInvite = () => inviteTile.classList.add('open');
+    const closeInvite = () => inviteTile.classList.remove('open');
 
-            if (newVolume > 0) {
-                lastKnownVolume = newVolume;
-                localStorage.setItem(`collab_iframe_volume`, lastKnownVolume);
-                isIframeMuted = false;
-                iframeMuteBtn.querySelector('i').className = 'fas fa-volume-up';
-            } else {
-                isIframeMuted = true;
-                iframeMuteBtn.querySelector('i').className = 'fas fa-volume-mute';
-            }
-            sendVolumeToIframe();
-        });
-
-        const gamingModeBtn = sidebarEl.querySelector('#gaming-mode-btn');
-        if (gamingModeBtn) {
-            gamingModeBtn.addEventListener('click', () => {
-                if (document.fullscreenElement) {
-                    if (document.exitFullscreen) {
-                        document.exitFullscreen().catch(err => console.error(err));
+    const initInviteControls = () => {
+        inviteBtn.addEventListener('click', openInvite);
+        // The broker hands back the same link for a permission all session,
+        // so one fetch per permission is all that is ever needed.
+        const inviteUrls = {};
+        inviteTile.querySelectorAll('.invite-copy').forEach((button) => {
+            let resetTimer = null;
+            const flash = (text) => {
+                const label = button.textContent;
+                button.textContent = text;
+                clearTimeout(resetTimer);
+                resetTimer = setTimeout(() => {
+                    button.textContent = label;
+                }, INVITE_FLASH_MS);
+            };
+            button.addEventListener('click', async () => {
+                const permission = button.dataset.permission;
+                try {
+                    if (!inviteUrls[permission]) {
+                        const resp = await fetch(
+                            `api/session/invite?token=${encodeURIComponent(COLLAB_DATA.userToken)}`,
+                            {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ permission }),
+                            }
+                        );
+                        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                        const invited = await resp.json();
+                        inviteUrls[permission] = new URL(invited.url, window.location.href).href;
                     }
-                } else {
-                    const iframe = document.getElementById('session-frame');
-                    if (iframe && iframe.contentWindow) {
-                        iframe.contentWindow.postMessage({ type: 'requestFullscreen' }, window.location.origin);
-                        iframe.focus(); 
-                    }
-                    if (COLLAB_DATA.userRole !== 'controller' && ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ action: 'force_cursor_render', state: 1 }));
-                    }
+                    await navigator.clipboard.writeText(inviteUrls[permission]);
+                    flash(t('inviteLinks.copied'));
+                    // Long enough to read the confirmation before the panel goes.
+                    setTimeout(closeInvite, INVITE_FLASH_MS);
+                } catch (err) {
+                    console.error('[Invite] failed:', err);
+                    flash(t('inviteLinks.failed'));
                 }
             });
-        }
+        });
+    };
 
-        sidebarEl.querySelector('.theme-toggle').addEventListener('click', toggleTheme);
-        sidebarEl.querySelector('#reload-stream-btn').addEventListener('click', () => {
+    const initDock = () => {
+        toggleMicBtn.addEventListener('click', () => handleMediaToggle('mic'));
+        toggleVideoBtn.addEventListener('click', () => handleMediaToggle('video'));
+        settingsBtn.addEventListener('click', () => {
+            unlockAllAudio();
+            populateDeviceLists();
+            settingsModalOverlay.classList.remove('hidden');
+        });
+        // Touch has no hover, so a tap on the tile itself is what surfaces the
+        // self-view controls; a tap anywhere else puts them away again.
+        localContainer.addEventListener('click', (e) => {
+            if (e.target.closest('button, .gamepad-icon')) return;
+            localContainer.classList.toggle('controls-shown');
+        });
+
+        chatForm.addEventListener('submit', handleChatSubmit);
+        chatInput.addEventListener('focus', openChat);
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeChat();
+        });
+        chatScroll.addEventListener('click', handleChatAreaClick);
+        document.getElementById('username-form').addEventListener('submit', handleUsernameSubmit);
+
+        initInviteControls();
+
+        reloadStreamBtn.addEventListener('click', () => {
             const iframe = document.getElementById('session-frame');
             if (iframe) {
                 if (iframe.getAttribute('src') === 'about:blank' && iframe.dataset.src) {
@@ -2182,80 +2817,49 @@ document.addEventListener('DOMContentLoaded', async () => {
                     iframe.src = currentSrc.toString();
                 }
             }
+            closeModal();
         });
-        sidebarEl.querySelector('#settings-btn').addEventListener('click', () => {
-            unlockAllAudio();
-            populateDeviceLists();
-            settingsModalOverlay.classList.remove('hidden')
+
+        // The open chat, the invite tile and the self-view controls all
+        // minimize the same way: interacting anywhere outside them. Captured
+        // so it runs before a target's own handler can re-open what it just
+        // closed.
+        document.addEventListener('pointerdown', (e) => {
+            if (isChatOpen && !e.target.closest('#chat-dock')) closeChat();
+            if (isInviteOpen() && !e.target.closest('#invite-tile')) closeInvite();
+            if (!e.target.closest('#local-user-container')) localContainer.classList.remove('controls-shown');
+        }, true);
+        // The chat column is fixed rather than in the bar's flow, so its
+        // closed height tracks whatever the bar is currently laid out at.
+        // The same pass decides whether the tiles are bumping into it: when
+        // the tiles plus a full-width column would not fit the bar, the
+        // column folds to a tab at the right edge and gives the strip the
+        // room. Measured against the full column width, not the slot's
+        // current one, so folding cannot un-crowd the bar and unfold itself.
+        const updateBarLayout = () => {
+            document.documentElement.style.setProperty('--bar-height', `${videoGrid.offsetHeight}px`);
+            const styles = getComputedStyle(videoGrid);
+            const gap = parseFloat(styles.columnGap) || 0;
+            const padding = (parseFloat(styles.paddingLeft) || 0) + (parseFloat(styles.paddingRight) || 0);
+            const fullDock = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--chat-dock-width')) || 0;
+            const needed = videoGridContent.scrollWidth + gap + fullDock + padding;
+            document.body.classList.toggle('chat-crowded', needed > videoGrid.clientWidth);
+        };
+        const barObserver = new ResizeObserver(updateBarLayout);
+        barObserver.observe(videoGrid);
+        barObserver.observe(videoGridContent);
+        chatTab.addEventListener('click', () => {
+            openChat();
+            chatInput.focus();
         });
-        const inviteBtn = sidebarEl.querySelector('#invite-btn');
-        const inviteSection = sidebarEl.querySelector('#invite-section');
-        if (inviteBtn && inviteSection) {
-            inviteBtn.addEventListener('click', () => {
-                inviteSection.classList.toggle('hidden');
-            });
-            // Each mint is a real seat in the session and the backend cannot
-            // dedup a user-less invite, so cache per permission rather than
-            // minting again on every click and leaving a trail of offline
-            // users behind.
-            const inviteUrls = {};
-            inviteSection.querySelectorAll('.invite-copy').forEach((button) => {
-                const label = button.textContent;
-                let resetTimer = null;
-                const flash = (text) => {
-                    button.textContent = text;
-                    clearTimeout(resetTimer);
-                    resetTimer = setTimeout(() => {
-                        button.textContent = label;
-                    }, 2000);
-                };
-                button.addEventListener('click', async () => {
-                    const permission = button.dataset.permission;
-                    try {
-                        if (!inviteUrls[permission]) {
-                            const resp = await fetch(
-                                `api/session/invite?token=${encodeURIComponent(COLLAB_DATA.userToken)}`,
-                                {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ permission }),
-                                }
-                            );
-                            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                            const invited = await resp.json();
-                            inviteUrls[permission] = new URL(invited.url, window.location.href).href;
-                        }
-                        await navigator.clipboard.writeText(inviteUrls[permission]);
-                        flash(t('inviteLinks.copied'));
-                    } catch (err) {
-                        console.error('[Invite] failed:', err);
-                        flash(t('inviteLinks.failed'));
-                    }
-                });
-            });
-        }
-        const exitBtn = sidebarEl.querySelector('#exit-session-btn');
-        if (exitBtn) {
-            exitBtn.addEventListener('click', async () => {
-                if (!confirm(t('exit.confirm'))) return;
-                exitBtn.disabled = true;
-                try {
-                    const resp = await fetch(`api/session/exit?token=${encodeURIComponent(COLLAB_DATA.userToken)}`, { method: 'POST' });
-                    const report = await resp.json();
-                    console.log('[Exit] save dump report:', report);
-                    showExitReport(report);
-                } catch (err) {
-                    console.error('[Exit] failed:', err);
-                    alert(t('exit.failed', { message: err.message }));
-                    exitBtn.disabled = false;
-                }
-            });
-        }
-        sidebarEl.querySelector('#chat-form').addEventListener('submit', handleChatSubmit);
-        document.getElementById('sidebar-main-content').innerHTML = '<div id="chat-messages"></div>';
-        document.getElementById('sidebar-main-content').addEventListener('click', handleChatAreaClick);
+        // Clicking into the game stream never reaches this document as a
+        // pointer event; the window losing focus is the only signal.
+        window.addEventListener('blur', () => {
+            closeChat();
+            closeInvite();
+        });
     };
-   
+
     const escapeHTML = (str) => str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
 
     const linkify = (text) => {
@@ -2263,8 +2867,18 @@ document.addEventListener('DOMContentLoaded', async () => {
         return text.replace(urlRegex, (url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
     };
 
+    // A server-stamped sender id settles authorship outright. The name match is
+    // only the fallback for a payload that carries none, and it is wrong for any
+    // peer who picked the same name: their messages read as "You" and stay silent.
+    const isOwnChatMessage = (data) => {
+        const senderPublicId = data.senderPublicId || data.sender_public_id;
+        if (senderPublicId) return senderPublicId === COLLAB_DATA.userPublicId;
+        if (COLLAB_DATA.userRole === 'controller' && data.sender === COLLAB_DATA.controllerName) return true;
+        return data.sender === username;
+    };
+
     const createMessageHTML = (data) => {
-        const isSelf = data.sender === username || (COLLAB_DATA.userRole === 'controller' && data.sender === 'Controller');
+        const isSelf = isOwnChatMessage(data);
         const senderName = isSelf ? t('chat.selfUsername') : escapeHTML(data.sender);
         
         let replyHTML = '';
@@ -2305,16 +2919,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         const messagesContainer = document.getElementById('chat-messages');
         if (!messagesContainer) return;
 
-        const scrollContainer = document.getElementById('sidebar-main-content');
-        if (!scrollContainer) return;
-
-        const isScrolledToBottom = scrollContainer.scrollHeight - scrollContainer.clientHeight <= scrollContainer.scrollTop + 50;
+        const isScrolledToBottom = chatScroll.scrollHeight - chatScroll.clientHeight <= chatScroll.scrollTop + 50;
 
         const msgEl = document.createElement('div');
         let isOwnMessage = false;
 
         if (type === 'chat') {
-            isOwnMessage = data.sender === username || (COLLAB_DATA.userRole === 'controller' && data.sender === 'Controller');
+            isOwnMessage = isOwnChatMessage(data);
             msgEl.innerHTML = createMessageHTML(data);
         } else {
             let content = '';
@@ -2335,13 +2946,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
 
         if (isScrolledToBottom) {
-            scrollContainer.scrollTop = scrollContainer.scrollHeight;
+            scrollChatToBottom();
         }
 
         if (type === 'chat' && !isOwnMessage) {
             playNotificationSound();
-            if (!isSidebarVisible) {
-                showToast(data);
+            if (!isChatOpen) {
+                showChatPeek(data);
             }
         }
     };
@@ -2356,7 +2967,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             localStorage.setItem('collab_username', username);
             sessionStorage.setItem('collab_hasJoined_' + COLLAB_DATA.sessionId, 'true');
             ws.send(JSON.stringify({ action: 'set_username', username: username }));
-            renderSidebar();
+            renderRoom();
 
             if (!mediaInitialized) {
                 await startMedia();
@@ -2364,6 +2975,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             
             isMicOn = true;
             if (localStream) localStream.getAudioTracks().forEach(t => t.enabled = true);
+            if (ws && ws.setMicActive) ws.setMicActive(true);
             sendControlMessage('audio_state', true);
             updateMediaButtonUI();
 
@@ -2376,26 +2988,34 @@ document.addEventListener('DOMContentLoaded', async () => {
                 sendControlMessage('video_state', true);
             }
             updateMediaButtonUI();
-
-            toggleSidebar();
         }
     };
 
     const handleChatSubmit = (e) => {
         e.preventDefault();
-        const input = document.getElementById('chat-input');
-        if (input.value.trim()) {
-            const payload = { 
-                action: 'send_chat_message', 
-                message: input.value.trim() 
-            };
-            if (replyingTo) {
-                payload.replyTo = replyingTo.messageId;
-            }
-            ws.send(JSON.stringify(payload));
-            input.value = '';
-            cancelReply();
+        const message = chatInput.value.trim();
+        if (!message) return;
+        // RoomSocket.send drops anything written to a socket that is not open,
+        // so a message typed during the reconnect backoff would vanish silently.
+        // The text stays in the box and the form flinches: resending after the
+        // reconnect costs a keystroke instead of retyping.
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+            console.warn('[Chat] message not sent: the room socket is not open.');
+            chatForm.classList.remove('send-failed');
+            // Restarting the animation needs the class gone for a frame first.
+            requestAnimationFrame(() => chatForm.classList.add('send-failed'));
+            return;
         }
+        const payload = {
+            action: 'send_chat_message',
+            message
+        };
+        if (replyingTo) {
+            payload.replyTo = replyingTo.messageId;
+        }
+        ws.send(JSON.stringify(payload));
+        chatInput.value = '';
+        cancelReply();
     };
 
     const handleChatAreaClick = (e) => {
@@ -2406,6 +3026,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (messageStore[messageId]) {
                 replyingTo = messageStore[messageId];
                 renderReplyBanner();
+                chatInput.focus();
             }
         }
     };
@@ -2459,25 +3080,30 @@ document.addEventListener('DOMContentLoaded', async () => {
         oscillator.stop(notificationAudioCtx.currentTime + 0.1);
     };
 
-    const showToast = (data) => {
-        const toast = document.createElement('div');
-        toast.className = 'toast';
-        toast.innerHTML = `
-            <div class="toast-sender">${escapeHTML(data.sender)}</div>
-            <div class="toast-message">${linkify(escapeHTML(data.message))}</div>
+    // A closed chat still shows what just arrived: the message surfaces as a
+    // bubble above the dock's input and clears itself, and tapping it opens
+    // the full history.
+    const showChatPeek = (data) => {
+        const bubble = document.createElement('div');
+        bubble.className = 'chat-peek-bubble';
+        bubble.innerHTML = `
+            <div class="chat-peek-sender">${escapeHTML(data.sender)}</div>
+            <div class="chat-peek-message">${linkify(escapeHTML(data.message))}</div>
         `;
-        toast.addEventListener('click', () => {
-            if (!isSidebarVisible) {
-                toggleSidebar();
-            }
-            toast.classList.add('closing');
+        bubble.addEventListener('click', () => {
+            openChat();
+            chatInput.focus();
         });
-        toastContainer.appendChild(toast);
+        chatTab.classList.add('unread');
+        chatPeek.appendChild(bubble);
+        while (chatPeek.children.length > MAX_PEEK_BUBBLES) {
+            chatPeek.removeChild(chatPeek.firstChild);
+        }
 
         setTimeout(() => {
-            toast.classList.add('closing');
-            toast.addEventListener('animationend', () => toast.remove());
-        }, 5000);
+            bubble.classList.add('closing');
+            bubble.addEventListener('animationend', () => bubble.remove());
+        }, PEEK_LIFETIME_MS);
     };
 
     const initGamepadControls = () => {
@@ -2492,12 +3118,11 @@ document.addEventListener('DOMContentLoaded', async () => {
         mkIcon.className = 'gamepad-icon mk-icon';
         if (COLLAB_DATA.userRole === 'controller') {
             mkIcon.classList.add('draggable');
-            mkIcon.draggable = true;
         }
         mkIcon.innerHTML = `<i class="fas fa-keyboard"></i><i class="fas fa-mouse" style="margin-left: 3px; font-size: 0.8em;"></i>`;
 
         if (COLLAB_DATA.userRole === 'controller') {
-            document.getElementById('local-user-container').appendChild(mkIcon);
+            localContainer.appendChild(mkIcon);
         } else {
             sourceBox.appendChild(mkIcon);
         }
@@ -2508,7 +3133,6 @@ document.addEventListener('DOMContentLoaded', async () => {
             icon.className = 'gamepad-icon';
             if (COLLAB_DATA.userRole === 'controller') {
                 icon.classList.add('draggable');
-                icon.draggable = true;
             }
             icon.dataset.gamepadId = i;
             icon.innerHTML = `<i class="fas fa-gamepad"></i><span class="gamepad-number">${i}</span>`;
@@ -2527,9 +3151,9 @@ document.addEventListener('DOMContentLoaded', async () => {
             if (user.slot) {
                 assignedGamepadIds.add(user.slot);
                 const icon = gamepadIcons[user.slot];
-                const container = user.token === COLLAB_DATA.userToken
+                const container = user.publicId === COLLAB_DATA.userPublicId
                     ? document.getElementById('local-user-container')
-                    : document.getElementById(`container-${user.token}`);
+                    : document.getElementById(`container-${user.publicId}`);
 
                 if (icon && container && icon.parentElement !== container) {
                     container.appendChild(icon);
@@ -2538,9 +3162,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 
             if (user.has_mk) {
                 mkAssigned = true;
-                const container = user.token === COLLAB_DATA.userToken
+                const container = user.publicId === COLLAB_DATA.userPublicId
                     ? document.getElementById('local-user-container')
-                    : document.getElementById(`container-${user.token}`);
+                    : document.getElementById(`container-${user.publicId}`);
 
                 if (mkIcon && container && mkIcon.parentElement !== container) {
                     container.appendChild(mkIcon);
@@ -2567,109 +3191,137 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     };
 
-    let draggedElement = null;
+    // Gamepad/MK handoff and tile reordering are pointer-event drags with an
+    // in-page ghost rather than native HTML5 drag-and-drop: the native drag
+    // image is drawn by the OS outside the page and does not show over a
+    // fullscreen element, and native DnD never worked on touch at all.
+    const DRAG_START_PX = 5;
+    let drag = null;
 
-    videoGrid.addEventListener('dragstart', (e) => {
-        const target = e.target.closest('.draggable, .reorderable');
-        if (!target) {
-            e.preventDefault();
+    const dragTargets = () => Array.from(document.querySelectorAll('.video-container')).filter((container) => {
+        const user = currentUserState.find(u => u.publicId === container.dataset.userPublicId);
+        return container.id === 'gamepad-source-box' || user;
+    });
+
+    const beginDrag = (pending) => {
+        const { source, pointerId } = pending;
+        const ghost = source.cloneNode(true);
+        ghost.classList.add('drag-ghost');
+        ghost.removeAttribute('id');
+        const rect = source.getBoundingClientRect();
+        ghost.style.width = `${rect.width}px`;
+        ghost.style.height = `${rect.height}px`;
+        document.body.appendChild(ghost);
+
+        drag = { ...pending, ghost, offsetX: pending.startX - rect.left, offsetY: pending.startY - rect.top, over: null };
+        source.setPointerCapture(pointerId);
+
+        if (drag.kind === 'stream') {
+            document.body.classList.add('dragging-stream');
+            source.classList.add('reordering');
+        } else {
+            document.body.classList.add(drag.kind === 'mk' ? 'dragging-mk' : 'dragging-gamepad');
+            source.classList.add('dragging');
+            dragTargets().forEach(c => c.classList.add('can-drop-gamepad'));
+        }
+    };
+
+    const moveGhost = (e) => {
+        drag.ghost.style.transform = `translate(${e.clientX - drag.offsetX}px, ${e.clientY - drag.offsetY}px)`;
+    };
+
+    const containerUnder = (e) => {
+        // The ghost ignores pointer events, so this sees through it.
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        return el ? el.closest('.video-container') : null;
+    };
+
+    const endDrag = (dropped) => {
+        if (!drag) return;
+        const { source, kind, ghost, over } = drag;
+        drag = null;
+        ghost.remove();
+        document.body.classList.remove('dragging-gamepad', 'dragging-mk', 'dragging-stream');
+        source.classList.remove('dragging', 'reordering');
+        document.querySelectorAll('.can-drop-gamepad, .drop-target').forEach(el => el.classList.remove('can-drop-gamepad', 'drop-target'));
+        if (!dropped || kind === 'stream' || !over) return;
+
+        if (kind === 'mk') {
+            const publicIdToAssign = (over.id === 'gamepad-source-box') ? COLLAB_DATA.userPublicId : over.dataset.userPublicId;
+            ws.send(JSON.stringify({ action: 'assign_mk', public_id: publicIdToAssign }));
             return;
         }
-        draggedElement = target;
-
-        if (target.classList.contains('gamepad-icon')) {
-            if (target.classList.contains('mk-icon')) {
-                document.body.classList.add('dragging-mk');
-                e.dataTransfer.setData('type', 'mk');
-            } else {
-                document.body.classList.add('dragging-gamepad');
-                e.dataTransfer.setData('type', 'gamepad');
-                e.dataTransfer.setData('text/plain', target.dataset.gamepadId);
+        const gamepadId = parseInt(source.dataset.gamepadId, 10);
+        if (over.id === 'gamepad-source-box') {
+            const parentContainer = source.parentElement;
+            if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
+                const userPublicId = parentContainer.dataset.userPublicId;
+                if (userPublicId) ws.send(JSON.stringify({ action: 'assign_slot', viewer_public_id: userPublicId, slot: null }));
             }
-            e.dataTransfer.effectAllowed = 'move';
-            
-            setTimeout(() => target.classList.add('dragging'), 0);
-            
-            document.querySelectorAll('.video-container').forEach(container => {
-                const userToken = container.dataset.userToken;
-                const user = currentUserState.find(u => u.token === userToken);
-                if (container.id === 'gamepad-source-box' || user) {
-                    container.classList.add('can-drop-gamepad');
-                }
-            });
-        } else if (target.classList.contains('reorderable')) {
-            document.body.classList.add('dragging-stream');
-            e.dataTransfer.setData('text/plain', target.id);
-            e.dataTransfer.effectAllowed = 'move';
-            setTimeout(() => target.classList.add('reordering'), 0);
-        }
-    });
-
-    videoGrid.addEventListener('dragend', (e) => {
-        document.body.className = '';
-        draggedElement?.classList.remove('dragging', 'reordering');
-        document.querySelectorAll('.can-drop-gamepad').forEach(el => el.classList.remove('can-drop-gamepad'));
-        draggedElement = null;
-    });
-
-    videoGrid.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        const dropTarget = e.target.closest('.video-container');
-
-        if (document.body.classList.contains('dragging-gamepad') || document.body.classList.contains('dragging-mk')) {
-            if (dropTarget && dropTarget.classList.contains('can-drop-gamepad')) {
-                e.dataTransfer.dropEffect = 'move';
-            } else {
-                e.dataTransfer.dropEffect = 'none';
-            }
-        } else if (document.body.classList.contains('dragging-stream')) {
-            if (dropTarget && !dropTarget.classList.contains('pinned') && dropTarget !== draggedElement) {
-                const rect = dropTarget.getBoundingClientRect();
-                const offsetX = e.clientX - rect.left;
-                if (offsetX < rect.width / 2) {
-                    dropTarget.parentNode.insertBefore(draggedElement, dropTarget);
-                } else {
-                    dropTarget.parentNode.insertBefore(draggedElement, dropTarget.nextSibling);
-                }
-            }
-        }
-    });
-
-    videoGrid.addEventListener('drop', (e) => {
-        e.preventDefault();
-        const isGamepad = document.body.classList.contains('dragging-gamepad');
-        const isMk = document.body.classList.contains('dragging-mk');
-
-        if (!isGamepad && !isMk) return;
-
-        const dropTarget = e.target.closest('.video-container.can-drop-gamepad');
-        if (!dropTarget) return;
-
-        if (isMk) {
-            const userToken = dropTarget.dataset.userToken;
-            const tokenToAssign = (dropTarget.id === 'gamepad-source-box') ? COLLAB_DATA.userToken : userToken;
-            ws.send(JSON.stringify({ action: 'assign_mk', token: tokenToAssign }));
         } else {
-            const gamepadId = parseInt(e.dataTransfer.getData('text/plain'), 10);
-            const draggedIcon = document.getElementById(`gamepad-icon-${gamepadId}`);
-            if (dropTarget.id === 'gamepad-source-box') {
-                const parentContainer = draggedIcon.parentElement;
-                if (parentContainer && parentContainer.id !== 'gamepad-source-box') {
-                    const userToken = parentContainer.dataset.userToken;
-                    if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: null }));
-                }
-            } else {
-                const userToken = dropTarget.dataset.userToken;
-                if (userToken) ws.send(JSON.stringify({ action: 'assign_slot', viewer_token: userToken, slot: gamepadId }));
-            }
+            const userPublicId = over.dataset.userPublicId;
+            if (userPublicId) ws.send(JSON.stringify({ action: 'assign_slot', viewer_public_id: userPublicId, slot: gamepadId }));
         }
+    };
+
+    videoStrip.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 || drag) return;
+        const icon = e.target.closest('.gamepad-icon.draggable');
+        const tile = e.target.closest('.video-container.reorderable');
+        let source, kind;
+        if (icon) {
+            source = icon;
+            kind = icon.classList.contains('mk-icon') ? 'mk' : 'gamepad';
+        } else if (tile && e.pointerType === 'mouse' && !e.target.closest('button')) {
+            // Touch on a tile has to stay a scroll of the strip.
+            source = tile;
+            kind = 'stream';
+        } else {
+            return;
+        }
+        // Nothing moves until the pointer has travelled a little, so a plain
+        // click on an icon or tile still behaves like one.
+        const pending = { source, kind, pointerId: e.pointerId, startX: e.clientX, startY: e.clientY };
+        const onMove = (ev) => {
+            if (ev.pointerId !== pending.pointerId) return;
+            if (!drag) {
+                if (Math.hypot(ev.clientX - pending.startX, ev.clientY - pending.startY) < DRAG_START_PX) return;
+                beginDrag(pending);
+            }
+            moveGhost(ev);
+            const over = containerUnder(ev);
+            if (drag.kind === 'stream') {
+                if (over && !over.classList.contains('pinned') && over !== drag.source) {
+                    const rect = over.getBoundingClientRect();
+                    const before = ev.clientX - rect.left < rect.width / 2;
+                    over.parentNode.insertBefore(drag.source, before ? over : over.nextSibling);
+                }
+                return;
+            }
+            const target = over && over.classList.contains('can-drop-gamepad') ? over : null;
+            if (target !== drag.over) {
+                drag.over?.classList.remove('drop-target');
+                target?.classList.add('drop-target');
+                drag.over = target;
+            }
+        };
+        const onEnd = (ev) => {
+            if (ev.pointerId !== pending.pointerId) return;
+            source.removeEventListener('pointermove', onMove);
+            source.removeEventListener('pointerup', onEnd);
+            source.removeEventListener('pointercancel', onEnd);
+            endDrag(ev.type === 'pointerup');
+        };
+        source.addEventListener('pointermove', onMove);
+        source.addEventListener('pointerup', onEnd);
+        source.addEventListener('pointercancel', onEnd);
     });
 
     let isBouncing = false;
-    videoGrid.addEventListener('wheel', e => {
-        if (videoGrid.scrollWidth > videoGrid.clientWidth) {
+    videoStrip.addEventListener('wheel', e => {
+        if (videoStrip.scrollWidth > videoStrip.clientWidth) {
             e.preventDefault();
-            videoGrid.scrollLeft += e.deltaY;
+            videoStrip.scrollLeft += e.deltaY;
         } else {
             if (isBouncing || Math.abs(e.deltaY) < 5) return;
             e.preventDefault();
@@ -2686,8 +3338,6 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
-    toggleHandle.addEventListener('click', toggleSidebar);
-
     if (videoToggleHandle) {
         videoToggleHandle.addEventListener('click', toggleVideoGrid);
     }
@@ -2702,25 +3352,26 @@ document.addEventListener('DOMContentLoaded', async () => {
     audioInputSelect.addEventListener('change', (e) => {
         preferredMicId = e.target.value;
         localStorage.setItem('collab_preferredMicId', preferredMicId);
-        if(mediaInitialized) startMedia();
+        restartMediaForDeviceChange().catch(err => console.error('[Media] microphone switch failed:', err));
     });
     videoInputSelect.addEventListener('change', (e) => {
         preferredCamId = e.target.value;
         localStorage.setItem('collab_preferredCamId', preferredCamId);
-        if(mediaInitialized) startMedia();
+        restartMediaForDeviceChange().catch(err => console.error('[Media] webcam switch failed:', err));
     });
     
-    videoGrid.addEventListener('click', (e) => {
+    videoStrip.addEventListener('click', (e) => {
         const btn = e.target.closest('.remote-control-btn');
         if (!btn) return;
     
         unlockAllAudio();
-        const token = btn.dataset.token;
-        const stream = remoteStreams[token];
-    
+        const publicId = btn.dataset.publicId;
+        const stream = remoteStreams[publicId];
+
         if (btn.classList.contains('mute-audio')) {
             if (!stream) return;
             stream.audioMuted = !stream.audioMuted;
+            if (stream.mediaId && ws && ws.setAudioActive) ws.setAudioActive(stream.mediaId, !stream.audioMuted);
             if (stream.audioContext) {
                 if (stream.audioMuted && stream.audioContext.state === 'running') {
                     stream.audioContext.suspend();
@@ -2747,12 +3398,12 @@ document.addEventListener('DOMContentLoaded', async () => {
                 stream.hasReceivedKeyFrame = false;
             }
         } else if (btn.classList.contains('resize-to-client')) {
-            const res = clientResolutions[token];
+            const res = clientResolutions[publicId];
             if (!res) {
-                console.warn(`[Controller] No resolution data available for client ${token}`);
+                console.warn(`[Controller] No resolution data available for client ${publicId}`);
                 return;
             }
-            console.log(`[Controller] Manually resizing to client ${token}: ${res.width}x${res.height}`);
+            console.log(`[Controller] Manually resizing to client ${publicId}: ${res.width}x${res.height}`);
             const iframe = document.getElementById('session-frame');
             if (iframe && iframe.contentWindow) {
                 iframe.contentWindow.postMessage({ type: 'setManualResolution', width: res.width, height: res.height }, window.location.origin);
@@ -2765,19 +3416,23 @@ document.addEventListener('DOMContentLoaded', async () => {
                 applyAutoResolution();
             }
         } else if (btn.classList.contains('designate-speaker')) {
-            const tokenToSet = (currentDesignatedSpeaker === token) ? null : token;
-            ws.send(JSON.stringify({ action: 'set_designated_speaker', token: tokenToSet }));
+            const publicIdToSet = (currentDesignatedSpeaker === publicId) ? null : publicId;
+            ws.send(JSON.stringify({ action: 'set_designated_speaker', public_id: publicIdToSet }));
         }
     });
 
     applyTranslations(document.body, t);
-    renderSidebar();
+    initDock();
+    renderRoom();
     connectWebSocket();
     updateSpeakingIndicators();
 
     document.body.addEventListener('click', initNotificationAudio, { once: true });
     document.body.addEventListener('keydown', initNotificationAudio, { once: true });
 
+    // A seat token is personal and comes out of the address bar; an invite
+    // token is the shared link and can stay, since reloading on it is what
+    // brings this tab back to its own seat.
     if (window.history.replaceState) {
         const url = new URL(window.location);
         url.searchParams.delete('token');
@@ -2793,14 +3448,16 @@ document.addEventListener('DOMContentLoaded', async () => {
                 const height = iframeEl.clientHeight;
                 ws.send(JSON.stringify({ action: 'client_resolution', width, height }));
                 if (COLLAB_DATA.userRole === 'controller') {
-                    clientResolutions[COLLAB_DATA.userToken] = { width, height };
-                    if (!isResolutionLocked && currentMkOwner === COLLAB_DATA.userToken) {
+                    clientResolutions[COLLAB_DATA.userPublicId] = { width, height };
+                    if (!isResolutionLocked && currentMkOwner === COLLAB_DATA.userPublicId) {
                         applyAutoResolution();
                     }
                 }
             }
         });
         resizeObserver.observe(iframeEl);
+        // Re-applied on every stream (re)load so a reload keeps RomM's volume.
+        iframeEl.addEventListener('load', sendVolumeToIframe);
     }
 
     document.addEventListener('fullscreenchange', () => {
@@ -2808,18 +3465,4 @@ document.addEventListener('DOMContentLoaded', async () => {
             ws.send(JSON.stringify({ action: 'force_cursor_render', state: 0 }));
         }
     });
-
-    setTimeout(toggleSidebar, 500);
-
-    // Show the chrome briefly, then retract it so the stream lands full-view.
-    // The sidebar always goes: it is a slide-over panel that would sit on top
-    // of the game. The video bar stays in a multiplayer room, because faces
-    // are the point of the mode and the handle that brings it back is easy to
-    // miss.
-    setTimeout(() => {
-        if (isSidebarVisible) toggleSidebar();
-        if (isVideoGridVisible && document.body.classList.contains('solo-mode')) {
-            toggleVideoGrid();
-        }
-    }, 2500);
 });

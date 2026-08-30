@@ -19,12 +19,53 @@ from starlette.responses import Response
 
 from . import api, room, settings
 from .emulators.base import reap_orphan
+from .emulators.rpcs3 import sweep_stale_extractions as sweep_rpcs3_extractions
+from .emulators.shadps4 import sweep_stale_extractions as sweep_shadps4_extractions
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [broker] %(levelname)s %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
+
+log = logging.getLogger(__name__)
+
+_NO_AUTH_BANNER = (
+    "\n"
+    + "!" * 72
+    + "\n"
+    "!! BROKER_SECRET IS NOT SET - REFUSING TO START\n"
+    "!!\n"
+    "!! Every session-lifecycle endpoint (activate, save/load state,\n"
+    "!! swap-disc, state-file, memory-card, exports, imports) would be\n"
+    "!! reachable by ANY caller that can reach this port, with no auth.\n"
+    "!!\n"
+    "!! Set BROKER_SECRET to a strong random value before starting the\n"
+    "!! broker, or set BROKER_DEV_MODE=true to explicitly run without\n"
+    "!! authentication (local development only).\n" + "!" * 72
+)
+
+
+def enforce_auth_config() -> None:
+    """Refuse to build an app that would serve every endpoint unauthenticated.
+
+    Enforced here rather than in the console-script wrapper alone, because
+    uvicorn and gunicorn are routinely pointed straight at `create_app` and
+    would otherwise skip the gate entirely.
+
+    Raises:
+        SystemExit: When `BROKER_SECRET` is unset and dev mode is not explicitly
+            enabled.
+    """
+    if not settings.BROKER_SECRET and not settings.DEV_MODE:
+        log.critical(_NO_AUTH_BANNER)
+        raise SystemExit(1)
+    if not settings.BROKER_SECRET:
+        log.warning(
+            "BROKER_DEV_MODE is set, so the broker is starting with BROKER_SECRET "
+            "unset: every session-lifecycle endpoint is unauthenticated. Do not "
+            "expose this broker beyond local development."
+        )
 
 
 @asynccontextmanager
@@ -36,6 +77,9 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
     next activate is what keeps it killable at all: exit answers 409 without a
     session, so otherwise the only way out is launching another game.
 
+    Also sweeps the shadPS4 and RPCS3 extraction scratch dirs left behind by
+    a crashed broker process, before any new extraction can be in flight.
+
     Args:
         _app: The application being started; unused.
 
@@ -43,6 +87,8 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         Nothing; control passes to the running application once the orphan is reaped.
     """
     await anyio.to_thread.run_sync(reap_orphan)
+    await anyio.to_thread.run_sync(sweep_shadps4_extractions)
+    await anyio.to_thread.run_sync(sweep_rpcs3_extractions)
     yield
 
 
@@ -56,7 +102,12 @@ def create_app() -> FastAPI:
     Returns:
         The application to serve: a bare root app with the broker mounted at
         `settings.PREFIX` when a prefix is set, otherwise the broker app itself.
+
+    Raises:
+        SystemExit: When the broker would come up with no authentication at all;
+            see `enforce_auth_config`.
     """
+    enforce_auth_config()
     prefixed = bool(settings.PREFIX)
     inner = FastAPI(
         title="webstation-broker", lifespan=None if prefixed else _lifespan
@@ -76,12 +127,22 @@ def create_app() -> FastAPI:
         response.headers["Referrer-Policy"] = "no-referrer"
         return response
 
-    if not settings.DEV_MODE and settings.FRONTEND_DIST.is_dir():
-        inner.mount(
-            "/",
-            StaticFiles(directory=settings.FRONTEND_DIST, html=True),
-            name="frontend",
-        )
+    if not settings.DEV_MODE:
+        if settings.FRONTEND_DIST.is_dir():
+            inner.mount(
+                "/",
+                StaticFiles(directory=settings.FRONTEND_DIST, html=True),
+                name="frontend",
+            )
+            log.info("serving the frontend from %s", settings.FRONTEND_DIST)
+        else:
+            log.error(
+                "frontend dist %s is not a directory: the room UI is not being "
+                "served, so every page under %s/ answers 404. Set "
+                "BROKER_FRONTEND_DIST, or BROKER_DEV_MODE=true to let vite serve it.",
+                settings.FRONTEND_DIST,
+                settings.PREFIX,
+            )
 
     if prefixed:
         root = FastAPI(lifespan=_lifespan)

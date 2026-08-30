@@ -9,7 +9,7 @@ what vite does automatically.
 
 ```
 frontend/
-  index.html        static shell: overlays, video grid, sidebar mount point, settings modal
+  index.html        static shell: overlays, bottom bar (tiles, invite tile, chat column), modals
   vite.config.js     dev server + build config
   package.json
   src/
@@ -18,11 +18,12 @@ frontend/
     room.css          all styling
 ```
 
-There is no component framework: `room.js` renders the
-sidebar by building HTML strings and reattaching listeners on every re-render
-(see `renderMainSidebar` and `renderSidebar`). It is one large file by design,
-not by neglect; keep new UI in that same direct-DOM style rather than
-introducing a second pattern.
+There is no component framework: the chrome is static markup in
+`index.html`, wired once at bootstrap (`initDock`), and `room.js` fills in the
+parts that depend on who is looking (`renderMainRoom`) or builds them from
+HTML strings as people arrive (`addRemoteStream`). It is one large file by
+design, not by neglect; keep new UI in that same direct-DOM style rather
+than introducing a second pattern.
 
 <Callout type="warn" title="Nothing here is linted or tested in CI.">
 `ci.yml` only runs the Python lint, app build, and pytest suite. There's no
@@ -71,20 +72,33 @@ the full path through to it.
   hidden `<video>` and canvas readback where it doesn't (Firefox, and
   Safari's audio side). Unrelated to the DOM/UI code below it; skip this
   block unless you're touching webcam/mic capture itself.
-- **Rendering**: `renderSidebar`, `renderUsernamePrompt`, `renderMainSidebar`
-  build the sidebar's HTML from `COLLAB_DATA` and the current roster, then
-  wire up listeners. They're called again on every roster change, so
-  listeners are attached fresh each time rather than assumed to persist.
-  `applyTranslations` runs last, resolving every `data-i18n*` attribute in
-  the rendered scope.
+- **Bar and panels**: `initDock` wires the static chrome once: the
+  self-view buttons, the chat column (`openChat`/`closeChat`, raised while
+  the input has focus, folded to a tab when `updateBarLayout` finds the
+  tiles crowding it), the invite tile (`initInviteControls`), and the
+  document-level dismissal that closes all of them on an outside pointer.
+  `renderRoom` then either shows the username modal (a viewer with no name
+  yet) or `renderMainRoom`, which fills in the local tile's label and
+  controller-only buttons, shows the invite tile to the controller, and
+  builds the gamepad tray. `applyTranslations` resolves every `data-i18n*`
+  attribute at bootstrap.
+- **Webcam compose** (`composeFrame`): every captured frame is drawn onto a
+  240x180 canvas before it reaches the encoder, rotated upright (derived
+  from `window.orientation` on mobile WebKit, whose frames carry no
+  orientation; applied by `drawImage` itself on Chromium) and fitted with
+  black bars rather than stretched. The receiver paints whatever arrives,
+  so this is the only place orientation is handled.
 - **Websocket** (`connectWebSocket` and its `onmessage`): chat, roster
   updates, gamepad/MK reassignment broadcasts, resolution changes. The wire
   format is documented on the [`room` module](/docs/developer/reference/room)
   in the Python reference.
-- **Drag-and-drop** (`videoGrid.addEventListener('dragstart'/'dragover'/'drop', ...)`
-  near the bottom): the controller-assignment mechanic from the room guide.
-  Only the controller's icons are `draggable`; a viewer's tiles are valid
-  drop targets but never drag sources.
+- **Drag-and-drop** (`videoStrip.addEventListener('pointerdown', ...)` and
+  `beginDrag`/`endDrag` near the bottom): the controller-assignment
+  mechanic from the room guide, plus tile reordering. It is pointer events
+  with an in-page ghost element rather than native HTML5 drag-and-drop,
+  because the native drag image is drawn by the OS and does not show over a
+  fullscreen element. Only the controller's icons carry the `draggable`
+  class; a viewer's tiles are valid drop targets but never drag sources.
 
 ## Adding or changing a translation
 
@@ -92,7 +106,7 @@ UI text reaches the page two ways:
 
 - **Static markup in `index.html`** carries `data-i18n="key"` (innerHTML),
   `data-i18n-placeholder="key"`, or `data-i18n-title="key"`.
-  `applyTranslations` resolves these on load and on every sidebar re-render.
+  `applyTranslations` resolves these at bootstrap.
 - **Anything `room.js` builds itself** calls `t('key')` directly inside the
   template string, e.g. `t('tooltips.invite')`.
 

@@ -1,6 +1,7 @@
 """Flycast ROM resolution, transient -config composition, launch, and exit via a graceful close request."""
 
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import NoReturn, Optional
 
@@ -135,6 +136,29 @@ def test_resolve_searches_one_level_of_subfolders(rom_root: Path) -> None:
     rom.write_bytes(b"")
 
     assert flycast.Flycast().resolve_rom_file(folder) == rom
+
+
+def test_resolve_keeps_the_candidates_it_could_read_when_one_search_pattern_fails(
+    rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One unreadable subdirectory must not report a bootable title as having no boot file."""
+    folder = rom_root / "MyGame"
+    folder.mkdir()
+    rom = folder / "MyGame.chd"
+    rom.write_bytes(b"")
+    real_glob = Path.glob
+
+    def flaky_glob(self: Path, pattern: str) -> Iterator[Path]:
+        if pattern == "*/*":
+            raise OSError("permission denied")
+        return real_glob(self, pattern)
+
+    monkeypatch.setattr(Path, "glob", flaky_glob)
+
+    with caplog.at_level("WARNING"):
+        assert flycast.Flycast().resolve_rom_file(folder) == rom
+
+    assert "rom search" in caplog.text
 
 
 # ── launch ───────────────────────────────────────────────────────────────
@@ -342,12 +366,59 @@ def test_stop_activates_the_window_and_sends_alt_f4_then_waits_for_exit(
 
     assert calls == [
         ("windowactivate", "--sync", "12345"),
+        ("getactivewindow",),
         ("key", "--clearmodifiers", "alt+F4"),
     ]
     assert proc.wait_calls == [emu.term_timeout]
     assert escalated == []
     assert emu._proc is None
     assert not pid_record.exists()
+
+
+def test_stop_sends_alt_f4_once_the_emulator_window_is_confirmed_focused(
+    monkeypatch: pytest.MonkeyPatch, pid_record: Path
+) -> None:
+    """Alt+F4 goes out over XTEST only once the focused window is the emulator's own."""
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: None)
+    emu = flycast.Flycast()
+    emu._proc = _FakeProc()
+    monkeypatch.setattr(emu, "_window", lambda: "12345")
+    calls = []
+
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
+        calls.append(args)
+        return "12345\n" if args == ("getactivewindow",) else ""
+
+    monkeypatch.setattr(flycast.Flycast, "_xdotool", fake_xdotool)
+
+    emu.stop()
+
+    assert calls[-1] == ("key", "--clearmodifiers", "alt+F4")
+
+
+def test_stop_skips_alt_f4_when_another_window_holds_the_focus(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A close request is never sent blind: another window in focus escalates instead."""
+    escalated = []
+    monkeypatch.setattr(base.Emulator, "stop", lambda self: escalated.append(True))
+    emu = flycast.Flycast()
+    emu._proc = _FakeProc()
+    monkeypatch.setattr(emu, "_window", lambda: "12345")
+    calls = []
+
+    def fake_xdotool(self: flycast.Flycast, *args: str) -> Optional[str]:
+        calls.append(args)
+        return "99999\n" if args == ("getactivewindow",) else ""
+
+    monkeypatch.setattr(flycast.Flycast, "_xdotool", fake_xdotool)
+
+    with caplog.at_level("WARNING"):
+        emu.stop()
+
+    assert ("key", "--clearmodifiers", "alt+F4") not in calls
+    assert escalated == [True]
+    assert "did not take focus" in caplog.text
 
 
 def test_stop_falls_back_to_sigterm_when_no_window_is_found(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -501,7 +572,7 @@ def test_exit_with_a_slot_reports_no_save_when_the_state_is_unchanged(
     assert state.exists()  # never discarded: a graceful exit, just no rewrite
 
 
-def test_exit_with_a_slot_discards_a_changed_state_killed_by_bare_sigterm(
+def test_exit_with_a_slot_sets_aside_a_changed_state_killed_by_bare_sigterm(
     data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Flycast has no SIGTERM handler, so the base class's SIGTERM escalation is already a hard kill.
@@ -530,13 +601,13 @@ def test_exit_with_a_slot_discards_a_changed_state_killed_by_bare_sigterm(
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
     assert not state.exists()
     assert "force-killed" in caplog.text
-    assert "discarded untrusted resume state" in caplog.text
+    assert "set aside untrusted resume state" in caplog.text
 
 
-def test_exit_with_a_slot_discards_a_changed_state_killed_by_sigkill(
+def test_exit_with_a_slot_keeps_a_changed_state_killed_by_sigkill_as_a_sidecar(
     data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A state file that changed during a SIGKILL is discarded, not reported as saved."""
+    """A state file that changed during a SIGKILL is set aside, never reported and never destroyed."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
@@ -546,7 +617,7 @@ def test_exit_with_a_slot_discards_a_changed_state_killed_by_sigkill(
         # dc_exit() wrote a complete state, or mid-write; either way the
         # broker cannot tell torn from complete, so a file that changed
         # during the kill is never trusted.
-        _touch(state)
+        _touch(state, b"maybe torn, maybe a whole session")
 
     monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
     emu = flycast.Flycast()
@@ -560,8 +631,79 @@ def test_exit_with_a_slot_discards_a_changed_state_killed_by_sigkill(
 
     assert report == {"state_saved": False, "state_slot": 1, "state_file": None}
     assert not state.exists()
+    aside = data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX)
+    assert aside.read_bytes() == b"maybe torn, maybe a whole session"
     assert "force-killed" in caplog.text
-    assert "discarded untrusted resume state" in caplog.text
+    assert "set aside untrusted resume state" in caplog.text
+
+
+def test_a_set_aside_state_is_replaced_rather_than_piling_up(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second force-killed exit for the same rom replaces the earlier sidecar."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+    aside = data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX)
+    _touch(aside, b"from the last kill")
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"from this kill")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = -9
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    emu.save_and_exit(1)
+
+    assert aside.read_bytes() == b"from this kill"
+    assert sorted(p.name for p in data_dir.iterdir()) == ["game.state" + flycast.UNTRUSTED_SUFFIX]
+
+
+def test_a_set_aside_state_is_not_picked_up_as_a_resume_or_swept_by_a_restore(
+    data_dir: Path, rom_root: Path
+) -> None:
+    """A sidecar is invisible to resume-state resolution and survives clear_working_slot."""
+    rom = rom_root / "game.chd"
+    aside = _touch(data_dir / ("game.state" + flycast.UNTRUSTED_SUFFIX), b"kept")
+
+    flycast.Flycast().clear_working_slot()
+
+    assert aside.exists()
+    assert not flycast._state_path_for(rom).exists()
+
+
+def test_a_state_that_cannot_be_set_aside_is_left_alone_and_logged(
+    data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A rename that fails leaves the state in place rather than losing it, and is logged."""
+    rom = rom_root / "game.chd"
+    rom.write_bytes(b"")
+    state = data_dir / "game.state"
+
+    def fake_stop(self: flycast.Flycast) -> None:
+        _touch(state, b"still the player's only copy")
+
+    def boom(self: Path, target: Path) -> NoReturn:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(flycast.Flycast, "stop", fake_stop)
+    monkeypatch.setattr(Path, "replace", boom)
+    emu = flycast.Flycast()
+    emu._rom_path = rom
+    emu._proc = _FakeProc()
+    emu._proc.returncode = -9
+    monkeypatch.setattr(emu, "alive", lambda: True)
+
+    with caplog.at_level("WARNING"):
+        report = emu.save_and_exit(1)
+
+    assert report["state_saved"] is False
+    assert state.read_bytes() == b"still the player's only copy"
+    assert "could not set aside untrusted resume state" in caplog.text
 
 
 def test_exit_with_a_slot_leaves_an_unchanged_state_alone_when_force_killed(
@@ -587,10 +729,10 @@ def test_exit_with_a_slot_leaves_an_unchanged_state_alone_when_force_killed(
     assert "force-killed" in caplog.text
 
 
-def test_exit_with_a_slot_discards_a_changed_state_when_stop_never_confirms_the_exit(
+def test_exit_with_a_slot_sets_aside_a_changed_state_when_stop_never_confirms_the_exit(
     data_dir: Path, rom_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A changed state file is discarded when stop cannot confirm a clean exit."""
+    """A changed state file is set aside when stop cannot confirm a clean exit."""
     rom = rom_root / "game.chd"
     rom.write_bytes(b"")
     state = data_dir / "game.state"
@@ -712,3 +854,12 @@ def test_class_attributes_match_the_exit_only_api_surface(data_dir: Path) -> Non
     assert emu.rom_extensions == (".chd", ".gdi", ".cdi", ".cue", ".elf")
     assert emu.supports_states is False
     assert emu.supports_disc_swap is False
+
+
+def test_the_savestate_is_labelled_apart_from_the_vmu_saves() -> None:
+    """The savestate is labelled apart from the VMU images it sits beside."""
+    emulator = flycast.Flycast()
+    data = flycast.DATA_DIR.name
+
+    assert emulator.save_file_kind(f"{data}/Game.state") == "state"
+    assert emulator.save_file_kind(f"{data}/vmu_save_A1.bin") == "save"

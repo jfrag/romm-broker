@@ -1,5 +1,7 @@
 """Room websocket: oversized-frame rejection, chat rate limiting, and video/audio/cursor state validation."""
 
+import json
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -9,7 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.testclient import WebSocketTestSession
 from starlette.websockets import WebSocketDisconnect
 
-from webstation_broker import room
+from webstation_broker import room, session, settings
 
 from .conftest import PREFIX, FakeEmulator
 
@@ -160,3 +162,604 @@ def test_an_out_of_range_state_value_is_dropped(
         message = conn.receive_json()
 
         assert message["payload"]["state"] == 0
+
+
+def _invite(client: TestClient, controller_token: str, permission: str = "participant") -> str:
+    """Take a seat through the controller's invite link and return the seat token."""
+    response = client.post(
+        f"{API}/session/invite?token={controller_token}", json={"permission": permission}
+    )
+    invite = response.json()["url"].split("invite=")[1]
+    return client.get(f"{API}/session/context?invite={invite}").json()["userToken"]
+
+
+def _wait_for_state(conn: WebSocketTestSession, predicate) -> dict:  # noqa: ANN001
+    """Read room broadcasts until a state_update satisfies `predicate`, and return it."""
+    while True:
+        message = conn.receive_json()
+        if message["type"] == "state_update" and predicate(message):
+            return message
+
+
+def test_an_invite_link_stays_valid_after_its_viewer_disconnects(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An invite link stays valid after its viewer disconnects.
+
+    The seat is minted once and lives for the whole session: a reload, a closed tab or the room's
+    own reconnect must land back in the same seat rather than on a "session does not exist" page.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, viewer):
+        pass
+
+    assert session.find_viewer(viewer) is not None
+    assert client.get(f"{API}/session/context?token={viewer}").status_code == 200
+    with _connect(client, viewer) as conn:
+        conn.send_json({"action": "video_state", "state": 1})
+        assert conn.receive_json()["payload"]["state"] == 1
+
+
+def test_a_disconnecting_viewer_releases_its_gamepad_but_keeps_its_seat(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A disconnecting viewer releases its gamepad but keeps its seat.
+
+    A pad nobody is driving goes back to the tray so the host can hand it on, while the seat (and
+    the link to it) survives for when that person comes back.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": 2})
+        _wait_for_state(
+            guest,
+            lambda m: any(u["publicId"] == viewer_public_id and u["slot"] == 2 for u in m["viewers"]),
+        )
+
+    seat = session.find_viewer(viewer)
+    assert seat is not None
+    assert seat["slot"] is None
+
+
+def test_a_seat_reclaimed_mid_handshake_gets_the_new_socket_closed(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A seat reclaimed by a concurrent join while accept() is still pending closes the stale socket.
+
+    accept() is an await point: a join at the room cap can reclaim this very seat while the
+    handshake is in flight, so the seat is re-checked after accept() rather than trusting the lookup
+    made before it.
+    """
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    # Past the grace a just-minted seat gets, so the reclaim below is the one
+    # the arrival would really make rather than one this test forces.
+    session.find_viewer(viewer)["last_seen"] = 0.0
+
+    original_accept = room.WebSocket.accept
+
+    async def accept_then_reclaim(self: object, *args: object, **kwargs: object) -> None:
+        await original_accept(self, *args, **kwargs)
+        # A second arrival at the cap goes through the real reclaim path in
+        # add_viewer, evicting `viewer`'s seat: it is still the only anonymous,
+        # not-yet-online candidate at this point in the handshake.
+        await session.add_viewer("participant", None)
+
+    monkeypatch.setattr(room.WebSocket, "accept", accept_then_reclaim)
+
+    with client.websocket_connect(f"{PREFIX}/ws/room?token={viewer}") as conn:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            conn.receive_json()
+        assert excinfo.value.code == 1008
+
+    assert session.find_viewer(viewer) is None
+
+
+def test_state_update_never_carries_a_raw_token(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """state_update identifies members by publicId, never by their real bearer token.
+
+    Every room member (including anonymous viewers) receives this broadcast, so a raw token in it
+    would hand out the credential needed to reconnect as, or impersonate, anyone else in the room.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer):
+        # The viewer's own _connect already drained its join broadcast; the host's
+        # queue still holds the state_update that announced the viewer, now with
+        # both members in it.
+        message = _wait_for_state(host, lambda m: len(m["viewers"]) == 2)
+
+        assert controller not in json.dumps(message)
+        assert viewer not in json.dumps(message)
+        for user in message["viewers"]:
+            assert "token" not in user
+            assert user["publicId"]
+
+
+def test_resolution_update_and_control_messages_use_public_id_not_token(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """resolution_update and control messages identify the sender by public id, not raw token."""
+    controller = _activate(client, broker_dirs)
+    controller_public_id = session.public_id_for(controller)
+
+    with _connect(client, controller) as conn:
+        conn.send_json({"action": "client_resolution", "width": 1280, "height": 720})
+        resolution_message = conn.receive_json()
+
+        assert resolution_message["type"] == "resolution_update"
+        assert resolution_message["public_id"] == controller_public_id
+        assert controller not in json.dumps(resolution_message)
+
+        conn.send_json({"action": "video_state", "state": 1})
+        control_message = conn.receive_json()
+
+        assert control_message["payload"]["sender_public_id"] == controller_public_id
+        assert controller not in json.dumps(control_message)
+
+
+def test_a_forged_media_sender_id_is_overwritten_before_relay(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A viewer's forged sender id in a media frame is overwritten with its own before relay.
+
+    Recipients attribute an incoming video/audio frame to whichever publicId sits in its first 8
+    bytes (see room.py's wire format docstring); trusting the sender's own bytes there would let
+    any participant paint its frames onto another member's video tile.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        guest_media_id = session.ROOM["viewers"][viewer]["public_id"]
+        forged = b"AAAAAAAA" + bytes([0x01]) + b"payload"
+        guest.send_bytes(forged)
+
+        while True:
+            raw = host.receive()
+            if "bytes" in raw:
+                relayed = raw["bytes"]
+                break
+
+        assert relayed[:8] == guest_media_id.encode("ascii")
+        assert relayed[8:] == forged[8:]
+
+
+def test_designated_speaker_is_reported_as_a_public_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The controller can name a viewer as designated speaker using only its public id.
+
+    The controller never learns the viewer's real token (see test_state_update_never_carries_a_raw_token),
+    so this is the only handle it has to target the viewer with.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "set_designated_speaker", "public_id": viewer_public_id})
+        message = _wait_for_state(guest, lambda m: m["designated_speaker"] == viewer_public_id)
+
+        assert message["designated_speaker"] == viewer_public_id
+        assert viewer not in json.dumps(message)
+
+
+def test_controller_can_assign_mk_to_a_viewer_using_its_public_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The controller can hand mouse/keyboard control to a viewer using only its public id."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        host.send_json({"action": "assign_mk", "public_id": viewer_public_id})
+        message = _wait_for_state(
+            guest,
+            lambda m: any(u["publicId"] == viewer_public_id and u["has_mk"] for u in m["viewers"]),
+        )
+
+        assert any(u["publicId"] == viewer_public_id and u["has_mk"] for u in message["viewers"])
+
+
+def test_a_rejoin_closes_the_old_seats_still_connected_socket(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A same-user rejoin closes the old seat's socket rather than leaving it live on a dead token.
+
+    Unlike a same-token reconnect, a rejoin mints a new token for a different seat: nothing else
+    would ever close the old one, so it would otherwise keep relaying room traffic on a token
+    `find_viewer` no longer recognizes.
+    """
+    controller = _activate(client, broker_dirs)
+    user = {"id": 7, "username": "ana"}
+    first = (
+        client.post(f"{API}/session/join", json={"user": user, "permission": "participant"})
+        .json()["url"]
+        .split("token=")[1]
+    )
+
+    with _connect(client, controller) as host, _connect(client, first) as old:
+        second = (
+            client.post(f"{API}/session/join", json={"user": user, "permission": "participant"})
+            .json()["url"]
+            .split("token=")[1]
+        )
+        assert second != first
+        # The evicted token's connection is detached the moment the join call
+        # returns, before the socket close below is even awaited.
+        assert first not in session.ROOM["viewers"]
+        second_public_id = session.find_viewer(second)["public_id"]
+
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            old.receive_json()
+        assert excinfo.value.code == 1008
+        assert session.find_viewer(first) is None
+
+        # The host and the new seat are the only two members left; the evicted
+        # seat is gone from the roster with no departure notice for it.
+        message = _wait_for_state(
+            host, lambda m: any(u["publicId"] == second_public_id for u in m["viewers"])
+        )
+        assert len(message["viewers"]) == 2
+
+
+def test_a_new_connection_on_the_same_token_replaces_the_old_one(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A new connection on the same token replaces the old one.
+
+    The stale socket is closed and, since it was not the member leaving, it must not announce a
+    departure or release what the live socket now holds.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host:
+        with _connect(client, viewer) as first:
+            with _connect(client, viewer) as second:
+                with pytest.raises(WebSocketDisconnect):
+                    first.receive_json()
+                second.send_json({"action": "video_state", "state": 1})
+                assert second.receive_json()["payload"]["state"] == 1
+
+        # The host saw a join per socket but no departure from the replaced one.
+        seen = []
+        while not seen or seen[-1] != "control":
+            seen.append(host.receive_json()["type"])
+        assert seen.count("user_left") == 0
+
+
+def _next_control(conn: WebSocketTestSession) -> dict:
+    """Read room traffic until a control message arrives, and return its payload.
+
+    A control message the sender knows will be relayed doubles as a barrier:
+    once it lands, every frame sent before it has already been handled.
+
+    Args:
+        conn: The socket to read from.
+
+    Returns:
+        The control message's payload.
+    """
+    while True:
+        message = conn.receive_json()
+        if message["type"] == "control":
+            return message["payload"]
+
+
+def test_the_session_ending_closes_every_room_socket(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """Ending the session closes the room's sockets instead of only forgetting them.
+
+    A forgotten socket is still an open socket with its handler parked in receive() forever, so
+    every connection of every ended session would outlive the session that owned it.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        client.portal.call(session.notify_session_ended)
+
+        for conn in (host, guest):
+            with pytest.raises(WebSocketDisconnect):
+                while True:
+                    conn.receive_json()
+
+    assert session.ROOM["controller"] is None
+    assert session.ROOM["viewers"] == {}
+
+
+def test_a_frame_from_a_lingering_socket_never_lands_in_a_replaced_session(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A socket left over from a retired session writes nothing into the session that replaced it.
+
+    The handler holds no reference to the session it opened on: it reads the live one per frame, so
+    a retire (and an activate on top of it) closes the leftover socket rather than letting it keep
+    setting roles on a session dict nothing serves.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host:
+        retired = session.SESSION
+        session.retire_session()
+        _activate(client, broker_dirs)
+
+        host.send_json({"action": "set_designated_speaker", "public_id": viewer_public_id})
+
+        with pytest.raises(WebSocketDisconnect):
+            host.receive_json()
+        assert retired["designated_speaker"] is None
+        assert session.SESSION["designated_speaker"] is None
+
+
+def test_a_non_object_frame_is_dropped_without_dropping_the_connection(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A frame that is not a JSON object, or carries a null field, is dropped but the socket lives.
+
+    Every handler below reads named keys off the frame, so anything else would raise into the
+    handler's own catch-all and take a member's connection down on a message it chose to send.
+    """
+    token = _activate(client, broker_dirs)
+
+    with _connect(client, token) as conn:
+        for frame in ("5", "[]", '"hello"', "not json at all"):
+            conn.send_text(frame)
+        conn.send_json({"action": "send_chat_message", "message": None})
+        conn.send_json({"action": "set_username", "username": None})
+        conn.send_json({"action": None})
+
+        conn.send_json({"action": "video_state", "state": 1})
+        assert _next_control(conn)["state"] == 1
+
+
+def test_a_gamepad_slot_outside_the_configured_range_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A gamepad slot from the wire is only honoured inside settings.GAMEPAD_SLOTS.
+
+    The slot goes into the token map selkies routes input by, so an out-of-range or non-numeric one
+    would strand a pad on a slot no emulator has.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host:
+        for slot in (settings.GAMEPAD_SLOTS + 1, 0, -1, "2", True, 1.5):
+            host.send_json(
+                {"action": "assign_slot", "viewer_public_id": viewer_public_id, "slot": slot}
+            )
+        host.send_json({"action": "video_state", "state": 1})
+        assert _next_control(host)["state"] == 1
+
+        assert session.find_viewer(viewer)["slot"] is None
+
+        host.send_json(
+            {
+                "action": "assign_slot",
+                "viewer_public_id": viewer_public_id,
+                "slot": settings.GAMEPAD_SLOTS,
+            }
+        )
+        _wait_for_state(
+            host,
+            lambda m: any(
+                u["publicId"] == viewer_public_id and u["slot"] == settings.GAMEPAD_SLOTS
+                for u in m["viewers"]
+            ),
+        )
+
+
+def test_naming_an_unknown_member_as_speaker_leaves_the_restriction_alone(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A speaker request naming nobody in the room leaves the standing restriction in place.
+
+    An unknown or departed public id resolves to None, which is also how the room says "anyone may
+    speak", so honouring it would silently reopen audio to everyone.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    viewer_public_id = session.find_viewer(viewer)["public_id"]
+
+    with _connect(client, controller) as host:
+        host.send_json({"action": "set_designated_speaker", "public_id": viewer_public_id})
+        _wait_for_state(host, lambda m: m["designated_speaker"] == viewer_public_id)
+
+        host.send_json({"action": "set_designated_speaker", "public_id": "deadbeef"})
+        host.send_json({"action": "video_state", "state": 1})
+        assert _next_control(host)["state"] == 1
+
+        assert session.SESSION["designated_speaker"] == viewer
+
+        # An explicit null is the one way to clear it, and still works.
+        host.send_json({"action": "set_designated_speaker", "public_id": None})
+        _wait_for_state(host, lambda m: m["designated_speaker"] is None)
+        assert session.SESSION["designated_speaker"] is None
+
+
+def test_a_control_message_relays_only_the_fields_the_room_acts_on(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A control message is rebuilt from the fields the room acts on, not relayed as sent.
+
+    The payload reaches every member, so forwarding the sender's own dict would carry every extra
+    key it packed in, a spoofed sender identity included.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        guest.send_json(
+            {
+                "action": "audio_state",
+                "state": 1,
+                "sender_public_id": "forged00",
+                "extra": {"anything": "at all"},
+            }
+        )
+        payload = _next_control(host)
+
+        assert payload == {
+            "action": "audio_state",
+            "state": 1,
+            "sender_public_id": session.find_viewer(viewer)["public_id"],
+        }
+
+
+def test_a_seat_with_no_username_is_never_named_after_its_token(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A seat with no username of its own gets a generic name, never one built from its token.
+
+    The name goes to the whole room in user_joined and state_update, and the token is the seat's
+    bearer credential: any part of it in that name is a credential leak.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+    del session.find_viewer(viewer)["username"]
+
+    with client.websocket_connect(f"{PREFIX}/ws/room?token={viewer}") as conn:
+        joined = conn.receive_json()
+        state = conn.receive_json()
+
+        assert joined["type"] == "user_joined"
+        assert joined["username"] == "Viewer"
+        assert viewer[:6] not in json.dumps([joined, state])
+
+
+def test_state_update_never_carries_a_seats_romm_user_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """state_update carries no seat bookkeeping beyond what the room renders.
+
+    Every member reads this broadcast, anonymous guests included, so a seat's RomM user id in it
+    would tell the whole room which library account is behind each name.
+    """
+    controller = _activate(client, broker_dirs)
+    joined = client.post(
+        f"{API}/session/join",
+        json={"permission": "participant", "user": {"id": 4242, "username": "bo"}},
+    ).json()
+    viewer = joined["url"].split("token=")[1]
+
+    with _connect(client, controller) as host, _connect(client, viewer):
+        message = _wait_for_state(host, lambda m: len(m["viewers"]) == 2)
+
+        assert "4242" not in json.dumps(message)
+        for user in message["viewers"]:
+            assert set(user) == {
+                "publicId",
+                "username",
+                "slot",
+                "permission",
+                "has_mk",
+                "online",
+                "mediaId",
+            }
+
+
+def test_a_media_frame_shorter_than_its_header_is_dropped_with_a_log(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A media frame too short to carry its own header is dropped, and says so in the log."""
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        with caplog.at_level(logging.WARNING, logger="webstation_broker.room"):
+            guest.send_bytes(b"\x01" * (room.MEDIA_HEADER_BYTES - 1))
+            guest.send_json({"action": "video_state", "state": 1})
+
+            relayed = []
+            while True:
+                message = host.receive()
+                if "bytes" in message:
+                    relayed.append(message["bytes"])
+                    continue
+                if json.loads(message["text"])["type"] == "control":
+                    break
+
+        assert relayed == []
+        assert "shorter than its" in caplog.text
+
+
+def test_a_connection_whose_media_id_is_the_wrong_width_is_refused(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection whose media id is not the width the wire format carries is refused.
+
+    Recipients read the frame type from the byte straight after the id, so an id of any other width
+    would put every frame's type byte at an offset nothing parses.
+    """
+    token = _activate(client, broker_dirs)
+    monkeypatch.setattr(session, "new_public_id", lambda: "too-short")
+
+    with client.websocket_connect(f"{PREFIX}/ws/room?token={token}") as conn:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            conn.receive_json()
+
+        assert excinfo.value.code == 1011
+
+
+def test_a_client_resolution_is_only_relayed_as_a_plausible_pixel_count(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A self-reported resolution is relayed only when both dimensions are plausible pixel counts."""
+    token = _activate(client, broker_dirs)
+
+    with _connect(client, token) as conn:
+        conn.send_json({"action": "client_resolution", "width": {"x": 1}, "height": "720"})
+        conn.send_json({"action": "client_resolution", "width": 1280, "height": 720})
+
+        message = conn.receive_json()
+
+        assert message["type"] == "resolution_update"
+        assert (message["width"], message["height"]) == (1280, 720)
+
+
+def test_a_chat_message_carries_the_senders_public_id(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A relayed chat message names its sender by public id as well as by display name.
+
+    Usernames are member-chosen and repeatable, so a client deciding whose message is whose by
+    comparing them would let one member wear another's identity in the transcript.
+    """
+    controller = _activate(client, broker_dirs)
+    viewer = _invite(client, controller)
+
+    with _connect(client, controller) as host, _connect(client, viewer) as guest:
+        guest.send_json({"action": "send_chat_message", "message": "hello"})
+        while True:
+            message = host.receive_json()
+            if message["type"] == "chat_message":
+                break
+
+    assert message["senderPublicId"] == session.find_viewer(viewer)["public_id"]
+    assert viewer not in json.dumps(message)

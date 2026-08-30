@@ -50,6 +50,44 @@ member is not written over a file that is newer on disk, so an old archive
 never rolls a session back. On dump, only files modified since launch are
 included, so an archive is a delta rather than the whole tree.
 
+## The archive manifest
+
+Every emulator lays its save directories out differently, and there are
+fourteen of them. So that RomM does not have to carry a table of those
+layouts, a dump archive also holds `.broker-manifest.json` at its root,
+naming the session and labelling each member:
+
+```json
+{
+  "version": 1,
+  "created_at": 1787880008.5,
+  "session": {
+    "emulator": "retroarch",
+    "core": "ppsspp",
+    "platform": "psp",
+    "rom_id": 5,
+    "rom": "Patapon",
+    "rom_file": "/romm/roms/psp/Patapon (USA).chd",
+    "state_slot": 0
+  },
+  "files": [
+    { "path": "states/Patapon (USA).state", "kind": "state" },
+    { "path": "states/Patapon (USA).state.png", "kind": "state_screenshot" },
+    { "path": "saves/Patapon (USA).srm", "kind": "save" }
+  ]
+}
+```
+
+`kind` is one of `state`, `state_screenshot`, `memcard` or `save`. `core` is
+set only for a launcher that fronts many backends (RetroArch), so a RetroArch
+PSP archive can be told from a standalone PPSSPP one; `state_slot` is null
+when the emulator has no save states.
+
+The manifest describes the archive, it is not save data: it is absent from the
+`save_dump.files` list, and a restore drops it rather than writing it into the
+save tree. Archives taken before it existed carry no manifest and restore
+exactly as they always did.
+
 ## Memory cards
 
 Some emulators keep a memory card the broker owns as a whole file or folder:

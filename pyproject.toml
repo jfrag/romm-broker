@@ -17,6 +17,9 @@ dependencies = [
 [project.scripts]
 webstation-broker = "webstation_broker.main:run"
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
 [tool.setuptools.packages.find]
 include = ["webstation_broker*"]
 

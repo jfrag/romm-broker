@@ -35,11 +35,20 @@ curl -k -X POST https://localhost:3001/streaming/api/session/invite \
   -d '{ "permission": "participant" }'
 ```
 
-Mints a token with no user attached and returns its room URL. Whoever opens it
-joins under the name they pick in the room. The invite route ignores the
-session's `multiplayer` flag: a link always works. That flag only governs
-whether RomM advertises the session for joining and whether the room shows its
-comms surface (chat, webcam) while the host is alone.
+Returns the session's shareable link for that permission (`?invite=...`
+rather than `?token=...`). It is the same link on every call, seats nobody by
+itself, and can go to any number of people: each person who opens it is given
+their own seat by `GET /api/session/context` and joins under the name they
+pick in the room. The invite route ignores the session's `multiplayer` flag:
+a link always works. That flag only governs whether RomM advertises the
+session for joining and whether the room shows its comms surface (chat,
+webcam) while the host is alone.
+
+Seats live for the whole session. Disconnecting (closing the tab, reloading,
+a network blip) releases any gamepad slot or mouse/keyboard the seat was
+holding but keeps the seat, and the room remembers its seat per tab, so a
+reload lands back in the same seat rather than taking another. Both kinds of
+link stop working when the session ends.
 
 ## The room
 
@@ -48,6 +57,6 @@ iframes the selkies stream and connects to the broker's websocket at
 `<SUBFOLDER>/ws/room`. It bootstraps from `GET /api/session/context?token=...`,
 which tells it who the token belongs to, what it may do, and the current
 roster. Over the websocket the room carries chat, webcam and microphone
-fanout, resolution changes, gamepad and mouse/keyboard reassignment, and the
-exit button. The wire format is documented on the
+fanout, resolution changes, and gamepad and mouse/keyboard reassignment. The
+wire format is documented on the
 [`room` module](/docs/developer/reference/room) in the Python reference.

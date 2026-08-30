@@ -163,6 +163,31 @@ def test_settings_patch_keeps_what_the_user_tuned(config_dir: Path) -> None:
     assert root.find("graphic_api").text == "1"
 
 
+def test_settings_pins_the_audio_device_to_default(config_dir: Path) -> None:
+    """TVDevice and PadDevice are forced to the cubeb default sentinel."""
+    cemu._patch_settings()
+
+    root = ET.parse(cemu.SETTINGS_PATH).getroot()
+    audio = root.find("Audio")
+    assert audio.find("TVDevice").text == "default"
+    assert audio.find("PadDevice").text == "default"
+
+
+def test_settings_patch_overwrites_a_blank_audio_device(config_dir: Path) -> None:
+    """An existing blank TVDevice/PadDevice, Cemu's own default, is patched too."""
+    config_dir.mkdir(parents=True)
+    cemu.SETTINGS_PATH.write_text(
+        "<content><Audio><TVDevice /><PadDevice /></Audio></content>"
+    )
+
+    cemu._patch_settings()
+
+    root = ET.parse(cemu.SETTINGS_PATH).getroot()
+    audio = root.find("Audio")
+    assert audio.find("TVDevice").text == "default"
+    assert audio.find("PadDevice").text == "default"
+
+
 def test_a_broken_settings_file_is_reseeded_not_fatal(config_dir: Path) -> None:
     """A settings.xml that does not parse is reseeded instead of raising."""
     config_dir.mkdir(parents=True)
@@ -174,14 +199,33 @@ def test_a_broken_settings_file_is_reseeded_not_fatal(config_dir: Path) -> None:
     assert root.find("check_update").text == "false"
 
 
+def test_an_unwritable_settings_file_aborts_the_launch(config_dir: Path) -> None:
+    """A settings.xml the broker cannot write must stop the launch, not pass it.
+
+    Launching anyway parks Cemu on its Getting Started modal while the
+    activate reports a healthy session.
+    """
+    # A plain file where the config directory belongs fails every write.
+    config_dir.parent.mkdir(parents=True)
+    config_dir.write_text("not a directory")
+
+    with pytest.raises(RuntimeError, match="broker settings"):
+        cemu._patch_settings()
+
+
 def test_crc16_matches_the_arc_check_value() -> None:
     """The CRC-16 implementation produces the standard ARC check value."""
     assert cemu._crc16(b"123456789") == 0xBB3D
 
 
-def test_the_classic_pad_guid_is_the_known_xpad_entry() -> None:
-    """Pad index 0 produces the well-known SDL GUID of the xpad controller."""
-    assert cemu._sdl_guid(0) == "030000005e0400008e02000010010000"
+def test_sdl_guid_is_the_interposers_name_based_fallback() -> None:
+    """With crc=0, the GUID is a zero bus and crc followed by the pad name."""
+    assert cemu._sdl_guid(0) == "000000004d6963726f736f6674205800"
+
+
+def test_sdl_guid_matches_the_interposers_measured_guid_with_crc() -> None:
+    """With the real name crc, the GUID matches the one measured against a live interposer."""
+    assert cemu._sdl_guid(cemu._crc16(cemu._PAD_NAME.encode())) == "000081b84d6963726f736f6674205800"
 
 
 def test_pad_profile_carries_both_guid_variants(config_dir: Path) -> None:
@@ -213,6 +257,44 @@ def test_pad_uuids_can_be_pinned_by_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert cemu._pad_uuids() == ["0_aaaa", "1_bbbb"]
 
 
+def test_launch_always_states_the_mlc_the_dump_reads_back(
+    save_dir: Path, config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mlc path must be passed even without CEMU_MLC_DIR set.
+
+    CEMU_DATA_DIR and XDG_DATA_HOME move MLC_DIR too, and Cemu resolves
+    neither of them the way the broker does.
+    """
+    monkeypatch.delenv("CEMU_MLC_DIR", raising=False)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(
+        cemu.Cemu,
+        "_spawn",
+        lambda self, cmd, env, stdin_pipe=False: spawned.append(cmd),
+    )
+    rom = tmp_path / "game.wua"
+    rom.write_bytes(b"")
+
+    cemu.Cemu().launch(rom, resume_slot=None)
+
+    assert spawned[0][spawned[0].index("-m") + 1] == str(cemu.MLC_DIR)
+
+
+def test_launch_creates_the_mlc_cemu_is_pointed_at(
+    save_dir: Path, config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cemu refuses an mlc path that is not there, so the broker makes one."""
+    mlc = tmp_path / "fresh-mlc"
+    monkeypatch.setattr(cemu, "MLC_DIR", mlc)
+    monkeypatch.setattr(cemu.Cemu, "_spawn", lambda self, cmd, env, stdin_pipe=False: None)
+    rom = tmp_path / "game.wua"
+    rom.write_bytes(b"")
+
+    cemu.Cemu().launch(rom, resume_slot=None)
+
+    assert mlc.is_dir()
+
+
 def test_exit_refreshes_only_the_title_saves_this_session_wrote(save_dir: Path) -> None:
     """Exit re-stamps every file of a title written this session and nothing else."""
     emu = cemu.Cemu()
@@ -240,6 +322,23 @@ def test_exit_refreshes_only_the_title_saves_this_session_wrote(save_dir: Path) 
     assert partner.stat().st_mtime >= emu._session_start
     assert stale.stat().st_mtime < emu._session_start
     assert system.stat().st_mtime == system_mtime
+
+
+def test_exit_without_a_launch_restamps_nothing(save_dir: Path) -> None:
+    """A save_and_exit that never saw a launch must not claim every title's saves.
+
+    A zero baseline is newer than every file on disk, which would drag
+    unrelated titles into this session's dump.
+    """
+    other = _touch(
+        save_dir / "00050000" / "aaaaaaaa" / "user" / "80000001" / "old.dat",
+        mtime=time.time() - 5000,
+    )
+    before = other.stat().st_mtime
+
+    cemu.Cemu().save_and_exit(10)
+
+    assert other.stat().st_mtime == before
 
 
 def test_exit_reports_no_state(save_dir: Path) -> None:

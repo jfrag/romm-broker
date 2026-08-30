@@ -20,6 +20,27 @@ files, not ROMs. Games come from your RomM library. Once uploaded, use the
 pcmanfm file manager or a foot terminal on the desktop to move files into the
 directories each emulator expects.
 
+Drag-and-drop is not the only option. `/config`, the volume every deployment
+already mounts (see [Running the container](/docs/container)), is the
+container's home directory, so anything placed on the host at the matching
+path inside it shows up in the container without an upload. This is
+particularly useful for RetroArch: its shared BIOS directory is
+`RETROARCH_SYSTEM_DIR` (default `/config/.local/share/RetroArch/system`, see
+[Configuration](/docs/configuration/emulators)), one folder every libretro
+core reads from, so seeding it on the host covers every RetroArch core at
+once. The per-emulator sections below give the equivalent path for each
+standalone emulator's BIOS, keys, or firmware (for example
+`/config/.local/share/flycast` for Flycast, `/config/.local/share/Cemu` for
+Cemu's `keys.txt`).
+
+Pre-seeding a path does not skip a standalone emulator's setup wizard.
+Emulators outside RetroArch keep their own BIOS/firmware location in their own
+internal config rather than reading it from the broker, so most still need one
+visit to their setup UI to point at or select the file, even when it is
+already sitting in the expected directory. What pre-seeding removes is the
+upload step itself, not the one-time wizard visit described per emulator
+below.
+
 ## Controllers
 
 Controllers behave identically in the desktop view and in single game
@@ -139,6 +160,33 @@ configure through it, but the binaries that single game launches actually use
 are the shadPS4 cores it downloads.
 </Callout>
 
+<Callout type="info">
+shadPS4 boots an `eboot.bin` out of an extracted game folder and cannot boot a
+`.pkg` directly, so a `.pkg` ROM (or a `.7z`/`.zip`/`.rar` archive holding one)
+has to be unpacked by `pkg_extractor` before it can run, and the extraction
+cache is where that unpacked copy goes. Set `SHADPS4_CACHE_ENABLED=true` to
+boot those formats: the first launch extracts the ROM and every later launch
+reuses that extraction, bounded by `SHADPS4_CACHE_MAX_GB` (default 30GB,
+oldest extraction evicted first). The cache lives at
+`/config/.local/share/shadPS4/extracted`; if you enable it, point a dedicated
+bind mount or Docker volume at that path so it doesn't compete with the rest
+of `/config` for space.
+
+An archive is the expensive case: its unpacked `.pkg` and `pkg_extractor`'s
+output are both on disk at the peak, so it wants roughly twice the archive's
+size free even though only about the archive's size is kept afterward. A
+launch that doesn't fit, either under `SHADPS4_CACHE_MAX_GB` or in the free
+space actually on that filesystem, is refused when it is requested rather
+than filling the disk for several minutes and failing on a write error.
+
+Leave `SHADPS4_CACHE_ENABLED` off, its default, and a `.pkg`/archive ROM is
+refused outright rather than re-extracted and thrown away on every launch, so
+only natively bootable formats (a game folder, a bare `eboot.bin`, a `.zar`)
+work. While extracting, `GET /api/session/status` reports `extraction_phase`
+as `"extracting_archive"` or `"extracting_pkg"` (see
+[Configuration](/docs/configuration/emulators)).
+</Callout>
+
 ## PCSX2
 
 PCSX2 runs a setup wizard much like DuckStation's. Upload your BIOS files and
@@ -146,6 +194,22 @@ select them, skip the game folder step, and for controller setup pick the
 proper SDL devices: SDL 0 for player 1 and SDL 1 for player 2.
 
 Set your graphics preferences and test a game before moving on.
+
+## PPSSPP
+
+PPSSPP needs no BIOS; PSP support is fully HLE. Controllers work out of the
+box through SDL, so the desktop visit is mostly about graphics and audio.
+
+PPSSPP is hotkey driven like Dolphin, working in state slot 1. Save data and
+states live under `PSP/` in `PPSSPP_CONFIG_DIR` (default
+`/config/.config/ppsspp`).
+
+Prefer RetroArch's `ppsspp` core for PSP launches: same core, better
+controller and save-state handling (see
+[Supported emulators](/docs/emulators#ppsspp)). Set this one up anyway if you
+want the standalone available; it needs no extra files either way.
+
+Set your graphics options and test a real game before moving on.
 
 ## RetroArch
 
@@ -176,16 +240,25 @@ Adjust graphics settings as desired and run a game to confirm.
 > game and, when a game's title id can't be read from the file path alone,
 > to look it up once the game is confirmed running.
 >
-> A ROM stored as a `.7z`, `.zip`, or `.rar` archive is extracted on launch,
-> since RPCS3 cannot boot an archive directly. By default the extracted
-> copy is removed again once the game stops, so archiving a PS3 dump saves
-> library space without leaving a permanent decompressed copy on local
-> disk. Set `RPCS3_CACHE_ENABLED=true` to keep the extraction around and
-> reuse it on later launches instead, bounded by `RPCS3_CACHE_MAX_GB`
-> (default 30GB, oldest extraction evicted first). The cache lives at
+> A ROM stored as a `.7z`, `.zip`, or `.rar` archive has to be extracted
+> before it can boot, since RPCS3 cannot boot an archive directly, so those
+> formats need the extraction cache. Set `RPCS3_CACHE_ENABLED=true` to boot
+> them: the first launch extracts the ROM and every later launch reuses that
+> extraction, bounded by `RPCS3_CACHE_MAX_GB` (default 30GB, oldest
+> extraction evicted first). The cache lives at
 > `/config/.config/rpcs3/extracted`; if you enable it, point a dedicated
 > bind mount or Docker volume at that path so it doesn't compete with the
-> rest of `/config` for space.
+> rest of `/config` for space. A launch that doesn't fit, either under
+> `RPCS3_CACHE_MAX_GB` or in the free space actually on that filesystem, is
+> refused when it is requested rather than filling the disk for several
+> minutes and failing on a write error.
+>
+> Leave `RPCS3_CACHE_ENABLED` off, its default, and an archived ROM is
+> refused outright rather than re-extracted and thrown away on every launch,
+> so only natively bootable formats (`.iso`, an installed `.pkg`) work.
+> `.pkg` is unaffected either way: it always installs through its own
+> installer, never through this cache. While an archive is extracting,
+> `GET /api/session/status` reports `extraction_phase: "extracting_archive"`.
 
 ## Cemu
 

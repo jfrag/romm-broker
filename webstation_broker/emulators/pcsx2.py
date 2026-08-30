@@ -45,12 +45,43 @@ used, so containers that ran that one keep resolving their existing states.
 
 MEMCARD_DIR = Path("/config/.config/PCSX2/memcards")
 """Directory PCSX2 keeps its memory cards in."""
-SLOT1_CARD_NAME = os.environ.get("PCSX2_SLOT1_CARD", "romm-slot1")
+_DEFAULT_SLOT1_CARD = "romm-slot1"
+"""Card name used when the environment names none, or names one the broker will not carry."""
+_CARD_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}$")
+"""Card names the broker accepts: one path component, and safe as an ini value."""
+
+
+def _slot1_card_name(raw: str) -> str:
+    """Return the Slot-1 card name to use, rejecting one the broker cannot carry.
+
+    The name goes straight into `Slot1_Filename` and is joined onto
+    `MEMCARD_DIR`, so a newline in it would append further ini keys of the
+    caller's choosing, and a path separator would aim the whole-card routes,
+    which replace the card by deleting what is there, at a directory outside
+    the memcards folder.
+
+    Args:
+        raw: The name as the environment gave it.
+
+    Returns:
+        `raw` when it is a single safe path component, otherwise `_DEFAULT_SLOT1_CARD`.
+    """
+    if _CARD_NAME_RE.match(raw):
+        return raw
+    log.warning(
+        "PCSX2_SLOT1_CARD %r is not a usable card name, falling back to %s",
+        raw,
+        _DEFAULT_SLOT1_CARD,
+    )
+    return _DEFAULT_SLOT1_CARD
+
+
+SLOT1_CARD_NAME = _slot1_card_name(os.environ.get("PCSX2_SLOT1_CARD", _DEFAULT_SLOT1_CARD))
 """Name of the Slot-1 card the broker owns (env `PCSX2_SLOT1_CARD`, default `romm-slot1`).
 
 PCSX2 tells a folder card from a file card by what it finds at the path, so
 this is a directory and the name carries no `.ps2` extension, to keep it from
-reading as one of PCSX2's own file cards.
+reading as one of PCSX2's own file cards. Validated by `_slot1_card_name`.
 """
 SLOT1_MARKER = "_pcsx2_superblock"
 """File that marks a directory as a folder card.
@@ -66,6 +97,13 @@ RESUME_LOAD_WAIT = float(os.environ.get("RESUME_LOAD_WAIT", "90.0"))
 """Seconds the boot watchdog gives the VM to start running (env `RESUME_LOAD_WAIT`, default 90)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("RESUME_LOAD_SETTLE", "3.0"))
 """Seconds to wait after the VM reports running before a resume load is sent (env `RESUME_LOAD_SETTLE`)."""
+RESUME_STATE_WAIT = float(os.environ.get("PCSX2_RESUME_STATE_WAIT", "60.0"))
+"""Seconds a booted VM gives the resume state to arrive (env `PCSX2_RESUME_STATE_WAIT`, default 60).
+
+Its own budget rather than whatever is left of the boot deadline: RomM pushes
+its resume pick after activate returns, so a slow boot would otherwise leave
+the wait no time at all and the player would start a fresh game.
+"""
 
 XDG_RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR", "/config/.XDG")
 """Runtime directory PCSX2 creates its PINE socket in (env `XDG_RUNTIME_DIR`, default `/config/.XDG`)."""
@@ -75,6 +113,14 @@ PINE_SOCKET = Path(XDG_RUNTIME_DIR) / "pcsx2.sock"
 _PINE_MSG_SAVE_STATE = 0x09
 _PINE_MSG_LOAD_STATE = 0x0A
 _PINE_MSG_EMU_STATUS = 0x0F
+
+_PINE_MAX_REPLY_BYTES = 64 * 1024
+"""Largest reply the broker will read off the PINE socket.
+
+The opcodes used here answer in a handful of bytes. The declared size is a
+u32 read straight off the wire, so without a ceiling a bogus one has the
+broker buying 4 GiB of memory on the word of whatever is on the socket.
+"""
 
 
 ROM_EXTENSIONS = (".chd", ".iso", ".cso", ".zso", ".gz", ".mdf", ".dump", ".bin", ".elf")
@@ -224,8 +270,15 @@ def _patch_ini() -> None:
     creates the sections it needs, so the very first launch boots the disc.
     Existing keys are rewritten in place, missing ones are added under their
     section (created when absent), the SDL pad is bound, and the result is
-    written through a temp file. Any failure is logged rather than raised so
-    the launch still goes ahead.
+    written through a temp file.
+
+    A failure is raised rather than logged and stepped over: without
+    `EnablePINE` the broker has no way to save a state, and no way to see the
+    VM running either, so a launch that goes ahead anyway costs the player the
+    whole session and reports a game that booted fine as a boot failure.
+
+    Raises:
+        RuntimeError: When the file cannot be read or rewritten.
     """
     patches: dict[tuple[str, str], str] = {
         ("EmuCore", "EnablePINE"): "EnablePINE = true",
@@ -286,8 +339,11 @@ def _patch_ini() -> None:
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
-    except Exception:
-        log.exception("PCSX2.ini patch failed, broker settings NOT applied")
+    except OSError as exc:
+        log.error("pcsx2: PCSX2.ini patch failed at %s: %s", INI_PATH, exc)
+        raise RuntimeError(
+            f"could not apply broker settings to {INI_PATH}: {exc}"
+        ) from exc
 
 
 def _sstate_snapshot() -> dict[Path, tuple[int, float]]:
@@ -322,11 +378,12 @@ def _matches_slot(p: Path, slot: int) -> bool:
     return p.name.endswith(f".{slot:02d}.p2s") or p.name.endswith(f".{slot}.p2s")
 
 
-_STATE_NAME_RE = re.compile(r"^(?P<serial>.+)\.\d{1,2}\.p2s$")
+_STATE_NAME_RE = re.compile(r"^(?P<serial>[^/]+)\.\d{1,2}\.p2s$")
 """Matches `<serial> (<crc>).<slot>.p2s`, the name PCSX2 builds for a save state.
 
 The serial is what ties the file to a disc, the slot is just which of the ten
-it went in.
+it went in. A serial stops at a path separator, so a pushed name carrying
+directories is not a state name here whatever else checks it.
 """
 
 
@@ -351,20 +408,59 @@ def _restamp_slot(filename: str, slot: int) -> Optional[str]:
     return f"{match.group('serial')}.{slot:02d}.p2s"
 
 
+def _holds_open(pid: Optional[int], path: Path) -> bool:
+    """Tell whether `pid` still has `path` open.
+
+    A file the writer has not closed yet is a write still in flight, however
+    long its size happens to sit still: PCSX2 compresses a state in blocks and
+    a busy or stalled host can leave it the same size for a full poll window
+    mid-write.
+
+    Args:
+        pid: The emulator process, or None when the broker holds no handle on it.
+        path: The state file being watched.
+
+    Returns:
+        True only when the descriptor is confirmed open. No pid, a `/proc` that
+        cannot be read, and a process already gone all read as False, so the
+        size test stays the answer where this one cannot contribute.
+    """
+    if pid is None:
+        return False
+    try:
+        target = os.path.realpath(path)
+        for fd in Path(f"/proc/{pid}/fd").iterdir():
+            try:
+                if os.path.realpath(fd) == target:
+                    return True
+            except OSError:
+                continue
+    except OSError as exc:
+        log.debug("could not read the open files of pcsx2 pid %s for %s: %s", pid, path, exc)
+    return False
+
+
 def _wait_for_sstate_write(
-    before: dict[Path, tuple[int, float]], deadline: float, slot: Optional[int] = None
+    before: dict[Path, tuple[int, float]],
+    deadline: float,
+    slot: Optional[int] = None,
+    pid: Optional[int] = None,
 ) -> bool:
     """Poll `SSTATE_DIR` until a slot-matching write completes or the deadline passes.
 
-    A write counts as complete once the file's size has been stable for 0.5 s.
-    PCSX2 acks PINE saves before writing, so this is the only reliable
-    confirmation. A target that disappears mid-write is dropped and the scan
-    starts over.
+    A write counts as complete once the file is non-empty, PCSX2 has closed it,
+    and its size has been stable for 0.5 s. PCSX2 acks PINE saves before
+    writing, so the file itself is the only confirmation there is, and size
+    alone is not enough of one: an emulator that stalls mid-write holds a
+    steady size while the state on disk is still truncated. A target that
+    disappears mid-write is dropped and the scan starts over.
 
     Args:
         before: Snapshot from `_sstate_snapshot` taken before the save was requested.
         deadline: `time.monotonic` value to give up at.
         slot: Only consider files in this slot; None watches every state.
+        pid: The running pcsx2 process, whose open descriptors say whether the write
+            has finished; None falls back to the size test alone.
 
     Returns:
         True once a new or modified state has settled, False on timeout.
@@ -394,10 +490,21 @@ def _wait_for_sstate_write(
                 if cur[0] != last_size:
                     last_size = cur[0]
                     stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= STABLE_SECS:
+                elif (
+                    time.monotonic() - stable_since >= STABLE_SECS
+                    and last_size > 0
+                    and not _holds_open(pid, target)
+                ):
                     log.info("save state write complete: %s (%d bytes)", target.name, last_size)
                     return True
         time.sleep(POLL_SECS)
+    if target is not None:
+        log.warning(
+            "save state write never settled before the deadline: %s (%s bytes, pid %s)",
+            target.name,
+            last_size,
+            pid,
+        )
     return False
 
 
@@ -424,18 +531,26 @@ def newest_state_for_slot(slot: int) -> Optional[Path]:
     return max(candidates)[1]
 
 
-def _pine_recv_exact(sock: _socket.socket, n: int) -> Optional[bytes]:
-    """Read exactly `n` bytes from the PINE socket.
+def _pine_recv_exact(sock: _socket.socket, n: int, deadline: float) -> Optional[bytes]:
+    """Read exactly `n` bytes from the PINE socket, on one shared deadline.
 
     Args:
         sock: A connected PINE socket.
         n: Number of bytes to read.
+        deadline: `time.monotonic` value the whole read must finish by. A
+            per-recv timeout alone never expires against a peer that dribbles
+            one byte at a time, so the budget is spent, not restarted.
 
     Returns:
-        The bytes read, or None if the peer closed the connection first.
+        The bytes read, or None if the peer closed the connection or the deadline passed.
     """
     buf = b""
     while len(buf) < n:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("PINE read timed out with %d of %d bytes on %s", len(buf), n, PINE_SOCKET)
+            return None
+        sock.settimeout(remaining)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             return None
@@ -453,25 +568,35 @@ def _pine_request(opcode: int, payload: bytes = b"", timeout: float = 5.0) -> Op
     Args:
         opcode: The PINE message opcode.
         payload: Bytes following the opcode.
-        timeout: Socket timeout in seconds for connect, send and receive.
+        timeout: Seconds the whole exchange gets, connect through reply.
 
     Returns:
-        The reply payload (possibly empty), or None when the socket is down, the peer hangs up, or
-        PCSX2 rejects the request with a non-zero result.
+        The reply payload (possibly empty), or None when the socket is down, the peer hangs up,
+        the reply declares a size outside `_PINE_MAX_REPLY_BYTES`, or PCSX2 rejects the request
+        with a non-zero result.
     """
     packet = struct.pack("<IB", 5 + len(payload), opcode) + payload
+    deadline = time.monotonic() + timeout
     try:
         with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect(str(PINE_SOCKET))
             sock.sendall(packet)
-            header = _pine_recv_exact(sock, 5)
+            header = _pine_recv_exact(sock, 5, deadline)
             if header is None:
                 return None
             size, result = struct.unpack("<IB", header)
+            if size < 5 or size > _PINE_MAX_REPLY_BYTES:
+                log.warning(
+                    "PINE opcode 0x%02X declared an unusable reply of %d bytes on %s",
+                    opcode,
+                    size,
+                    PINE_SOCKET,
+                )
+                return None
             body = b""
             if size > 5:
-                body = _pine_recv_exact(sock, size - 5) or b""
+                body = _pine_recv_exact(sock, size - 5, deadline) or b""
             if result != 0:
                 log.warning("PINE opcode 0x%02X rejected (result %d)", opcode, result)
                 return None
@@ -535,6 +660,7 @@ class Pcsx2(Emulator):
     display_name = "PCSX2"
     save_root = Path("/config/.config/PCSX2")
     save_subtrees = ("memcards", "sstates")
+    state_subtrees = ("sstates",)
     memory_card_subtree = "memcards"
     memory_card_marker = SLOT1_MARKER
     rom_extensions = ROM_EXTENSIONS
@@ -608,6 +734,10 @@ class Pcsx2(Emulator):
         Args:
             rom_path: The disc image to boot.
             resume_slot: Slot to load once the VM is running, or None to boot clean.
+
+        Raises:
+            RuntimeError: When PCSX2.ini could not be patched, which leaves PINE off and
+                the session with no save states and no boot signal.
         """
         self.stop()
         _patch_ini()
@@ -633,7 +763,9 @@ class Pcsx2(Emulator):
 
         Polls the PINE status once a second until `RESUME_LOAD_WAIT` runs out.
         Once the VM runs, a requested resume waits `RESUME_LOAD_SETTLE`, then
-        for the state file to exist, then loads it. A process that is still
+        up to `RESUME_STATE_WAIT` for the state file to exist, then loads it.
+        The state wait starts from that point rather than sharing the boot
+        deadline, which a slow boot can have already used up. A process that is still
         alive when the deadline passes without the VM ever running is the
         boot-error-dialog case: PCSX2 does not exit, so nothing else in the
         broker would ever notice; `boot_failed` is set for it. The watchdog
@@ -653,7 +785,7 @@ class Pcsx2(Emulator):
                 if slot is None:
                     return
                 time.sleep(RESUME_LOAD_SETTLE)
-                if not self.wait_for_state(deadline):
+                if not self.wait_for_state(time.monotonic() + RESUME_STATE_WAIT):
                     log.warning("resume: slot %d never got a state file", slot)
                     return
                 if self._launch_seq != seq:
@@ -693,7 +825,8 @@ class Pcsx2(Emulator):
         before = _sstate_snapshot()
         if _pine_request(_PINE_MSG_SAVE_STATE, bytes([STATE_SLOT])) is None:
             return False
-        return _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, STATE_SLOT)
+        pid = self._proc.pid if self._proc is not None else None
+        return _wait_for_sstate_write(before, time.monotonic() + PINE_WAIT, STATE_SLOT, pid)
 
     def load_state(self, slot: int) -> bool:
         """Load the broker's slot over PINE.
