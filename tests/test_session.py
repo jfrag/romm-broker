@@ -12,6 +12,9 @@ from webstation_broker import selkies, session, settings
 
 from .conftest import FakeEmulator
 
+REAL_PUSH_TOKENS = selkies.push_tokens
+"""The real push, captured before conftest's autouse stub replaces it for every test."""
+
 
 def _activate(session_id: str = "sess-1", user: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Start a session on a FakeEmulator with a minimal activate body.
@@ -241,6 +244,7 @@ async def test_a_disconnected_anonymous_seat_is_reclaimed_at_the_cap(monkeypatch
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
     ghost = await session.add_viewer("participant", None)
+    ghost["last_seen"] = 0.0  # long past the grace a just-minted seat gets
 
     arrival = await session.add_viewer("participant", None)
 
@@ -292,6 +296,7 @@ async def test_reclaiming_a_seat_clears_its_speaker_and_mk_ownership(monkeypatch
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     sess = _activate()
     ghost = await session.add_viewer("participant", None)
+    ghost["last_seen"] = 0.0  # long past the grace a just-minted seat gets
     sess["designated_speaker"] = ghost["token"]
     sess["mk_owner_token"] = ghost["token"]
 
@@ -341,6 +346,7 @@ async def test_reclaiming_a_seat_drops_its_rate_limit_cooldowns(monkeypatch: pyt
     monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
     _activate()
     ghost = await session.add_viewer("participant", None)
+    ghost["last_seen"] = 0.0  # long past the grace a just-minted seat gets
     session.ROOM["cooldowns"][ghost["token"]] = {"chat": 1.0}
 
     await session.add_viewer("participant", None)
@@ -401,3 +407,140 @@ async def test_the_token_map_carries_the_gamepad_slot_selkies_routes_on() -> Non
 
     assert tokens[sess["controller_token"]]["slot"] == 1
     assert tokens[viewer["token"]] == {"role": "viewer", "slot": 2, "mk_control": False}
+
+
+async def test_a_seat_that_was_just_handed_out_is_never_reclaimed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An arrival at the cap is refused rather than reclaiming a seat handed out moments ago.
+
+    A seat is minted before its holder has had time to open the room socket, so reclaiming on
+    "not connected" alone would let a burst of arrivals eat each other's seats and admit nobody.
+    """
+    monkeypatch.setattr(settings, "MAX_ROOM_VIEWERS", 1)
+    _activate()
+    fresh = await session.add_viewer("participant", None)
+
+    refused = await session.add_viewer("participant", None)
+
+    assert refused is None
+    assert session.find_viewer(fresh["token"]) is not None
+
+
+async def test_every_public_id_is_the_width_the_media_wire_format_carries() -> None:
+    """Every public id is exactly as wide as the room's media frames assume.
+
+    Room media frames carry the sender's id in a fixed-width prefix and read the frame type from
+    the byte after it, so an id of any other width would misalign every frame for every recipient.
+    """
+    sess = _activate()
+    viewer = await session.add_viewer("participant", {"id": 7, "username": "ana"})
+
+    for public_id in (session.new_public_id(), sess["controller_public_id"], viewer["public_id"]):
+        assert len(public_id.encode("ascii")) == session.PUBLIC_ID_HEX_CHARS
+
+
+def _fake_httpx_client(accepting: set[str], attempted: list[str]) -> type:
+    """Build a stand-in for `httpx.AsyncClient` that only accepts POSTs to `accepting`.
+
+    Args:
+        accepting: The endpoint URLs the stand-in answers successfully.
+        attempted: List every attempted URL is recorded on, in order.
+
+    Returns:
+        A class usable in place of `httpx.AsyncClient`.
+    """
+
+    class _Response:
+        """The bare slice of an httpx response the token push looks at."""
+
+        def raise_for_status(self) -> None:
+            """Accept the response, as a 2xx one does."""
+
+    class _Client:
+        """An async client that answers only the endpoints it was told to accept."""
+
+        def __init__(self, **_kwargs: Any) -> None:
+            """Ignore the client settings the real one takes.
+
+            Args:
+                _kwargs: Timeout and friends, unused here.
+            """
+
+        async def __aenter__(self) -> "_Client":
+            """Enter the async context.
+
+            Returns:
+                The client itself.
+            """
+            return self
+
+        async def __aexit__(self, *_exc: Any) -> bool:
+            """Leave the async context without swallowing anything.
+
+            Args:
+                _exc: The exception triple, unused here.
+
+            Returns:
+                False, so any exception keeps propagating.
+            """
+            return False
+
+        async def post(self, url: str, **_kwargs: Any) -> _Response:
+            """Record the attempt and answer only for an accepted endpoint.
+
+            Args:
+                url: The endpoint being posted to.
+                _kwargs: The body and headers, unused here.
+
+            Returns:
+                A stand-in response.
+
+            Raises:
+                OSError: When `url` is not one of the accepted endpoints.
+            """
+            attempted.append(url)
+            if url not in accepting:
+                raise OSError("connection refused")
+            return _Response()
+
+    return _Client
+
+
+async def test_a_token_push_falls_through_to_the_next_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused endpoint is logged and the next candidate is tried, not left to fail silently."""
+    attempted: list[str] = []
+    monkeypatch.setattr(settings, "SELKIES_TOKEN_URLS", ["http://first/tokens", "http://second/tokens"])
+    monkeypatch.setattr(selkies, "_active_url", None)
+    monkeypatch.setattr(
+        selkies.httpx, "AsyncClient", _fake_httpx_client({"http://second/tokens"}, attempted)
+    )
+    sess = _activate()
+
+    assert await REAL_PUSH_TOKENS(sess) is True
+    assert attempted == ["http://first/tokens", "http://second/tokens"]
+    # Remembered so a steady-state push stops re-probing the endpoint that refused.
+    assert selkies._active_url == "http://second/tokens"
+
+
+async def test_a_token_push_that_fails_everywhere_is_logged_and_retried_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A sweep that fails everywhere retries the last-known-good endpoint and then says so.
+
+    Input routing is left on the map selkies already has, so a push nobody is told about leaves a
+    viewer holding a pad the room believes it took away.
+    """
+    attempted: list[str] = []
+    monkeypatch.setattr(settings, "SELKIES_TOKEN_URLS", ["http://first/tokens", "http://second/tokens"])
+    monkeypatch.setattr(selkies, "_active_url", None)
+    monkeypatch.setattr(selkies, "RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(selkies.httpx, "AsyncClient", _fake_httpx_client(set(), attempted))
+    sess = _activate()
+
+    with caplog.at_level("WARNING", logger="webstation_broker.selkies"):
+        assert await REAL_PUSH_TOKENS(sess) is False
+
+    assert attempted == ["http://first/tokens", "http://second/tokens", "http://first/tokens"]
+    assert "connection refused" in caplog.text
+    assert any(r.levelname == "ERROR" for r in caplog.records)

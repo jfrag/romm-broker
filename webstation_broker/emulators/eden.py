@@ -102,7 +102,16 @@ def _patch_ini() -> None:
 
     A missing file is seeded with just the patched section and Eden fills in
     the rest. Otherwise the file is patched line-wise so every other setting
-    survives untouched. Failures are logged, not raised.
+    survives untouched.
+
+    Raises:
+        OSError: When the file cannot be read, written or replaced.
+        UnicodeDecodeError: When the existing file is not decodable text.
+
+    Both are fatal to a launch rather than a warning to launch past: an
+    unpatched config leaves `confirmStop` on Ask_Always, and the modal that
+    then answers SIGTERM holds the shutdown until the SIGKILL escalation cuts
+    a running game off mid-save.
     """
     try:
         if not INI_PATH.exists():
@@ -156,8 +165,9 @@ def _patch_ini() -> None:
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
-    except Exception:
-        log.exception("qt-config.ini patch failed, broker settings NOT applied")
+    except (OSError, UnicodeDecodeError):
+        log.exception("eden: qt-config.ini patch failed at %s, refusing to launch", INI_PATH)
+        raise
 
 
 class Eden(Emulator):
@@ -165,9 +175,10 @@ class Eden(Emulator):
 
     Eden has no external control API, so the broker patches qt-config.ini
     before every launch (close confirmation off) and boots fullscreen with
-    `-f -g`. SIGTERM goes through Eden's Qt event loop into a normal window
-    close, so the stop is a graceful emulation teardown; SIGINT is never
-    used because Eden maps it to `_exit(1)`.
+    `-f -g`. A patch that fails aborts the launch: the close confirmation is
+    what the whole shutdown path rests on. SIGTERM goes through Eden's Qt
+    event loop into a normal window close, so the stop is a graceful emulation
+    teardown; SIGINT is never used because Eden maps it to `_exit(1)`.
 
     There are no save states: persistence is the game's own save data under
     the virtual NAND, and the archive carries it together with the profile
@@ -219,8 +230,10 @@ class Eden(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                # One unreadable subdirectory must not discard what the other
+                # patterns already found and report the title as unbootable.
+                log.warning("eden: search of %s for %s failed: %s", path, pattern, exc)
         return _pick_rom_file(candidates, path)
 
     def launch(self, rom_path: Path, resume_slot: Optional[int]) -> None:
@@ -229,6 +242,11 @@ class Eden(Emulator):
         Args:
             rom_path: The file to boot.
             resume_slot: Ignored with a log line; Eden has no save states.
+
+        Raises:
+            OSError: When qt-config.ini could not be patched, so nothing is
+                spawned; see `_patch_ini`.
+            UnicodeDecodeError: Likewise, for an undecodable existing file.
         """
         self.stop()
         _patch_ini()

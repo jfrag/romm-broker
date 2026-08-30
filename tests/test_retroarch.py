@@ -258,7 +258,9 @@ class TestResumeGate:
         monkeypatch.setattr(retroarch, "_ensure_core", lambda name, source=None: tmp_path / f"{name}.so")
         monkeypatch.setattr(retroarch, "_ensure_core_assets", lambda assets: None)
         monkeypatch.setattr(retroarch, "_write_broker_cfg", lambda *a: tmp_path / "broker.cfg")
-        monkeypatch.setattr(retroarch.shutil, "which", lambda binary: "/usr/bin/retroarch")
+        monkeypatch.setattr(
+            retroarch.shutil, "which", lambda binary, path=None: "/usr/bin/retroarch"
+        )
         monkeypatch.setattr(retroarch.Retroarch, "stop", lambda self: None)
         monkeypatch.setattr(retroarch.Retroarch, "_spawn_ra", lambda self, cmd, env: None)
 
@@ -502,7 +504,12 @@ class TestSwapDisc:
                 return "GET_STATUS PLAYING dc,Game,0"
             return None
 
+        def fake_write_cmd(cmd: str) -> bool:
+            emulator.sent.append(cmd)
+            return True
+
         monkeypatch.setattr(emulator, "_send", fake_send)
+        monkeypatch.setattr(emulator, "_write_cmd", fake_write_cmd)
         monkeypatch.setattr(emulator, "alive", lambda: True)
 
         playlist = tmp_path / "Game.m3u"
@@ -568,17 +575,13 @@ class TestSwapDisc:
         state = {"alive": True}
         monkeypatch.setattr(emulator, "alive", lambda: state["alive"])
 
-        def fake_send(
-            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
-        ) -> Optional[str]:
+        def fake_write_cmd(cmd: str) -> bool:
             emulator.sent.append(cmd)
-            if cmd == "GET_STATUS":
-                return "GET_STATUS PLAYING dc,Game,0"
             if cmd == "DISK_NEXT":
                 state["alive"] = False
-            return None
+            return True
 
-        monkeypatch.setattr(emulator, "_send", fake_send)
+        monkeypatch.setattr(emulator, "_write_cmd", fake_write_cmd)
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
         assert emulator._disc_index == 0
 
@@ -648,17 +651,13 @@ class TestSwapDisc:
         process's stdin, which reads self._proc live.
         """
 
-        def fake_send(
-            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
-        ) -> Optional[str]:
+        def fake_write_cmd(cmd: str) -> bool:
             emulator.sent.append(cmd)
-            if cmd == "GET_STATUS":
-                return "GET_STATUS PLAYING dc,Game,0"
             if cmd == "DISK_EJECT_TOGGLE":
                 emulator._launch_seq += 1
-            return None
+            return True
 
-        monkeypatch.setattr(emulator, "_send", fake_send)
+        monkeypatch.setattr(emulator, "_write_cmd", fake_write_cmd)
         assert emulator.swap_disc(emulator.tmp_path / "Game (Disc 2).chd") is False
         assert emulator.sent == ["GET_STATUS", "DISK_EJECT_TOGGLE"]
         assert emulator._disc_index == 0
@@ -688,19 +687,15 @@ class TestSwapDisc:
         entered_sequence = threading.Event()
         release_winner = threading.Event()
 
-        def fake_send(
-            cmd: str, wait_prefix: Optional[Union[str, tuple[str, ...]]] = None, timeout: float = 5.0
-        ) -> Optional[str]:
+        def fake_write_cmd(cmd: str) -> bool:
             emulator.sent.append(cmd)
-            if cmd == "GET_STATUS":
-                return "GET_STATUS PLAYING dc,Game,0"
             if cmd == "DISK_EJECT_TOGGLE" and emulator.sent.count("DISK_EJECT_TOGGLE") == 1:
                 # Mid-sequence: let the loser attempt its own swap here.
                 entered_sequence.set()
                 release_winner.wait(timeout=2)
-            return None
+            return True
 
-        monkeypatch.setattr(emulator, "_send", fake_send)
+        monkeypatch.setattr(emulator, "_write_cmd", fake_write_cmd)
 
         results = {}
 

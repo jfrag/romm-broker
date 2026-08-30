@@ -38,16 +38,16 @@ import subprocess
 import tempfile
 import time
 import zipfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Lock
 from typing import Optional
 
+from .. import settings
 from .base import Emulator, base_launch_env
 
 log = logging.getLogger(__name__)
-
-ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
-"""Library root ROM paths resolve under (env `ROM_ROOT`, default `/romm`)."""
 
 XDG_DATA_HOME = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local/share")
 """The XDG data root, `~/.local/share` when `XDG_DATA_HOME` is unset."""
@@ -141,6 +141,23 @@ PKG_EXTRACTOR_BIN = os.environ.get("SHADPS4_PKG_EXTRACTOR_BIN", "pkg_extractor")
 PKG_EXTRACT_TIMEOUT = float(os.environ.get("SHADPS4_PKG_EXTRACT_TIMEOUT", "1800"))
 """Seconds a pkg_extractor run gets before it is considered hung (env `SHADPS4_PKG_EXTRACT_TIMEOUT`)."""
 
+PKG_EXPANSION_FACTOR = float(os.environ.get("SHADPS4_PKG_EXPANSION_FACTOR", "1.1"))
+"""Assumed extracted-size to .pkg-size ratio (env `SHADPS4_PKG_EXPANSION_FACTOR`, default 1.1).
+
+A PS4 .pkg is already compressed per-file, so pkg_extractor's output lands
+close to the package's own size; the margin covers the filesystem overhead of
+many small files. It is only an estimate, so `_check_expansion` reports a
+title that outgrows it instead of letting the space guards look like they
+held.
+"""
+ARCHIVE_PEAK_FACTOR = float(os.environ.get("SHADPS4_ARCHIVE_PEAK_FACTOR", "2.2"))
+"""Assumed peak-on-disk to archive-size ratio (env `SHADPS4_ARCHIVE_PEAK_FACTOR`, default 2.2).
+
+An archive holds its unpacked .pkg and pkg_extractor's output at the same
+moment, so the disk carries roughly twice `PKG_EXPANSION_FACTOR` at the height
+of the run even though only the output survives.
+"""
+
 # PS4 titles run several GB decrypted, so a .pkg is extracted once into
 # CACHE_DIR and reused on every later launch. CACHE_ENABLED therefore gates
 # whether .pkg/archive ROMs are bootable at all, not just whether the
@@ -162,6 +179,46 @@ both work off location rather than guessing from a filename.
 # CACHE_DIR tree, so one launch's eviction can't rmtree a directory another
 # launch is mid-extracting into or about to boot from.
 _CACHE_LOCK = Lock()
+
+_CACHE_LOCK_WAIT = float(os.environ.get("SHADPS4_CACHE_LOCK_WAIT", "120"))
+"""Seconds a caller waits for `_CACHE_LOCK` before giving up (env `SHADPS4_CACHE_LOCK_WAIT`).
+
+The lock is held for a whole extraction, which is bounded only by
+`PKG_EXTRACT_TIMEOUT` (1800 s by default). An untimed acquire would park a
+second launch's request thread for that long with nothing to show for it, so
+it gives up and says why instead.
+"""
+
+_CONFIG_LOCK = Lock()
+"""Serializes the read/modify/write of shadPS4's config.json across launch threads."""
+
+
+@contextmanager
+def _cache_lock(what: str) -> Iterator[None]:
+    """Hold `_CACHE_LOCK` for the block, giving up after `_CACHE_LOCK_WAIT`.
+
+    Args:
+        what: The operation waiting for the lock, named in the log and the error.
+
+    Yields:
+        Nothing; the lock is released when the block ends.
+
+    Raises:
+        RuntimeError: When the lock is still held elsewhere after `_CACHE_LOCK_WAIT`.
+    """
+    if not _CACHE_LOCK.acquire(timeout=_CACHE_LOCK_WAIT):
+        log.error(
+            "shadps4 cache: %s gave up after waiting %.0fs for the cache lock",
+            what, _CACHE_LOCK_WAIT,
+        )
+        raise RuntimeError(
+            f"another shadps4 extraction is still running; {what} waited "
+            f"{_CACHE_LOCK_WAIT:.0f}s for the extraction cache"
+        )
+    try:
+        yield
+    finally:
+        _CACHE_LOCK.release()
 
 BIN_NAME = os.environ.get("SHADPS4_BIN_NAME", "Shadps4-sdl.AppImage")
 """The binary looked for inside a release folder (env `SHADPS4_BIN_NAME`, default `Shadps4-sdl.AppImage`).
@@ -373,6 +430,40 @@ def _require_room(peak_bytes: int, kept_bytes: int, rom_name: str) -> None:
         )
 
 
+def _check_expansion(actual_bytes: int, reserved_bytes: int, rom_name: str) -> None:
+    """Report an extraction that outgrew the room reserved for it, refusing an unkeepable one.
+
+    `_require_room` sizes both space guards from `PKG_EXPANSION_FACTOR`, an
+    assumption about how far a .pkg expands rather than a measurement. A title
+    that expands further has already slipped past the free-space guard by the
+    time the extraction finishes, so the mismatch is named here instead of
+    passing for a normal run, and a result too big for the cap is refused
+    rather than cached over it.
+
+    Args:
+        actual_bytes: What the finished extraction occupies.
+        reserved_bytes: What `_require_room` charged the cache cap for it.
+        rom_name: The ROM being extracted, named in the log and the error.
+
+    Raises:
+        RuntimeError: If the finished extraction is larger than CACHE_MAX_GB.
+    """
+    if actual_bytes <= reserved_bytes:
+        return
+    log.error(
+        "shadps4 cache: %s extracted to %.2f GB, past the %.2f GB reserved for it; "
+        "SHADPS4_PKG_EXPANSION_FACTOR (%.2f) is too low for this title, so the "
+        "free-space guard was sized short",
+        rom_name, actual_bytes / _GB, reserved_bytes / _GB, PKG_EXPANSION_FACTOR,
+    )
+    max_bytes = int(CACHE_MAX_GB * _GB)
+    if actual_bytes > max_bytes:
+        raise RuntimeError(
+            f"{rom_name} extracted to about {actual_bytes / _GB:.1f} GB, more than "
+            f"SHADPS4_CACHE_MAX_GB ({CACHE_MAX_GB:.0f} GB) allows"
+        )
+
+
 def _cache_key(rom: Path) -> str:
     """Cache dir name for rom (a .pkg or an archive).
 
@@ -401,14 +492,37 @@ def _run_extractor(cmd: list[str], what: str) -> str:
     return result.stdout
 
 
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+"""Matches a control character in an archive member name."""
+_7Z_SEPARATOR_RE = re.compile(r"^-{5,}\s*$")
+"""Matches the dashed line `7z l -slt` puts between the archive header and its members."""
+_7Z_PATH_PREFIX = "Path = "
+"""Prefix of the `7z l -slt` line carrying one member's full path."""
+
+
 def _reject_unsafe_members(dest: Path, members: list[str]) -> None:
     """Reject any archive member whose path would land outside dest.
 
     A `../` (or absolute) member path can escape dest on extraction (Zip
-    Slip); this is checked before anything is written.
+    Slip); this is checked before anything is written. A name carrying a
+    control character is refused as well: the .rar/.7z member lists are read
+    back out of a line-based text listing, so a name holding a newline (or
+    anything else that does not survive that round trip) cannot be checked as
+    the path the archive really holds.
+
+    Args:
+        dest: The directory the extraction must stay under.
+        members: Member paths as the archive names them.
+
+    Raises:
+        RuntimeError: On the first member that escapes dest or carries a
+            control character.
     """
     dest_real = dest.resolve()
     for member in members:
+        if _CONTROL_CHAR_RE.search(member):
+            log.error("shadps4: archive member name holds a control character: %r", member)
+            raise RuntimeError(f"archive member name holds a control character: {member!r}")
         target = (dest / member).resolve()
         if target != dest_real and dest_real not in target.parents:
             raise RuntimeError(f"archive member escapes extraction dir: {member}")
@@ -429,21 +543,61 @@ def _rar_member_paths(archive: Path) -> list[str]:
 
     Bare paths from `unrar lb`, one per line, no header or column
     formatting to parse around.
+
+    Args:
+        archive: The .rar to list.
+
+    Returns:
+        One path per member.
+
+    Raises:
+        RuntimeError: When the listing names no member. `_reject_unsafe_members`
+            checks exactly this list, so an empty parse would wave the whole
+            archive through unchecked and has to stop the extraction instead.
     """
     listing = _run_extractor(["unrar", "lb", "-y", str(archive)], f"unrar list ({archive.name})")
-    return [line for line in listing.splitlines() if line]
+    members = [line for line in listing.splitlines() if line.strip()]
+    if not members:
+        log.error("shadps4: unrar listed no members in %s", archive.name)
+        raise RuntimeError(f"unrar listed no members in {archive.name}")
+    return members
 
 
 def _7z_member_paths(archive: Path) -> list[str]:
     """List member paths from an archive.
 
     Parsed from `7z l -slt`, the only 7z listing mode that gives a full
-    untruncated path per entry. Everything before the `----------`
-    separator describes the archive itself, not its contents.
+    untruncated path per entry. Everything before the dashed separator line
+    describes the archive itself, not its contents.
+
+    Args:
+        archive: The .7z, or any other archive 7z can identify, to list.
+
+    Returns:
+        One path per member.
+
+    Raises:
+        RuntimeError: When the listing carries no separator line or names no
+            member. `_reject_unsafe_members` checks exactly this list, so a
+            listing shaped differently than expected (another 7z build, a
+            localized one) has to stop the extraction rather than wave every
+            member through unchecked.
     """
     listing = _run_extractor(["7z", "l", "-slt", str(archive)], f"7z list ({archive.name})")
-    _, _, body = listing.partition("----------\n")
-    return [line[len("Path = ") :] for line in body.splitlines() if line.startswith("Path = ")]
+    lines = listing.splitlines()
+    body: Optional[list[str]] = None
+    for i, line in enumerate(lines):
+        if _7Z_SEPARATOR_RE.match(line):
+            body = lines[i + 1:]
+            break
+    if body is None:
+        log.error("shadps4: 7z listing of %s has no member section", archive.name)
+        raise RuntimeError(f"7z listing of {archive.name} has no member section")
+    members = [line[len(_7Z_PATH_PREFIX):] for line in body if line.startswith(_7Z_PATH_PREFIX)]
+    if not members:
+        log.error("shadps4: 7z listed no members in %s", archive.name)
+        raise RuntimeError(f"7z listed no members in {archive.name}")
+    return members
 
 
 def _reject_escaped_tree(dest: Path) -> None:
@@ -458,8 +612,19 @@ def _reject_escaped_tree(dest: Path) -> None:
     result: any symlink whose target resolves outside dest, or any entry
     not contained under dest at all, means the extractor's own traversal
     protection didn't hold.
+
+    Every offender is logged with the host path it points at, because that is
+    where the extractor may have written and it is the one thing the caller
+    cannot clean up on its own judgement.
+
+    Args:
+        dest: The directory the extraction was confined to.
+
+    Raises:
+        RuntimeError: If any entry resolves outside dest or cannot be resolved.
     """
     dest_real = dest.resolve()
+    escaped: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(dest, followlinks=False):
         base = Path(dirpath)
         for name in dirnames + filenames:
@@ -469,7 +634,30 @@ def _reject_escaped_tree(dest: Path) -> None:
             except OSError as exc:
                 raise RuntimeError(f"could not resolve extracted member {p}: {exc}") from exc
             if target_real != dest_real and dest_real not in target_real.parents:
-                raise RuntimeError(f"extracted member escapes cache dir: {p}")
+                log.error("shadps4: extracted member %s points outside %s, at %s", p, dest, target_real)
+                escaped.append(p)
+    if escaped:
+        raise RuntimeError(f"extracted member escapes cache dir: {escaped[0]}")
+
+
+def _purge_extraction(dest: Path, what: str) -> None:
+    """Empty an extraction directory whose contents failed the escape check.
+
+    Only what sits under dest can be reclaimed. A member the tool wrote
+    through an escaping symlink landed on a host path that already belonged to
+    something else, and deleting that would finish what the archive started,
+    so those are named in the log for an operator to judge instead.
+
+    Args:
+        dest: The extraction directory to empty.
+        what: The archive being extracted, named in the log.
+    """
+    log.error("shadps4: discarding the unsafe extraction of %s under %s", what, dest)
+    shutil.rmtree(dest, ignore_errors=True)
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("shadps4: could not recreate the extraction dir %s: %s", dest, exc)
 
 
 def _extract_archive(archive: Path, dest: Path) -> None:
@@ -490,7 +678,13 @@ def _extract_archive(archive: Path, dest: Path) -> None:
         _reject_unsafe_members(dest, _7z_member_paths(archive))
         _run_extractor(["7z", "x", "-y", str(archive), f"-o{dest}"], f"7z ({archive.name})")
     if ext != ".zip":
-        _reject_escaped_tree(dest)
+        try:
+            _reject_escaped_tree(dest)
+        except RuntimeError:
+            # unrar/7z have already written by the time this runs, so what
+            # they left goes rather than staying for a later launch to boot.
+            _purge_extraction(dest, archive.name)
+            raise
 
 
 def _run_pkg_extractor(pkg: Path, dest: Path) -> None:
@@ -545,8 +739,11 @@ def sweep_stale_extractions() -> None:
     startup so the space is reclaimed before the first launch rather than
     only when the next extraction happens to run.
     """
-    with _CACHE_LOCK:
-        _clear_scratch()
+    try:
+        with _cache_lock("startup scratch sweep"):
+            _clear_scratch()
+    except RuntimeError as exc:
+        log.warning("shadps4 cache: startup scratch sweep skipped: %s", exc)
 
 
 def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
@@ -566,7 +763,9 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
     Holds _CACHE_LOCK for the whole call: eviction, extraction, and the
     boot-target lookup all touch the same CACHE_DIR tree, so a second
     launch racing in here must wait rather than potentially evicting the
-    directory this one is mid-extracting into or about to boot from.
+    directory this one is mid-extracting into or about to boot from. The
+    wait is bounded by `_CACHE_LOCK_WAIT`, since the lock is held for as
+    long as an extraction takes.
 
     Args:
         rom: The .pkg or archive to extract.
@@ -575,13 +774,14 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
             returning or raising.
 
     Raises:
-        RuntimeError: If the extraction cannot fit in the cache or on the
-            disk, archive extraction or pkg_extractor fails, the archive
-            holds no .pkg, the extraction holds no eboot.bin, or the finished
-            extraction cannot be moved to its cache key.
+        RuntimeError: If another extraction still holds the cache lock, the
+            extraction cannot fit in the cache or on the disk, archive
+            extraction or pkg_extractor fails, the archive holds no .pkg, the
+            extraction holds no eboot.bin, it outgrew the whole cache cap, or
+            it cannot be moved to its cache key.
         OSError: If CACHE_DIR or a scratch dir cannot be created at all.
     """
-    with _CACHE_LOCK:
+    with _cache_lock(rom.name):
         key = _cache_key(rom)
         game_dir = CACHE_DIR / key
 
@@ -608,8 +808,8 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
             # staged output living under CACHE_DIR at the same time; only the
             # output survives, so the two figures differ for an archive and
             # coincide for a bare .pkg.
-            kept = int(size * 1.1)
-            peak = int(size * 2.2) if is_archive else kept
+            kept = int(size * PKG_EXPANSION_FACTOR)
+            peak = int(size * ARCHIVE_PEAK_FACTOR) if is_archive else kept
             CACHE_DIR.mkdir(parents=True, exist_ok=True)
             # Orphaned scratch is un-evictable but still counts toward the
             # cap, so reclaim it before sizing the cache rather than letting
@@ -640,6 +840,7 @@ def _extract_and_cache_pkg(rom: Path, emulator: Emulator) -> Path:
                     _run_pkg_extractor(rom, staged)
                 if _extracted_boot_target(staged) is None:
                     raise RuntimeError(f"{rom.name} extracted but held no eboot.bin")
+                _check_expansion(_extracted_dir_size(staged), kept, rom.name)
                 # The rmtree above uses ignore_errors, so game_dir can still
                 # be sitting there non-empty and the rename then fails.
                 try:
@@ -760,6 +961,42 @@ def _detect_gpu_id() -> Optional[int]:
         return _DETECTED_GPU_ID
 
 
+def _write_config(cfg: dict, mode: int) -> bool:
+    """Replace config.json with `cfg`, through a temp file in the same directory.
+
+    A truncating in-place write that fails part way (full disk, killed
+    process) would leave shadPS4 a half-written config.json and lose every
+    setting in it. The temp file is uniquely named rather than a fixed `.tmp`
+    sibling, so two brokers pinning at once cannot write the same scratch path
+    and rename half of each other's file into place.
+
+    Args:
+        cfg: The config to serialize.
+        mode: Permission bits to give the replacement, normally the ones the
+            config already had; mkstemp creates it owner-only.
+
+    Returns:
+        True when config.json now holds `cfg`, False when it was left alone.
+    """
+    parent = SHADPS4_CONFIG_PATH.parent
+    try:
+        fd, name = tempfile.mkstemp(dir=str(parent), prefix=f".{SHADPS4_CONFIG_PATH.name}.", suffix=".tmp")
+    except OSError as exc:
+        log.warning("shadps4: could not stage a config rewrite in %s (%s)", parent, exc)
+        return False
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(cfg, indent=2))
+        os.chmod(tmp, mode)
+        os.replace(tmp, SHADPS4_CONFIG_PATH)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        log.warning("shadps4: could not rewrite %s (%s)", SHADPS4_CONFIG_PATH, exc)
+        return False
+    return True
+
+
 def _pin_gpu_id() -> None:
     """Force `Vulkan.gpu_id` in config.json to a real GPU before launch.
 
@@ -767,7 +1004,17 @@ def _pin_gpu_id() -> None:
     is `-1`, the auto-select that can land on a software device, so a brand
     new container can still hit the bug on its very first launch, same as
     xemu's renderer pin leaves a missing xemu.toml alone.
+
+    `_CONFIG_LOCK` is held across the read and the write so two launches
+    pinning at once cannot each write the config they read before the other's
+    edit landed.
     """
+    with _CONFIG_LOCK:
+        _pin_gpu_id_locked()
+
+
+def _pin_gpu_id_locked() -> None:
+    """The body of `_pin_gpu_id`; callers must hold `_CONFIG_LOCK`."""
     setting = SHADPS4_GPU_ID.strip()
     if setting.upper() in ("", "KEEP", "-1"):
         log.debug("shadps4 gpu_id pin disabled (SHADPS4_GPU_ID=%r)", SHADPS4_GPU_ID)
@@ -778,6 +1025,7 @@ def _pin_gpu_id() -> None:
     # and it saves the vulkaninfo subprocess on that path entirely.
     try:
         text = SHADPS4_CONFIG_PATH.read_text(encoding="utf-8")
+        mode = SHADPS4_CONFIG_PATH.stat().st_mode & 0o777
     except OSError as exc:
         log.debug("could not read %s to pin gpu_id (%s)", SHADPS4_CONFIG_PATH, exc)
         return
@@ -811,16 +1059,8 @@ def _pin_gpu_id() -> None:
     if vulkan.get("gpu_id") == gpu_id:
         return
     vulkan["gpu_id"] = gpu_id
-    # Written through a temp file: a truncating in-place write that fails
-    # part way (full disk, killed process) would leave shadPS4 with a
-    # half-written config.json and lose every setting in it.
-    tmp = SHADPS4_CONFIG_PATH.with_suffix(".tmp")
-    try:
-        tmp.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-        tmp.replace(SHADPS4_CONFIG_PATH)
-    except OSError as exc:
-        tmp.unlink(missing_ok=True)
-        log.warning("shadps4: could not pin gpu_id into %s (%s)", SHADPS4_CONFIG_PATH, exc)
+    if not _write_config(cfg, mode):
+        log.warning("shadps4: gpu_id %d was NOT pinned into %s", gpu_id, SHADPS4_CONFIG_PATH)
         return
     log.info("shadps4: pinned Vulkan.gpu_id=%d in %s", gpu_id, SHADPS4_CONFIG_PATH)
 
@@ -888,10 +1128,22 @@ class Shadps4(Emulator):
         Returns:
             The file itself, the folder's `eboot.bin`, the folder when it
             has none (shadPS4 appends eboot.bin to directory paths itself),
-            or None when the path does not exist, or is a `.pkg`/archive
-            with the extraction cache disabled.
+            or None when the path does not exist, resolves outside the ROM
+            library root, or is a `.pkg`/archive with the extraction cache
+            disabled.
         """
+        rom_root = settings.rom_root()
         if path.is_file():
+            # Defense in depth: api.py validates the activate payload's path,
+            # but a symlinked ROM file would otherwise reach both shadps4 and
+            # pkg_extractor on the word of whichever caller passed it in.
+            try:
+                if not path.resolve().is_relative_to(rom_root):
+                    log.warning("shadps4: refusing %s, it resolves outside %s", path, rom_root)
+                    return None
+            except OSError as exc:
+                log.warning("shadps4: could not resolve %s (%s)", path, exc)
+                return None
             if not CACHE_ENABLED and path.suffix.lower() in (".pkg",) + _ARCHIVE_EXTS:
                 log.warning(
                     "shadps4: refusing %s, %s needs the extraction cache "
@@ -906,9 +1158,10 @@ class Shadps4(Emulator):
         eboot = path / "eboot.bin"
         try:
             if eboot.is_file():
-                if eboot.resolve().is_relative_to(ROM_ROOT):
+                if eboot.resolve().is_relative_to(rom_root):
                     return eboot
-                return None  # symlink escapes ROM_ROOT
+                log.warning("shadps4: refusing %s, it resolves outside %s", eboot, rom_root)
+                return None
             if eboot.exists() or eboot.is_symlink():
                 # present but not a regular file: dangling symlink, or a
                 # symlink to a directory/device/fifo. is_file() misses these,

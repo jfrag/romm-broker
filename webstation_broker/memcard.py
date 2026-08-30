@@ -94,7 +94,8 @@ def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[by
 
     Returns:
         The zip bytes, None when the slot holds no card, or an error string when
-        the slot holds a single-file card or the card exceeds `SAVE_FILE_MAX_BYTES`.
+        the slot holds a single-file card, the card exceeds `SAVE_FILE_MAX_BYTES`,
+        or one of its files could not be read.
     """
     if card.exists() and not card.is_dir():
         return _FILE_CARD_ERROR
@@ -122,7 +123,14 @@ def build_archive(card: Path, marker: Optional[str] = None) -> Optional[Union[by
             try:
                 zf.write(p, p.relative_to(card).as_posix())
             except OSError as exc:
-                log.warning("memcard: could not read %s: %s", p, exc)
+                # A card only means anything whole: `replace` wipes the live
+                # card before laying an image down, so an image missing a file
+                # is a card missing a save, with nothing to tell it apart from
+                # a complete one afterwards.
+                log.error(
+                    "memcard: could not read %s, refusing to ship a partial card: %s", p, exc
+                )
+                return "memory card could not be read in full"
     return buf.getvalue()
 
 

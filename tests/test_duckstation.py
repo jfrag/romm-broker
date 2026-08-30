@@ -194,10 +194,14 @@ def test_patch_ini_adds_a_missing_section_entirely(duckstation_dirs: dict[str, P
     assert "CheckAtStartup = false" in text
 
 
-def test_patch_ini_leaves_the_existing_file_untouched_when_the_tmp_write_fails(
+def test_patch_ini_raises_and_leaves_the_existing_file_untouched(
     duckstation_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Patching leaves the existing ini file untouched when the tmp-file write fails."""
+    """A failed patch aborts the launch and leaves the existing ini as it was.
+
+    Proceeding would run the session with SaveStateOnExit off, so the whole
+    session's progress is lost at exit with only a log line to say why.
+    """
     original = "[Main]\nSetupWizardIncomplete = false\nSomeOtherSetting = 5\n"
     duckstation.INI_PATH.write_text(original)
     real_write_text = Path.write_text
@@ -209,7 +213,8 @@ def test_patch_ini_leaves_the_existing_file_untouched_when_the_tmp_write_fails(
 
     monkeypatch.setattr(Path, "write_text", guarded)
 
-    duckstation._patch_ini()  # must not raise
+    with pytest.raises(RuntimeError, match="broker settings"):
+        duckstation._patch_ini()
 
     assert duckstation.INI_PATH.read_text() == original
 
@@ -222,17 +227,42 @@ def test_resume_snapshot_is_empty_without_a_savestates_dir(duckstation_dirs: dic
     assert duckstation._resume_snapshot() == {}
 
 
-def test_newest_resume_state_picks_the_highest_mtime(duckstation_dirs: dict[str, Path]) -> None:
-    """Newest resume state picks the file with the highest mtime."""
+def test_changed_resume_state_picks_the_newest_of_several_writes(
+    duckstation_dirs: dict[str, Path]
+) -> None:
+    """Among several states written this session, the highest mtime wins."""
+    before = duckstation._resume_snapshot()
     _touch(duckstation.SSTATE_DIR / "SLUS-00001_resume.sav", mtime=1000)
     newest = _touch(duckstation.SSTATE_DIR / "SLUS-00002_resume.sav", mtime=3000)
 
-    assert duckstation._newest_resume_state() == newest
+    assert duckstation._changed_resume_state(before) == newest
 
 
-def test_newest_resume_state_is_none_with_no_resume_files(duckstation_dirs: dict[str, Path]) -> None:
-    """Newest resume state is None when no resume files exist."""
-    assert duckstation._newest_resume_state() is None
+def test_changed_resume_state_ignores_another_games_untouched_state(
+    duckstation_dirs: dict[str, Path]
+) -> None:
+    """A state already on disk and not rewritten is never claimed as this session's.
+
+    The savestates directory is shared across titles, so picking the newest
+    file outright hands DuckStation another game's state on the next resume.
+    """
+    stale = _touch(duckstation.SSTATE_DIR / "SLUS-90001_resume.sav", mtime=9000)
+    before = duckstation._resume_snapshot()
+
+    assert duckstation._changed_resume_state(before) is None
+
+    mine = _touch(duckstation.SSTATE_DIR / "SLUS-00002_resume.sav", mtime=1000)
+    # Lower mtime than the untouched one, but it is the only file this
+    # session actually wrote.
+    assert duckstation._changed_resume_state(before) == mine
+    assert stale.exists()
+
+
+def test_changed_resume_state_is_none_with_no_resume_files(
+    duckstation_dirs: dict[str, Path]
+) -> None:
+    """Changed resume state is None when no resume files exist."""
+    assert duckstation._changed_resume_state({}) is None
 
 
 def test_changed_resume_state_finds_the_file_that_appeared(duckstation_dirs: dict[str, Path]) -> None:

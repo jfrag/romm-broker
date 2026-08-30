@@ -12,6 +12,7 @@ from typing import NoReturn, Optional
 
 import pytest
 
+from webstation_broker import settings
 from webstation_broker.emulators import base, shadps4
 
 
@@ -32,11 +33,60 @@ def _isolated_gpu_pin(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
 
 @pytest.fixture
 def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    """Point shadps4's ROM_ROOT at a fresh temporary directory."""
+    """Point the ROM library root at a fresh temporary directory."""
     root = tmp_path / "romm"
     root.mkdir()
-    monkeypatch.setattr(shadps4, "ROM_ROOT", root)
+    monkeypatch.setattr(settings, "ROM_ROOT", root)
     return root
+
+
+def test_resolve_refuses_a_rom_file_that_symlinks_out_of_the_rom_root(
+    rom_root: Path, tmp_path: Path
+) -> None:
+    """A ROM file that resolves outside the ROM root is refused.
+
+    The file branch used to hand the path straight to shadPS4 and, for a
+    .pkg, to pkg_extractor, on the word of whichever caller passed it in.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"not a game")
+    linked = rom_root / "Game.bin"
+    linked.symlink_to(secret)
+
+    assert shadps4.Shadps4().resolve_rom_file(linked) is None
+
+
+def test_resolve_refuses_a_pkg_that_symlinks_out_of_the_rom_root(
+    rom_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A .pkg pointing outside the ROM root is refused even with the cache on.
+
+    With caching enabled the path goes on to pkg_extractor, so containment has
+    to be decided before the format is.
+    """
+    monkeypatch.setattr(shadps4, "CACHE_ENABLED", True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.pkg"
+    secret.write_bytes(b"not a game")
+    linked = rom_root / "Game.pkg"
+    linked.symlink_to(secret)
+
+    assert shadps4.Shadps4().resolve_rom_file(linked) is None
+
+
+def test_resolve_accepts_a_rom_file_that_symlinks_inside_the_rom_root(rom_root: Path) -> None:
+    """A ROM file symlinked to another path inside the ROM root still boots."""
+    shared = rom_root / "SharedAssets"
+    shared.mkdir()
+    real = shared / "eboot.bin"
+    real.write_bytes(b"game")
+    linked = rom_root / "Game.bin"
+    linked.symlink_to(real)
+
+    assert shadps4.Shadps4().resolve_rom_file(linked) == linked
 
 
 def test_resolve_refuses_an_eboot_that_symlinks_out_of_the_rom_root(
@@ -334,9 +384,59 @@ def test_an_unwritable_config_is_left_as_it_was(
     def fail(*args: object, **kwargs: object) -> NoReturn:
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(Path, "write_text", fail)
+    monkeypatch.setattr(shadps4.tempfile, "mkstemp", fail)
     shadps4._pin_gpu_id()
     assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == -1
+
+
+def test_the_config_is_swapped_in_and_leaves_no_scratch_file(pinned: Path) -> None:
+    """The pin renames its replacement into place and leaves nothing beside it.
+
+    A truncating write that dies half way costs shadPS4 every setting in the
+    file, and a fixed `.tmp` sibling lets two pins write the same scratch path
+    and rename half of each other's config in.
+    """
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    shadps4._pin_gpu_id()
+
+    assert json.loads(pinned.read_text())["Vulkan"]["gpu_id"] == 0
+    assert [p.name for p in pinned.parent.iterdir()] == [pinned.name]
+
+
+def test_two_concurrent_pins_leave_a_readable_config(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins racing each other still leave one whole config behind."""
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}, "General": {"volume": 50}}))
+    real_replace = os.replace
+
+    def slow_replace(src: object, dst: object) -> None:
+        time.sleep(0.05)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(shadps4.os, "replace", slow_replace)
+    threads = [threading.Thread(target=shadps4._pin_gpu_id) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    cfg = json.loads(pinned.read_text())
+    assert cfg["Vulkan"]["gpu_id"] == 0
+    assert cfg["General"]["volume"] == 50
+
+
+def test_the_config_keeps_its_permissions_across_a_pin(pinned: Path) -> None:
+    """The replacement config carries the mode the original had.
+
+    mkstemp creates its file owner-only, which would lock shadPS4 out of a
+    config it shares.
+    """
+    pinned.write_text(json.dumps({"Vulkan": {"gpu_id": -1}}))
+    os.chmod(pinned, 0o640)
+    shadps4._pin_gpu_id()
+
+    assert pinned.stat().st_mode & 0o777 == 0o640
 
 
 def test_an_invalid_gpu_id_env_value_is_left_alone(
@@ -1711,3 +1811,188 @@ def test_the_cache_is_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> No
     """The cache is disabled by default when SHADPS4_CACHE_ENABLED is unset."""
     monkeypatch.delenv("SHADPS4_CACHE_ENABLED", raising=False)
     assert shadps4._truthy(os.environ.get("SHADPS4_CACHE_ENABLED", "false")) is False
+
+
+# ── archive listings must fail closed ──────────────────────────────────
+
+
+def test_rar_member_paths_raises_when_the_listing_names_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unrar listing with no members stops the extraction.
+
+    An empty parse used to reach `_reject_unsafe_members` as an empty list,
+    which approves every member in the archive without checking one.
+    """
+    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: "\n  \n\n")
+
+    with pytest.raises(RuntimeError, match="listed no members"):
+        shadps4._rar_member_paths(tmp_path / "Game.rar")
+
+
+def test_rar_member_paths_returns_the_listed_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal unrar listing yields one path per member."""
+    monkeypatch.setattr(
+        shadps4, "_run_extractor", lambda cmd, what: "Game/CUSA23079.pkg\nGame/readme.txt\n"
+    )
+
+    assert shadps4._rar_member_paths(tmp_path / "Game.rar") == [
+        "Game/CUSA23079.pkg",
+        "Game/readme.txt",
+    ]
+
+
+def test_7z_member_paths_raises_when_the_listing_has_no_separator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 7z listing shaped differently than expected stops the extraction.
+
+    Without the dashed separator there is no member section to parse, so
+    every path in the archive would go unchecked.
+    """
+    monkeypatch.setattr(
+        shadps4, "_run_extractor", lambda cmd, what: "7-Zip 24.09\n\nListing archive: Game.7z\n"
+    )
+
+    with pytest.raises(RuntimeError, match="no member section"):
+        shadps4._7z_member_paths(tmp_path / "Game.7z")
+
+
+def test_7z_member_paths_raises_when_the_member_section_is_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 7z member section holding no Path line stops the extraction."""
+    listing = "7-Zip 24.09\n----------\nSize = 10\nAttributes = A\n"
+    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: listing)
+
+    with pytest.raises(RuntimeError, match="listed no members"):
+        shadps4._7z_member_paths(tmp_path / "Game.7z")
+
+
+def test_7z_member_paths_returns_the_listed_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A normal 7z -slt listing yields one path per member, header skipped."""
+    listing = (
+        "7-Zip 24.09\n"
+        "Path = Game.7z\n"
+        "----------\n"
+        "Path = Game/CUSA23079.pkg\n"
+        "Size = 4096\n"
+        "\n"
+        "Path = Game/readme.txt\n"
+        "Size = 12\n"
+    )
+    monkeypatch.setattr(shadps4, "_run_extractor", lambda cmd, what: listing)
+
+    assert shadps4._7z_member_paths(tmp_path / "Game.7z") == [
+        "Game/CUSA23079.pkg",
+        "Game/readme.txt",
+    ]
+
+
+def test_reject_unsafe_members_raises_on_a_control_character_name(tmp_path: Path) -> None:
+    """A member name carrying a newline is refused.
+
+    The .rar/.7z member lists are read back out of a line-based listing, so a
+    name holding a newline cannot be checked as the path the archive holds.
+    """
+    with pytest.raises(RuntimeError, match="control character"):
+        shadps4._reject_unsafe_members(tmp_path, ["ok.pkg\n../../etc/evil"])
+
+
+def test_extract_archive_discards_a_tree_that_escaped_dest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An escaping extraction is emptied instead of being left for a later boot."""
+    outside = _touch(tmp_path / "outside.pkg")
+    archive = tmp_path / "Game.7z"
+    archive.write_bytes(b"")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    monkeypatch.setattr(shadps4, "_7z_member_paths", lambda a: ["CUSA23079.pkg"])
+
+    def fake_run_extractor(cmd: list, what: str) -> str:
+        (dest / "CUSA23079.pkg").write_bytes(b"pkg data")
+        (dest / "escaped.pkg").symlink_to(outside)
+        return ""
+
+    monkeypatch.setattr(shadps4, "_run_extractor", fake_run_extractor)
+
+    with pytest.raises(RuntimeError, match="escapes cache dir"):
+        shadps4._extract_archive(archive, dest)
+
+    assert list(dest.iterdir()) == []
+    assert outside.exists()
+
+
+# ── cache lock and expansion accounting ────────────────────────────────
+
+
+def test_the_cache_lock_gives_up_rather_than_parking_a_request(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that cannot take the cache lock is told so instead of blocking.
+
+    The lock is held for a whole extraction, bounded only by the 1800 s
+    extraction timeout, so an untimed acquire would park a second launch's
+    request thread for that long.
+    """
+    monkeypatch.setattr(shadps4, "_CACHE_LOCK_WAIT", 0.05)
+    with shadps4._cache_lock("first"):
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="still running"):
+            with shadps4._cache_lock("second"):
+                pass
+        waited = time.monotonic() - started
+
+    assert waited < 5
+
+
+def test_the_cache_lock_is_released_when_the_block_raises() -> None:
+    """A failed extraction does not leave the cache lock held forever."""
+    with pytest.raises(ValueError):
+        with shadps4._cache_lock("boom"):
+            raise ValueError("extraction failed")
+
+    assert shadps4._CACHE_LOCK.acquire(timeout=0.1)
+    shadps4._CACHE_LOCK.release()
+
+
+def test_an_extraction_inside_its_reservation_is_not_reported(
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    """An extraction that fit the room reserved for it says nothing."""
+    with caplog.at_level("ERROR"):
+        shadps4._check_expansion(actual_bytes=100, reserved_bytes=200, rom_name="Game.pkg")
+
+    assert caplog.records == []
+
+
+def test_an_extraction_past_its_reservation_is_reported(
+    caplog: pytest.LogCaptureFixture
+) -> None:
+    """An extraction that outgrew its reservation names the factor that sized it.
+
+    The free-space guard was sized from that factor, so the run already
+    slipped past it; nothing else would report that.
+    """
+    with caplog.at_level("ERROR"):
+        shadps4._check_expansion(actual_bytes=300, reserved_bytes=200, rom_name="Game.pkg")
+
+    assert "Game.pkg" in caplog.text
+    assert "SHADPS4_PKG_EXPANSION_FACTOR" in caplog.text
+
+
+def test_an_extraction_past_the_whole_cache_cap_is_refused(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extraction bigger than the whole cache cap is refused, not cached."""
+    monkeypatch.setattr(shadps4, "CACHE_MAX_GB", 1.0)
+
+    with pytest.raises(RuntimeError, match="SHADPS4_CACHE_MAX_GB"):
+        shadps4._check_expansion(
+            actual_bytes=2 * shadps4._GB, reserved_bytes=shadps4._GB // 2, rom_name="Game.pkg"
+        )

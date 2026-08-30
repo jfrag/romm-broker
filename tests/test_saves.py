@@ -208,23 +208,6 @@ def test_restore_refuses_an_archive_too_large_to_unpack(
     assert "size limit" in result["error"]
 
 
-def test_write_import_lands_the_archive_under_its_final_name(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Write import lands the archive under its final name."""
-    from webstation_broker import settings
-
-    monkeypatch.setattr(settings, "IMPORT_DIR", tmp_path / "imports")
-
-    path = saves.write_import(b"PK-body", "session-1.zip")
-
-    assert path == str(tmp_path / "imports" / "session-1.zip")
-    assert (tmp_path / "imports" / "session-1.zip").read_bytes() == b"PK-body"
-    # The staging file exists only mid-write; a leftover would be handed to a
-    # later activate as a restore source.
-    assert list((tmp_path / "imports").glob("*.part")) == []
-
-
 def test_restore_refuses_an_archive_with_too_many_entries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -368,3 +351,30 @@ def test_a_classifier_failure_logs_and_falls_back_to_save(
         manifest = json.loads(zf.read(saves.MANIFEST_NAME))
     assert manifest["files"] == [{"path": "GC/card.raw", "kind": "save"}]
     assert "could not classify" in caplog.text
+
+
+def test_restore_leaves_no_staging_file_behind_when_a_member_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member that fails on its way into place takes its staging file with it.
+
+    The staging name is dot-prefixed so the dump walk never sees it, which is exactly why a
+    leftover would sit unnoticed in the player's save directory for the life of the container.
+    """
+
+    def _refuse(src: object, dst: object) -> None:
+        """Fail the swap into place the way a full disk would.
+
+        Args:
+            src: The staging file.
+            dst: The final path.
+        """
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(saves.os, "replace", _refuse)
+
+    result = saves.extract_save_archive(_zip({"GC/card.raw": b"x"}), tmp_path, ("GC",))
+
+    assert result["failed"] == 1
+    assert result["written"] == 0
+    assert list((tmp_path / "GC").iterdir()) == []

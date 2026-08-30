@@ -57,6 +57,22 @@ SELKIES_MASTER_TOKEN = os.environ.get("SELKIES_MASTER_TOKEN", "")
 ROM_ROOT = Path(os.environ.get("ROM_ROOT", "/romm"))
 """ROM library root, from `ROM_ROOT` (default `/romm`); activate rejects paths outside it."""
 
+
+def rom_root() -> Path:
+    """Return `ROM_ROOT` with symlinks resolved, for containment checks.
+
+    Callers test a candidate with `candidate.resolve().is_relative_to(...)`, so
+    the root has to be resolved on the same terms. Bind and NFS mount layouts
+    routinely make `/romm` itself a symlink, and comparing a resolved candidate
+    against an unresolved root rejects every ROM in the library. This resolves
+    per call rather than at import so that a test or a caller reassigning
+    `ROM_ROOT` still gets a correct answer.
+
+    Returns:
+        The resolved ROM library root.
+    """
+    return ROM_ROOT.resolve()
+
 EXPORT_DIR = Path(os.environ.get("BROKER_EXPORT_DIR", "/config/broker-exports"))
 """Where exit writes its save archives, from `BROKER_EXPORT_DIR` (default `/config/broker-exports`).
 

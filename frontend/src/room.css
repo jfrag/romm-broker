@@ -598,6 +598,18 @@ iframe {
   padding: 0.5rem;
 }
 
+/* The only signal that a message could not be sent: the text is still in the
+   box, so the form flinches rather than clearing. */
+#chat-form.send-failed {
+  animation: chat-send-failed 0.35s ease;
+}
+
+@keyframes chat-send-failed {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  75% { transform: translateX(5px); }
+}
+
 #chat-form input {
   flex-grow: 1;
   border: none;

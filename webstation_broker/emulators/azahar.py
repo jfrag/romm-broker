@@ -250,9 +250,24 @@ class Azahar(Emulator):
     """
 
     def __init__(self) -> None:
-        """Initialise the process handle and a zero session baseline."""
+        """Initialise the process handle, the session baseline and the restamp log."""
         super().__init__()
-        self._session_start = 0.0
+        self._session_start = float("inf")
+        """Unix time `launch` started the emulator at; infinity until it does.
+
+        Infinity rather than zero so an instance whose launch never completed
+        matches no file at all. A baseline of zero is newer than nothing, so
+        every title in the container would read as touched this session and
+        `save_and_exit` would restamp and ship all of them.
+        """
+        self._restamped: list[tuple[Path, float, float]] = []
+        """What the last `save_and_exit` restamped: path, original atime, original mtime.
+
+        The restamp is a deliberate edit of the player's own files, so the
+        originals are kept: `revert_restamps` puts them back when the dump the
+        restamp was for did not happen, and the entries say which files the
+        game did not write this session.
+        """
 
     def prepare_restore(self) -> None:
         """Stop a running Azahar so the archive can be extracted under it."""

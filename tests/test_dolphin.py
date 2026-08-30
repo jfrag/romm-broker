@@ -5,6 +5,7 @@ naming contract, the undo buffer, and finding the render window.
 """
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -242,23 +243,135 @@ def test_the_undo_buffer_is_dropped_before_the_dump(state_dir: Path) -> None:
     assert not undo.exists()
 
 
-def test_the_render_window_is_the_one_titled_with_the_running_game() -> None:
-    """The render window is the Dolphin window whose title names the running game."""
-    emu = dolphin.Dolphin()
-    titles = {
-        "111": "Dolphin 2606-280",
-        "222": "Controller Settings",
-        "333": "Dolphin 2606-280 | JIT64 SC | OpenGL | HLE | Custom Robo (GXCE01)",
-    }
+def _disc(path: Path, game_id: bytes, offset: int = 0) -> Path:
+    """Write a stub disc image carrying `game_id` at `offset`.
+
+    Args:
+        path: The image to create.
+        game_id: The six-byte id the disc header opens with.
+        offset: Where the header sits, 0x200 for a WBFS file.
+
+    Returns:
+        The path that was written.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"\0" * offset + game_id + b"\0" * 32)
+    return path
+
+
+def test_a_boot_resume_takes_the_state_that_matches_the_disc(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state whose game id matches the image being booted is the one resumed from."""
+    monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
+    state = state_dir / "GXCE01.s01"
+    state.write_bytes(b"GXCE01" + b"\0" * 16)
+
+    assert dolphin._resume_state(_disc(tmp_path / "Game.iso", b"GXCE01")) == state
+    assert dolphin._resume_state(_disc(tmp_path / "Game.wbfs", b"GXCE01", 0x200)) == state
+
+
+def test_a_boot_resume_refuses_another_games_state(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A state carrying another game's id is never handed to Dolphin as a resume."""
+    monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
+    (state_dir / "GXCE01.s01").write_bytes(b"GXCE01" + b"\0" * 16)
+
+    assert dolphin._resume_state(_disc(tmp_path / "Other.iso", b"RMCE01")) is None
+
+
+def test_a_compressed_image_keeps_its_state_on_trust(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A format that hides its game id resumes as before, rather than losing every resume."""
+    monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
+    state = state_dir / "GXCE01.s01"
+    state.write_bytes(b"GXCE01" + b"\0" * 16)
+
+    assert dolphin._resume_state(_disc(tmp_path / "Game.rvz", b"RVZ\x01\x00\x00")) == state
+
+
+def test_a_launch_over_another_games_state_boots_without_it(
+    state_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch whose slot holds another game's state spawns Dolphin with no -s."""
+    monkeypatch.setattr(dolphin, "STATE_SLOT", 1)
+    (state_dir / "GXCE01.s01").write_bytes(b"GXCE01" + b"\0" * 16)
+    rom = _disc(tmp_path / "Other.iso", b"RMCE01")
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(dolphin, "_seed_gcpad", lambda: None)
+    monkeypatch.setattr(dolphin, "Thread", lambda **kwargs: type("T", (), {"start": lambda s: None})())
+    monkeypatch.setattr(dolphin.Dolphin, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+
+    dolphin.Dolphin().launch(rom, 1)
+
+    assert spawned and "-s" not in spawned[0]
+
+
+def test_a_state_still_open_by_the_emulator_is_not_a_finished_write(state_dir: Path) -> None:
+    """A state whose size sits still while dolphin still holds it open never counts as saved."""
+    before = dolphin._snapshot()
+    with (state_dir / "GXCE01.s01").open("wb") as fh:
+        fh.write(b"half a state")
+        fh.flush()
+
+        settled = dolphin._wait_for_state_write(before, time.monotonic() + 0.9, os.getpid())
+
+    assert settled is False
+
+
+def test_a_state_the_emulator_has_closed_counts_as_a_finished_write(state_dir: Path) -> None:
+    """A non-empty state with no descriptor left on it settles as saved."""
+    before = dolphin._snapshot()
+    _touch(state_dir / "GXCE01.s01")
+
+    assert dolphin._wait_for_state_write(before, time.monotonic() + 5.0, os.getpid()) is True
+
+
+def test_an_empty_state_file_is_never_a_finished_write(state_dir: Path) -> None:
+    """A zero-byte state is a write that produced nothing, not a save."""
+    before = dolphin._snapshot()
+    (state_dir / "GXCE01.s01").write_bytes(b"")
+
+    assert dolphin._wait_for_state_write(before, time.monotonic() + 0.9) is False
+
+
+def _windowed(emu: dolphin.Dolphin, windows: dict[str, tuple[str, str]], pid: int) -> None:
+    """Give `emu` a process handle and an xdotool that reports `windows`.
+
+    Args:
+        emu: The emulator to wire up.
+        windows: Window id to `(title, owning pid)`.
+        pid: The pid the emulator's own process reports.
+    """
+    emu._proc = type("FakeProc", (), {"pid": pid})()
 
     def fake_xdotool(*args: str) -> str:
+        """Answer a search, a window name or a window pid out of `windows`."""
         if args[0] == "search":
-            return "111\n222\n333\n"
+            return "\n".join(windows) + "\n"
         if args[0] == "getwindowname":
-            return titles[args[1]]
+            return windows[args[1]][0]
+        if args[0] == "getwindowpid":
+            return windows[args[1]][1]
         return ""
 
     emu._xdotool = fake_xdotool
+
+
+def test_the_render_window_is_the_one_titled_with_the_running_game() -> None:
+    """The render window is the Dolphin window whose title names the running game."""
+    emu = dolphin.Dolphin()
+    _windowed(
+        emu,
+        {
+            "111": ("Dolphin 2606-280", "4242"),
+            "222": ("Controller Settings", "4242"),
+            "333": ("Dolphin 2606-280 | JIT64 SC | OpenGL | HLE | Custom Robo (GXCE01)", "4242"),
+        },
+        pid=4242,
+    )
 
     assert emu._render_window() == "333"
 
@@ -266,7 +379,30 @@ def test_the_render_window_is_the_one_titled_with_the_running_game() -> None:
 def test_no_render_window_when_only_the_main_window_is_up() -> None:
     """No render window is found while only Dolphin's main window is open."""
     emu = dolphin.Dolphin()
-    emu._xdotool = lambda *args: "111\n" if args[0] == "search" else "Dolphin 2606-280"
+    _windowed(emu, {"111": ("Dolphin 2606-280", "4242")}, pid=4242)
+
+    assert emu._render_window() is None
+
+
+def test_a_window_left_by_the_previous_process_is_not_the_render_window() -> None:
+    """A render-titled window belonging to an older emulator process is passed over."""
+    emu = dolphin.Dolphin()
+    _windowed(
+        emu,
+        {
+            "111": ("Dolphin 2606-280 | JIT64 SC | OpenGL | HLE | Custom Robo (GXCE01)", "1111"),
+            "222": ("Dolphin 2606-280 | JIT64 SC | OpenGL | HLE | Mario Kart (GM4E01)", "4242"),
+        },
+        pid=4242,
+    )
+
+    assert emu._render_window() == "222"
+
+
+def test_no_render_window_without_a_process_of_our_own() -> None:
+    """With no process handle there is no window to send a hotkey at."""
+    emu = dolphin.Dolphin()
+    emu._xdotool = lambda *args: pytest.fail("xdotool run with no emulator process")
 
     assert emu._render_window() is None
 
@@ -286,6 +422,20 @@ def test_memory_card_is_gamecube_only(tmp_path: Path, monkeypatch: pytest.Monkey
     assert emu.memory_card_path(platform="ngc") == tmp_path / "GC"
     assert emu.memory_card_path(platform="wii") is None
     assert emu.memory_card_path() is None
+
+
+def test_only_a_gamecube_session_takes_the_card_out_of_the_save_archive() -> None:
+    """The card subtree follows the card path: named for GC, absent for Wii and for no platform."""
+    emu = dolphin.Dolphin()
+    assert emu.memory_card_subtree is None
+
+    emu.platform = "wii"
+    # Nothing carries GC on a Wii session, so it has to stay in the archive.
+    assert emu.memory_card_subtree is None
+
+    emu.platform = "ngc"
+    assert emu.memory_card_subtree == "GC"
+    assert emu.memory_card_subtree in emu.save_subtrees
 
 
 def test_exit_reports_the_working_slot_without_a_running_emulator(

@@ -5,6 +5,8 @@ that never comes up.
 """
 
 import os
+import struct
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
@@ -78,7 +80,19 @@ def test_restamp_keeps_the_serial_and_rewrites_the_slot(filename: str, expected:
     assert pcsx2._restamp_slot(filename, 10) == expected
 
 
-@pytest.mark.parametrize("filename", ["SLUS-20946.p2s", "SLUS-20946.10.sav", "card.bin", ""])
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "SLUS-20946.p2s",
+        "SLUS-20946.10.sav",
+        "card.bin",
+        "",
+        # A serial cannot span a path separator, whoever else is checking.
+        "../escape.01.p2s",
+        "sub/SLUS-20946.01.p2s",
+        "/abs/SLUS-20946.01.p2s",
+    ],
+)
 def test_restamp_refuses_anything_that_is_not_a_state_name(filename: str) -> None:
     """Restamping returns None for a name that is not a PCSX2 state name."""
     assert pcsx2._restamp_slot(filename, 10) is None
@@ -167,6 +181,108 @@ def test_the_card_the_whole_card_routes_sync_is_the_slot_1_folder() -> None:
     assert emu.memory_card_marker
 
 
+def test_a_state_still_open_by_the_emulator_is_not_a_finished_write(sstate_dir: Path) -> None:
+    """A state whose size sits still while pcsx2 still holds it open never counts as saved."""
+    before = pcsx2._sstate_snapshot()
+    target = sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s"
+    with target.open("wb") as fh:
+        fh.write(b"half a state")
+        fh.flush()
+
+        settled = pcsx2._wait_for_sstate_write(
+            before, time.monotonic() + 0.9, 10, os.getpid()
+        )
+
+    assert settled is False
+
+
+def test_a_state_the_emulator_has_closed_counts_as_a_finished_write(sstate_dir: Path) -> None:
+    """A non-empty state with no descriptor left on it settles as saved."""
+    before = pcsx2._sstate_snapshot()
+    _touch(sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s")
+
+    assert pcsx2._wait_for_sstate_write(before, time.monotonic() + 5.0, 10, os.getpid()) is True
+
+
+def test_an_empty_state_file_is_never_a_finished_write(sstate_dir: Path) -> None:
+    """A zero-byte state is a write that produced nothing, not a save."""
+    before = pcsx2._sstate_snapshot()
+    (sstate_dir / "SLUS-20946 (7D3A8B4E).10.p2s").write_bytes(b"")
+
+    assert pcsx2._wait_for_sstate_write(before, time.monotonic() + 0.9, 10) is False
+
+
+class _FakePineSocket:
+    """A PINE socket stand-in that replays a canned reply.
+
+    Attributes:
+        reply: The bytes the peer sends back, handed out in recv-sized slices.
+        requested: Every byte count recv was asked for, so a test can prove
+            the broker never tried to buy the whole declared reply.
+    """
+
+    def __init__(self, reply: bytes) -> None:
+        """Start with the whole reply still to be read.
+
+        Args:
+            reply: The bytes the fake peer sends back.
+        """
+        self.reply = reply
+        self.requested: list[int] = []
+
+    def __enter__(self) -> "_FakePineSocket":
+        """Return the socket itself, the way socket.socket's context manager does."""
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        """Leave any exception to propagate."""
+        return False
+
+    def settimeout(self, timeout: Optional[float]) -> None:
+        """Accept the timeout the broker sets; nothing here ever blocks."""
+
+    def connect(self, address: str) -> None:
+        """Accept the connect; the fake peer is always up."""
+
+    def sendall(self, data: bytes) -> None:
+        """Accept the request packet unread."""
+
+    def recv(self, n: int) -> bytes:
+        """Hand back up to `n` bytes of the canned reply.
+
+        Args:
+            n: The most bytes the caller will take.
+
+        Returns:
+            The next slice of the reply, empty once it is spent.
+        """
+        self.requested.append(n)
+        chunk, self.reply = self.reply[:n], self.reply[n:]
+        return chunk
+
+
+def test_a_pine_reply_that_declares_a_huge_body_is_refused(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply header claiming gigabytes is dropped instead of accumulated."""
+    sock = _FakePineSocket(struct.pack("<IB", 0xFFFFFFFF, 0))
+    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+
+    assert pcsx2._pine_request(pcsx2._PINE_MSG_EMU_STATUS) is None
+    # Only the 5-byte header was ever read for.
+    assert max(sock.requested) <= 5
+
+
+def test_a_pine_reply_within_the_ceiling_still_comes_back(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A well-formed status reply is read and returned."""
+    sock = _FakePineSocket(struct.pack("<IB", 9, 0) + struct.pack("<I", 0))
+    monkeypatch.setattr(pcsx2._socket, "socket", lambda family, kind: sock)
+
+    assert pcsx2._pine_emu_status() == 0
+
+
 class _FakeClock:
     """A monotonic() stand-in that advances by `step` seconds each call.
 
@@ -227,6 +343,30 @@ def test_boot_watchdog_clears_the_flag_when_the_vm_boots_promptly(
     emu._boot_watchdog(1, emu._launch_seq)
 
     assert emu.boot_failed is False
+
+
+def test_the_resume_state_wait_does_not_ride_the_boot_deadline(
+    monkeypatch: pytest.MonkeyPatch, watchdog_env: _FakeClock
+) -> None:
+    """A slow boot still leaves the resume wait its full budget for the pushed state."""
+    seen: list[float] = []
+
+    def record(self: pcsx2.Pcsx2, deadline: float) -> bool:
+        """Record the deadline the watchdog gave the state wait."""
+        seen.append(deadline)
+        return True
+
+    monkeypatch.setattr(pcsx2, "_pine_emu_status", lambda: 0)
+    monkeypatch.setattr(pcsx2, "RESUME_STATE_WAIT", 1000.0)
+    monkeypatch.setattr(pcsx2.Pcsx2, "wait_for_state", record)
+    monkeypatch.setattr(pcsx2.Pcsx2, "load_state", lambda self, slot: True)
+    emu = pcsx2.Pcsx2()
+
+    emu._boot_watchdog(1, emu._launch_seq)
+
+    # The boot deadline is RESUME_LOAD_WAIT (90s) from the start of the poll,
+    # so anything past it can only have come from a budget of its own.
+    assert seen and seen[0] > pcsx2.RESUME_LOAD_WAIT
 
 
 def test_boot_watchdog_flags_a_hang_when_the_process_is_still_alive(
@@ -321,6 +461,37 @@ def test_launch_always_spawns_the_watchdog_even_with_no_resume_slot(
     assert len(started) == 1
     assert started[0][0] == "_boot_watchdog"
     assert started[0][1] == (None, emu._launch_seq)
+
+
+def test_an_unpatchable_ini_is_raised_rather_than_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ini the broker cannot rewrite fails loudly instead of leaving PINE off."""
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_bytes(b"")
+    monkeypatch.setattr(pcsx2, "INI_PATH", blocked / "PCSX2.ini")
+
+    with pytest.raises(RuntimeError):
+        pcsx2._patch_ini()
+
+
+def test_a_launch_stops_at_an_unpatchable_ini(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch whose ini patch failed never spawns pcsx2."""
+    spawned = []
+
+    def refuse() -> None:
+        raise RuntimeError("no ini")
+
+    monkeypatch.setattr(pcsx2, "_patch_ini", refuse)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_ensure_folder_card", lambda self: None)
+    monkeypatch.setattr(pcsx2.Pcsx2, "_spawn", lambda self, cmd, env: spawned.append(cmd))
+
+    with pytest.raises(RuntimeError):
+        pcsx2.Pcsx2().launch(tmp_path / "g.iso", None)
+
+    assert spawned == []
 
 
 def test_resolve_refuses_a_direct_path_that_is_a_symlink_out_of_the_library(

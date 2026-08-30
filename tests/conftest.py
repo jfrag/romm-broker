@@ -373,8 +373,13 @@ def client(broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch) -> Ite
         A client whose app lifespan is running for the duration of the test.
     """
     monkeypatch.setattr(settings, "BROKER_SECRET", "")
+    # create_app refuses to build with neither a secret nor dev mode, which is
+    # the very shape these tests drive the unauthenticated routes in. Dev mode
+    # covers the construction and comes straight back off for the requests.
+    monkeypatch.setattr(settings, "DEV_MODE", True)
+    app = create_app()
     monkeypatch.setattr(settings, "DEV_MODE", False)
-    with TestClient(create_app()) as c:
+    with TestClient(app) as c:
         yield c
 
 

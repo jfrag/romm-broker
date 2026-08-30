@@ -37,11 +37,18 @@ A resolved disc image must sit under it; candidates resolving outside are discar
 def _default_data_dir() -> str:
     """Work out DuckStation's Linux data root.
 
+    DuckStation keeps its whole tree (settings.ini, memcards, savestates)
+    under the XDG *data* home, so that is the variable this follows: a
+    container that sets `XDG_CONFIG_HOME` would otherwise point the broker at
+    a directory DuckStation never writes, and every card and state would look
+    missing.
+
     Returns:
-        `$XDG_CONFIG_HOME/duckstation` when that variable is set to an absolute path, otherwise
-        `~/.local/share/duckstation` under `$HOME` (default `/config`).
+        `$XDG_DATA_HOME/duckstation` when that variable is set to an absolute
+        path, otherwise `~/.local/share/duckstation` under `$HOME` (default
+        `/config`).
     """
-    xdg = os.environ.get("XDG_CONFIG_HOME")
+    xdg = os.environ.get("XDG_DATA_HOME")
     if xdg and os.path.isabs(xdg):
         return os.path.join(xdg, "duckstation")
     return os.path.join(os.environ.get("HOME", "/config"), ".local/share/duckstation")
@@ -136,7 +143,13 @@ def _patch_ini() -> None:
     the setup wizard, so the very first launch boots the disc. Existing keys
     are rewritten in place, missing ones are added under their section
     (created when absent), and the result is written through a temp file.
-    Any failure is logged rather than raised so the launch still goes ahead.
+
+    A failure is raised rather than logged and stepped over: without
+    `SaveStateOnExit` the shutdown writes no state at all, so a launch that
+    goes ahead anyway costs the player the whole session.
+
+    Raises:
+        RuntimeError: When the file cannot be read or rewritten.
     """
     patches: dict[tuple[str, str], str] = {
         ("Main", "SetupWizardIncomplete"): "SetupWizardIncomplete = false",
@@ -197,8 +210,11 @@ def _patch_ini() -> None:
         tmp = INI_PATH.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(INI_PATH)
-    except Exception:
-        log.exception("settings.ini patch failed, broker settings NOT applied")
+    except OSError as exc:
+        log.error("duckstation: settings.ini patch failed at %s: %s", INI_PATH, exc)
+        raise RuntimeError(
+            f"could not apply broker settings to {INI_PATH}: {exc}"
+        ) from exc
 
 
 def _resume_snapshot() -> dict[Path, tuple[int, float]]:
@@ -220,20 +236,50 @@ def _resume_snapshot() -> dict[Path, tuple[int, float]]:
     return snap
 
 
-def _newest_resume_state() -> Optional[Path]:
-    """Find the newest `<serial>_resume.sav`.
+_RESUME_SUFFIX = "_resume.sav"
+"""Suffix DuckStation appends to a game's serial when it writes a resume state."""
 
-    After a save restore the directory only holds this game's states, so
-    newest-by-mtime is the session's state.
+
+def _resume_state_for(rom: Path) -> Optional[Path]:
+    """The resume state belonging to the disc about to boot, if it can be told.
+
+    `savestates/` is flat and shared by every title, and the serial in the
+    filename is the only thing tying a state to its game. The broker never
+    reads the disc's serial, so a state is claimed either because its serial
+    appears in the ROM's own path or because it is the only one left in a
+    directory `clear_working_slot` empties every session. Anything else is
+    ambiguous, and booting clean costs a resume where handing DuckStation
+    another game's state costs the player their save.
+
+    Args:
+        rom: The disc image or playlist about to boot.
 
     Returns:
-        The most recently modified resume state, or None when there is none.
+        The state to pass to `-statefile`, or None when there is none or the
+        choice cannot be made.
     """
-    best: Optional[tuple[float, Path]] = None
-    for p, (_size, mtime) in _resume_snapshot().items():
-        if best is None or mtime > best[0]:
-            best = (mtime, p)
-    return best[1] if best is not None else None
+    states = sorted(_resume_snapshot())
+    if not states:
+        return None
+    haystack = str(rom).upper()
+    named = [
+        p
+        for p in states
+        # A serial-less name would match every path, so it identifies nothing.
+        if p.name[: -len(_RESUME_SUFFIX)] and p.name[: -len(_RESUME_SUFFIX)].upper() in haystack
+    ]
+    if len(named) == 1:
+        return named[0]
+    if len(states) == 1:
+        return states[0]
+    log.error(
+        "duckstation: %d resume states in %s and none identifies %s, booting clean: %s",
+        len(states),
+        SSTATE_DIR,
+        rom.name,
+        ", ".join(p.name for p in states),
+    )
+    return None
 
 
 def _changed_resume_state(before: dict[Path, tuple[int, float]]) -> Optional[Path]:
@@ -305,11 +351,10 @@ class Duckstation(Emulator):
     def clear_working_slot(self) -> None:
         """Drop every resume state left in SSTATE_DIR before a restore.
 
-        All titles share one flat directory, and _newest_resume_state()
-        picks whichever file is newest with no serial filter. A leftover
-        from an earlier session is otherwise indistinguishable from the
-        state a restore is about to write, so clearing everything here is
-        what keeps a stale file from being served as the new game's own.
+        All titles share one flat directory, and the broker cannot read the
+        booting disc's serial to tell which state is its own. Emptying the
+        directory here is what leaves `_resume_state_for` a single candidate
+        it can trust.
         """
         if not SSTATE_DIR.is_dir():
             return
@@ -348,20 +393,24 @@ class Duckstation(Emulator):
         """Stop any running instance, patch settings.ini, and start duckstation-qt.
 
         The binary comes from env `DUCKSTATION_BIN` (default
-        `/opt/duckstation/AppRun`). With `resume_slot` set, the newest resume
-        state is passed with `-statefile`; a resume with no state on disk is
-        logged and boots clean.
+        `/opt/duckstation/AppRun`). With `resume_slot` set, the resume state
+        `_resume_state_for` claims for this disc is passed with `-statefile`;
+        a resume with no state on disk is logged and boots clean.
 
         Args:
             rom_path: The disc image or playlist to boot.
             resume_slot: Any slot to resume from (the number itself is not used), or None to
                 boot clean.
+
+        Raises:
+            RuntimeError: When the broker's settings.ini values cannot be
+                applied, which would cost the session its exit save state.
         """
         self.stop()
         _patch_ini()
 
         cmd = [os.environ.get("DUCKSTATION_BIN", "/opt/duckstation/AppRun"), "-batch", "-fullscreen"]
-        state = _newest_resume_state() if resume_slot is not None else None
+        state = _resume_state_for(rom_path) if resume_slot is not None else None
         if resume_slot is not None and state is None:
             log.warning("resume requested but no resume state in %s", SSTATE_DIR)
         if state is not None:
@@ -403,17 +452,24 @@ class Duckstation(Emulator):
         # rather than just left unreported, since the archive dump sweeps up
         # anything with a fresh mtime whether or not this method reports it.
         killed = proc is None or proc.returncode is None or proc.returncode == -signal.SIGKILL
-        if was_alive and slot is not None:
+        if was_alive:
             p = _changed_resume_state(before)
             if killed:
-                log.warning(
-                    "duckstation had to be force-killed, discarding possibly-incomplete resume state"
-                )
+                # Independent of `slot`: DuckStation writes the state either
+                # way, and the archive dump sweeps it up by mtime whether or
+                # not this method reports it.
                 if p is not None:
+                    log.warning(
+                        "duckstation had to be force-killed, discarding possibly-incomplete "
+                        "resume state %s",
+                        p.name,
+                    )
                     try:
                         p.unlink()
                     except OSError as exc:
                         log.warning("could not discard incomplete resume state %s: %s", p, exc)
+            elif slot is None:
+                log.info("duckstation exited without a state requested, resume state left unreported")
             elif p is None:
                 log.warning("no resume state written during shutdown")
             else:

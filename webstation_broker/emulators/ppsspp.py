@@ -5,12 +5,14 @@ inis, both patched before every launch. ppsspp.ini gets FirstRun and
 CheckForNewVersion so a freshly seeded /config never opens the setup wizard or
 an update toast behind a session nobody can click into, and StateSlot so every
 save/load hotkey lands on the broker's one working slot without ever cycling
-it. controls.ini gets Save State and Load State bound to the bracket keys:
+it. controls.ini gets the bracket keys added to Save State and Load State:
 F1-F12 never reach PPSSPP through this container's streaming/input stack
 (confirmed empirically, including with a real keyboard through the user's own
-desktop session), so the brackets are what's forced in on every launch rather
-than trusted to survive from a one-off manual bind through PPSSPP's own remap
-UI. Both files are written with a leading UTF-8 BOM; the patcher has to strip
+desktop session), so the brackets go in on every launch rather than being
+trusted to survive from a one-off manual bind through PPSSPP's own remap UI.
+They are merged into the action's existing comma-separated mapping list, not
+written over it, so whatever else the player bound to those actions still
+works. Both files are written with a leading UTF-8 BOM; the patcher has to strip
 it on read and put it back on write; a naive line scan would loosen the BOM
 onto the first `[section]` line and never match it.
 
@@ -81,6 +83,13 @@ LOAD_KEY = "bracketright"
 
 STATE_WAIT = float(os.environ.get("PPSSPP_STATE_WAIT", "20.0"))
 """Seconds a save state has to land on disk after the save hotkey (env `PPSSPP_STATE_WAIT`, default 20)."""
+STATE_STABLE = float(os.environ.get("PPSSPP_STATE_STABLE", "1.5"))
+"""Seconds a state's size and mtime must both hold still before the write counts as finished.
+
+From env `PPSSPP_STATE_STABLE`, default 1.5. Long enough that a stalled write
+is not mistaken for a finished one, short enough to stay well inside
+`STATE_WAIT`.
+"""
 RESUME_LOAD_WAIT = float(os.environ.get("PPSSPP_RESUME_LOAD_WAIT", "90.0"))
 """Seconds a deferred resume waits for a state file to arrive (env `PPSSPP_RESUME_LOAD_WAIT`, default 90)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("PPSSPP_RESUME_LOAD_SETTLE", "5.0"))
@@ -97,6 +106,9 @@ several candidates picks by this order. PSP has no multi-disc titles, so
 there is no disc number to rank on.
 """
 _ROM_SEARCH_GLOBS = ("*", "*/*")
+
+_STAGING_SUFFIX = ".tmp"
+"""Suffix PPSSPP saves a state under before renaming it over the real name once the save succeeds."""
 
 _STATE_NAME_RE = re.compile(r"^(?P<prefix>[^/]+)_(?P<slot>\d+)\.ppst$")
 """Matches `<game id>_<version>_<slot>.ppst`, the name PPSSPP builds for a save state.
@@ -115,20 +127,22 @@ loaded PPSSPP appends ` - <id> : <name>`, which is what a hotkey needs.
 
 _INI_SECTION = "General"
 _INI_PATCHES: dict[tuple[str, str], str] = {
-    (_INI_SECTION, "FirstRun"): "FirstRun = False",
-    (_INI_SECTION, "CheckForNewVersion"): "CheckForNewVersion = False",
-    (_INI_SECTION, "StateSlot"): f"StateSlot = {STATE_SLOT}",
+    (_INI_SECTION, "FirstRun"): "False",
+    (_INI_SECTION, "CheckForNewVersion"): "False",
+    (_INI_SECTION, "StateSlot"): str(STATE_SLOT),
 }
 """Settings forced into ppsspp.ini: no first-run wizard, no update toast, and the working slot pinned."""
 
 _CONTROLS_SECTION = "ControlMapping"
 _CONTROLS_PATCHES: dict[tuple[str, str], str] = {
-    (_CONTROLS_SECTION, "Save State"): "Save State = 1-71",
-    (_CONTROLS_SECTION, "Load State"): "Load State = 1-72",
+    (_CONTROLS_SECTION, "Save State"): "1-71",
+    (_CONTROLS_SECTION, "Load State"): "1-72",
 }
-"""Bindings forced into controls.ini: device-1 (keyboard) NKCODE for the bracket keys.
+"""Bindings added to controls.ini: device-1 (keyboard) NKCODE for the bracket keys.
 
-See the `SAVE_KEY` note for where 71/72 come from.
+See the `SAVE_KEY` note for where 71/72 come from. These are merged into
+whatever the action already carries rather than replacing it, so a pad button
+or a second key the player mapped to Save State keeps working.
 """
 
 
@@ -168,7 +182,32 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Optional[Path]:
     return min(ranked)[-1]
 
 
-def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, str], str]) -> None:
+def _merge_binding(existing: str, required: str) -> str:
+    """Add one mapping to an action's binding list without dropping the rest.
+
+    PPSSPP keeps every binding for an action on a single comma-separated
+    line, so rewriting that line whole is what silently unmaps the pad button
+    or second key a player put on the same action.
+
+    Args:
+        existing: The value side of the action's line, as the ini holds it.
+        required: The `device-keycode` mapping the broker needs bound.
+
+    Returns:
+        The action's mappings with `required` appended, or unchanged when it is already there.
+    """
+    parts = [p.strip() for p in existing.split(",") if p.strip()]
+    if required not in parts:
+        parts.append(required)
+    return ",".join(parts)
+
+
+def _patch_ini_file(
+    path: Path,
+    default_section: str,
+    patches: dict[tuple[str, str], str],
+    merge_existing: bool = False,
+) -> None:
     """Force a set of settings into one of PPSSPP's inis before every launch.
 
     Written and read with a leading UTF-8 BOM, matching PPSSPP's own files: a
@@ -182,14 +221,18 @@ def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, s
     Args:
         path: The ini file to patch.
         default_section: Section header to seed when the file does not exist yet.
-        patches: `(section, key)` to `key = value` lines to force in.
+        patches: `(section, key)` to the value the broker needs the key to carry.
+        merge_existing: Treat an existing value as a comma-separated list and
+            add the broker's value to it instead of replacing the line. Set
+            for controls.ini, where the line is the player's whole mapping for
+            that action, not a setting the broker owns.
     """
     try:
         if not path.exists():
             # First run: write just the forced settings, PPSSPP fills in the rest.
             path.parent.mkdir(parents=True, exist_ok=True)
-            body = f"[{default_section}]\n" + "\n".join(patches.values())
-            path.write_text("﻿" + body + "\n", encoding="utf-8")
+            seeded = "\n".join(f"{key} = {val}" for (_sec, key), val in patches.items())
+            path.write_text("﻿" + f"[{default_section}]\n" + seeded + "\n", encoding="utf-8")
             return
         lines = path.read_text(encoding="utf-8-sig").splitlines()
         section = ""
@@ -206,7 +249,10 @@ def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, s
                 if section != sec:
                     continue
                 if stripped.startswith(f"{key} =") or stripped.startswith(f"{key}="):
-                    new_lines.append(val)
+                    value = val
+                    if merge_existing:
+                        value = _merge_binding(stripped.split("=", 1)[1], val)
+                    new_lines.append(f"{key} = {value}")
                     applied.add((sec, key))
                     matched = True
                     break
@@ -219,18 +265,18 @@ def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, s
                 for ln in new_lines
                 if ln.strip().startswith("[") and ln.strip().endswith("]")
             }
-            for sec, _key, val in missing:
+            for sec, key, val in missing:
                 if sec in present:
                     out: list[str] = []
                     inserted = False
                     for ln in new_lines:
                         out.append(ln)
                         if not inserted and ln.strip() == f"[{sec}]":
-                            out.append(val)
+                            out.append(f"{key} = {val}")
                             inserted = True
                     new_lines = out
                 else:
-                    new_lines.extend(["", f"[{sec}]", val])
+                    new_lines.extend(["", f"[{sec}]", f"{key} = {val}"])
                     present.add(sec)
         tmp = path.with_suffix(".tmp")
         tmp.write_text("﻿" + "\n".join(new_lines) + "\n", encoding="utf-8")
@@ -242,7 +288,7 @@ def _patch_ini_file(path: Path, default_section: str, patches: dict[tuple[str, s
 def _patch_config() -> None:
     """Patch both ppsspp.ini and controls.ini with the broker's forced settings."""
     _patch_ini_file(INI_PATH, _INI_SECTION, _INI_PATCHES)
-    _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES)
+    _patch_ini_file(CONTROLS_INI_PATH, _CONTROLS_SECTION, _CONTROLS_PATCHES, merge_existing=True)
 
 
 def _state_for_slot(slot: int) -> Optional[Path]:
@@ -286,13 +332,35 @@ def _snapshot() -> dict[Path, tuple[int, float]]:
     return snap
 
 
+def _staging_in_flight(state: Path) -> bool:
+    """Whether PPSSPP still has the staging file for `state` on disk.
+
+    Args:
+        state: The state file the save is expected to land on.
+
+    Returns:
+        True while a `_STAGING_SUFFIX` sibling exists, False when it is gone
+        or cannot be looked at.
+    """
+    try:
+        return state.with_name(state.name + _STAGING_SUFFIX).exists()
+    except OSError as exc:
+        log.warning("could not look for a staging file beside %s: %s", state.name, exc)
+        return False
+
+
 def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float) -> bool:
     """Poll the working slot until a write completes or the deadline passes.
 
-    A write counts as complete once the file's size has been stable for 0.5 s.
-    The hotkey is fire-and-forget, so the file appearing and settling is the
-    only confirmation there is. A target that disappears mid-write is dropped
-    and the scan starts over.
+    The hotkey is fire-and-forget, so the file itself is the only
+    acknowledgement there is. A write only counts as complete once the state
+    is non-empty, PPSSPP's staging file for it is gone (it saves to that name
+    and renames it over the real one once the save succeeds), and neither
+    size nor mtime has moved for `STATE_STABLE`. Size alone over a short
+    window is not enough: an emulator that stalls mid-write passes that test,
+    and the broker would ship a truncated state to RomM as the player's
+    progress. A target that disappears mid-write is dropped and the scan
+    starts over.
 
     Args:
         before: Snapshot from `_snapshot` taken before the hotkey was sent.
@@ -301,33 +369,38 @@ def _wait_for_state_write(before: dict[Path, tuple[int, float]], deadline: float
     Returns:
         True once a new or modified state has settled, False on timeout.
     """
-    STABLE_SECS = 0.5
     POLL_SECS = 0.1
     target: Optional[Path] = None
-    last_size: Optional[int] = None
-    stable_since: Optional[float] = None
+    last: Optional[tuple[int, float]] = None
+    stable_since = 0.0
     while time.monotonic() < deadline:
         after = _snapshot()
         if target is None:
-            for p, (size, mtime) in after.items():
-                prev = before.get(p)
-                if prev is None or prev[1] != mtime:
+            for p, stamp in after.items():
+                if before.get(p) != stamp:
                     target = p
-                    last_size = size
+                    last = stamp
                     stable_since = time.monotonic()
                     break
         else:
             cur = after.get(target)
             if cur is None:
+                log.warning("save state %s vanished mid-write, waiting for another", target.name)
                 target = None
-            else:
-                if cur[0] != last_size:
-                    last_size = cur[0]
-                    stable_since = time.monotonic()
-                elif time.monotonic() - stable_since >= STABLE_SECS:
-                    log.info("save state write complete: %s (%d bytes)", target.name, last_size)
-                    return True
+                last = None
+            elif cur != last:
+                last = cur
+                stable_since = time.monotonic()
+            elif cur[0] == 0 or _staging_in_flight(target):
+                stable_since = time.monotonic()
+            elif time.monotonic() - stable_since >= STATE_STABLE:
+                log.info("save state write complete: %s (%d bytes)", target.name, cur[0])
+                return True
         time.sleep(POLL_SECS)
+    if target is not None:
+        log.warning("save state %s never finished writing before the deadline", target.name)
+    else:
+        log.warning("no save state was written before the deadline")
     return False
 
 
@@ -406,7 +479,11 @@ class Ppsspp(Emulator):
         """Resolve a RomM path to the ROM to boot.
 
         A file is taken as is. A directory is searched one level deep for the
-        best candidate by `_pick_rom_file`.
+        best candidate by `_pick_rom_file`. A pattern that cannot be walked
+        (an unreadable subdirectory, a broken mount) costs only what that
+        pattern would have contributed: the candidates already found still
+        rank, since reporting a title unbootable over one bad directory is
+        worse than booting the best of what could be read.
 
         Args:
             path: The ROM file or folder RomM handed over.
@@ -430,8 +507,8 @@ class Ppsspp(Emulator):
         for pattern in _ROM_SEARCH_GLOBS:
             try:
                 candidates.extend(path.glob(pattern))
-            except OSError:
-                return None
+            except OSError as exc:
+                log.warning("rom search %r under %s failed: %s", pattern, path, exc)
         return _pick_rom_file(candidates, path)
 
     def _xdotool(self, *args: str) -> Optional[str]:
@@ -460,22 +537,32 @@ class Ppsspp(Emulator):
         return result.stdout
 
     def _game_window(self) -> Optional[str]:
-        """Find the window PPSSPP is running the game in.
+        """Find the window this launch is running the game in.
 
-        Picked by title rather than the first match: before a game is loaded
-        the same class is a menu window a hotkey does nothing useful to.
+        Two things have to hold. The window must belong to the process this
+        broker spawned, since a window left behind by the previous emulator
+        process carries the same class and title shape and would swallow the
+        save hotkey, and its title must carry `_GAME_TITLE_MARK`, which
+        PPSSPP only appends once a game is loaded: before that the window is
+        a menu a hotkey does nothing useful to.
 
         Returns:
-            The X window id as xdotool prints it, or None when no game window is up.
+            The X window id as xdotool prints it, or None when this launch has no game window up.
         """
+        proc = self._proc
+        if proc is None:
+            return None
         out = self._xdotool("search", "--class", _WINDOW_CLASS)
         if out is None:
             return None
         for win_id in out.split():
+            pid = self._xdotool("getwindowpid", win_id)
+            if pid is None or pid.strip() != str(proc.pid):
+                continue
             name = self._xdotool("getwindowname", win_id)
             if name and _GAME_TITLE_MARK in name:
                 return win_id
-        log.warning("no ppsspp game window found")
+        log.warning("no ppsspp game window found for pid %s", proc.pid)
         return None
 
     def _send_key(self, key: str) -> bool:

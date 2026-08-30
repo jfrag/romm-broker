@@ -26,7 +26,7 @@
   "ngc": {
     "core": "dolphin",
     "thumbnail": false,
-    "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".chd", ".wad", ".dol", ".elf"],
+    "extensions": [".rvz", ".gcz", ".iso", ".gcm", ".wbfs", ".ciso", ".chd", ".wad", ".dol", ".elf"],
     "save_subtrees": [
       "states",
       "saves/dolphin-emu/User/GC",

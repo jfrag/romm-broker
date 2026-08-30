@@ -5,15 +5,18 @@ libfatx compares path names byte for byte, and that detail is exactly what the
 inject and extract hooks have to get right.
 """
 
+import gc
 import os
+import signal
 import struct
 import tomllib
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn, Optional
 
 import pytest
 from pyfatx import Fatx
 
+from webstation_broker import settings
 from webstation_broker.emulators import xemu
 
 SECTOR = 2048
@@ -107,6 +110,22 @@ def test_title_id_is_none_for_a_missing_file(tmp_path: Path) -> None:
     assert xemu._disc_title_id(tmp_path / "gone.iso") is None
 
 
+@pytest.mark.parametrize("claimed", [0xFFFFFFFF, xemu.XISO_MAX_DIR_BYTES + 1, 0])
+def test_a_disc_claiming_an_absurd_root_directory_is_not_read(tmp_path: Path, claimed: int) -> None:
+    """A disc whose root directory size is out of range is refused, not allocated for.
+
+    The size is a 32-bit field taken straight from the image, so reading it
+    verbatim lets a hostile ISO ask for a 4 GiB buffer.
+    """
+    disc = _xiso(tmp_path / "g.iso")
+    raw = bytearray(disc.read_bytes())
+    off = 32 * SECTOR + 24
+    raw[off:off + 4] = struct.pack("<I", claimed)
+    disc.write_bytes(bytes(raw))
+
+    assert xemu._disc_title_id(disc) is None
+
+
 # ── ROM resolution ───────────────────────────────────────────────────────────
 
 
@@ -123,7 +142,7 @@ def rom_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """
     root = tmp_path / "romm"
     root.mkdir()
-    monkeypatch.setattr(xemu, "ROM_ROOT", root)
+    monkeypatch.setattr(settings, "ROM_ROOT", root)
     return root
 
 
@@ -441,9 +460,51 @@ def test_an_unwritable_config_does_not_stop_the_launch(pinned: Path, monkeypatch
     def fail(*args: object, **kwargs: object) -> NoReturn:
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(Path, "write_text", fail)
+    monkeypatch.setattr(xemu.tempfile, "mkstemp", fail)
     xemu._pin_display_settings()
     assert _renderer_of(pinned) == "VULKAN"
+
+
+def test_a_pin_that_would_not_parse_is_never_written(
+    pinned: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pinned edit that does not parse leaves the user's config alone.
+
+    xemu.toml holds every setting the user has ever changed, so a bad edit
+    written over it costs them all of them.
+    """
+    pinned.write_text(FULL_TOML)
+    monkeypatch.setattr(xemu, "_pin_toml_key",
+                        lambda text, section, key, value: "[display\nrenderer = ")
+
+    xemu._pin_display_settings()
+    assert pinned.read_text() == FULL_TOML
+
+
+def test_the_config_is_swapped_in_rather_than_truncated_in_place(pinned: Path) -> None:
+    """The pin replaces the config by rename, leaving no temp file behind.
+
+    A truncating write that fails halfway leaves the config unparseable;
+    the replacement is written beside it and renamed over it instead.
+    """
+    pinned.write_text(FULL_TOML)
+    xemu._pin_display_settings()
+
+    assert _renderer_of(pinned) == "OPENGL"
+    assert [p.name for p in pinned.parent.iterdir()] == [pinned.name]
+
+
+def test_the_config_keeps_its_permissions_across_a_pin(pinned: Path) -> None:
+    """The replaced config carries the mode the original had.
+
+    A temp file created by mkstemp is 0600, which would lock xemu itself out
+    of a config it shares.
+    """
+    pinned.write_text(FULL_TOML)
+    os.chmod(pinned, 0o640)
+    xemu._pin_display_settings()
+
+    assert pinned.stat().st_mode & 0o777 == 0o640
 
 
 def _spawned_env(emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, str]:
@@ -521,6 +582,86 @@ def test_launch_pins_the_display_settings_before_spawning(
     assert spawned, "launch did not spawn xemu"
     assert _renderer_of(cfg) == "OPENGL"
     assert _fullscreen_of(cfg) is True
+
+
+# ── Stray process reaping ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def signals(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    """Record what the reaper would signal instead of signalling it.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+
+    Returns:
+        The list deliveries are appended to, as (pid, signal) pairs.
+    """
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(xemu.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(xemu.time, "sleep", lambda seconds: None)
+    return sent
+
+
+def test_the_process_scan_sees_this_process() -> None:
+    """The /proc scan reports real pids."""
+    assert os.getpid() in xemu._proc_pids()
+
+
+def test_a_process_that_only_names_the_binary_is_left_alone(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """A process that merely mentions the xemu path is not signalled.
+
+    A substring match over whole command lines also hits a shell, a grep or a
+    log tail carrying the path, and killed them.
+    """
+    monkeypatch.setattr(xemu, "_proc_pids", lambda: [4321])
+    monkeypatch.setattr(xemu, "_cmdline",
+                        lambda pid: ["/bin/sh", "-c", f"tail -f {xemu.XEMU_BIN}.log"])
+
+    xemu._reap_strays()
+    assert signals == []
+
+
+def test_the_reaper_does_not_signal_itself(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """The broker's own pid is never a target, whatever its command line reads."""
+    monkeypatch.setattr(xemu, "_proc_pids", lambda: [os.getpid()])
+    monkeypatch.setattr(xemu, "_cmdline", lambda pid: [xemu.XEMU_BIN])
+
+    xemu._reap_strays()
+    assert signals == []
+
+
+def test_a_stray_is_asked_to_exit_before_it_is_killed(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """A stray that goes on SIGTERM is never killed.
+
+    QEMU flushes the HDD image on a clean shutdown only, and the save hooks
+    read that image seconds later.
+    """
+    monkeypatch.setattr(xemu, "_proc_pids", lambda: [777])
+    monkeypatch.setattr(
+        xemu, "_cmdline",
+        lambda pid: [] if signals else [xemu.XEMU_BIN, "-dvd_path", "/romm/g.iso"])
+
+    xemu._reap_strays()
+    assert signals == [(777, signal.SIGTERM)]
+
+
+def test_a_stray_that_ignores_sigterm_is_killed(
+    monkeypatch: pytest.MonkeyPatch, signals: list[tuple[int, int]]
+) -> None:
+    """A stray still running after the grace window is killed."""
+    monkeypatch.setattr(xemu, "XEMU_STRAY_TERM_WAIT", 0.0)
+    monkeypatch.setattr(xemu, "_proc_pids", lambda: [777])
+    monkeypatch.setattr(xemu, "_cmdline", lambda pid: [xemu.XEMU_BIN])
+
+    xemu._reap_strays()
+    assert signals == [(777, signal.SIGTERM), (777, signal.SIGKILL)]
 
 
 # ── FATX save sync ───────────────────────────────────────────────────────────
@@ -723,6 +864,195 @@ def test_a_save_round_trips_through_the_image(emulator: xemu.Xemu) -> None:
     assert bytes(fs.read("/UDATA/4D530064/saved.dat")) == b"progress"
 
 
+class _FatxProxy:
+    """A Fatx handle that records what the save hooks do and can fail one call.
+
+    The real handle lives in a list the test owns rather than on the proxy:
+    a failing call leaves the proxy reachable from the logged exception's
+    traceback for as long as pytest keeps the log record, and closing the
+    image has to stay under the test's control.
+
+    Attributes:
+        calls: Filesystem call names, in the order they were made.
+        released: Appended to when the hook drops the proxy.
+    """
+
+    def __init__(self, handle: list[Fatx], calls: list[str], released: list[bool],
+                 fail: Optional[str] = None,
+                 error: type[BaseException] = AssertionError) -> None:
+        """Wrap an open handle.
+
+        Args:
+            handle: One element list holding the real handle.
+            calls: List every call name is appended to.
+            released: List a True is appended to when the proxy is dropped.
+            fail: Name of the call that raises instead of running.
+            error: Exception type that call raises.
+        """
+        self._handle = handle
+        self.calls = calls
+        self.released = released
+        self._fail = fail
+        self._error = error
+
+    def __getattr__(self, name: str) -> Any:
+        """Wrap one of the handle's methods so the call is recorded.
+
+        The underlying method is looked up when the call is made, not when the
+        wrapper is built, so a wrapper caught in a traceback keeps no reference
+        to the real handle.
+
+        Args:
+            name: The attribute being looked up.
+
+        Returns:
+            A wrapper that records the call and applies the configured failure.
+        """
+        def recorded(*args: object, **kwargs: object) -> Any:
+            self.calls.append(name)
+            if name == self._fail:
+                raise self._error(f"pyfatx {name} failed")
+            return getattr(self._handle[0], name)(*args, **kwargs)
+
+        return recorded
+
+    def __del__(self) -> None:
+        """Note the release: the hook dropping its handle is what commits FATX writes."""
+        self.released.append(True)
+
+
+def _proxy_fatx(monkeypatch: pytest.MonkeyPatch,
+                **kwargs: Any) -> tuple[list[str], list[bool], list[Fatx]]:
+    """Make the save hooks open the image through a recording proxy.
+
+    Args:
+        monkeypatch: The pytest monkeypatch fixture.
+        **kwargs: `fail` and `error`, passed to the proxy.
+
+    Returns:
+        The call log, the release log, and the one element list holding the
+        real handle: emptying it and collecting closes the image, which is
+        what makes a write visible to a second handle.
+    """
+    calls: list[str] = []
+    released: list[bool] = []
+    handle: list[Fatx] = []
+
+    def opener(image: Path) -> _FatxProxy:
+        handle.append(_fatx(image))
+        return _FatxProxy(handle, calls, released, **kwargs)
+
+    monkeypatch.setattr(xemu, "_open_fatx_e", opener)
+    return calls, released, handle
+
+
+def test_a_shrinking_save_is_truncated_before_it_is_written(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stale tail is cut before the new save lands, not after.
+
+    Truncating afterwards leaves every failure in between showing the previous
+    save's tail welded onto the new one, which the game reads as one save.
+    """
+    _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"a much longer save")
+    _stage(emulator, "UDATA/4D530064/saved.dat", b"short")
+    calls, _released, _handle = _proxy_fatx(monkeypatch)
+
+    assert emulator._inject_saves() == 1
+    assert calls.index("truncate") < calls.index("write")
+
+
+def test_a_failed_write_leaves_no_half_written_save_behind(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A write that fails takes the file with it instead of leaving a hybrid.
+
+    The old save's tail under a new save's head still reads as one save to the
+    game, so half a write is worse than none.
+    """
+    _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"a much longer save")
+    _stage(emulator, "UDATA/4D530064/saved.dat", b"short")
+    calls, _released, handle = _proxy_fatx(monkeypatch, fail="write")
+
+    assert emulator._inject_saves() == 0
+    assert calls.index("write") < calls.index("unlink")
+    # Closing the image is what makes the removal visible to a second handle.
+    handle.clear()
+    gc.collect()
+    fs = _fatx(emulator.hdd_image)
+    with pytest.raises(AssertionError):
+        fs.get_attr("/UDATA/4D530064/saved.dat")
+
+
+def test_an_unexpected_error_still_releases_the_image(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error the injection does not expect still closes the FATX handle.
+
+    pyfatx has no flush; dropping the handle is what commits the writes, so an
+    exception on the way out must not skip it.
+    """
+    _stage(emulator, "UDATA/4D530064/saved.dat", b"restored")
+    _calls, released, _handle = _proxy_fatx(monkeypatch)
+
+    def boom(self: Path) -> NoReturn:
+        raise ValueError("staging file vanished")
+
+    monkeypatch.setattr(Path, "read_bytes", boom)
+    with pytest.raises(ValueError):
+        emulator._inject_saves()
+    assert released == [True]
+
+
+def test_a_failed_extraction_keeps_what_the_session_restored(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An extraction that cannot open the image leaves the staging dir alone.
+
+    The dump ships whatever staging holds, so emptying it on a failed read
+    uploads an empty archive over the title's real saves.
+    """
+    _stage(emulator, "UDATA/4D530064/restored.dat", b"from the archive")
+    monkeypatch.setattr(xemu, "_open_fatx_e", lambda image: None)
+
+    assert emulator._extract_saves() is None
+    assert (emulator.staging_dir / "UDATA/4D530064/restored.dat").read_bytes() == b"from the archive"
+
+
+def test_an_image_with_no_save_directories_is_a_failed_read(emulator: xemu.Xemu) -> None:
+    """A disk carrying neither UDATA nor TDATA is a failed read, not an empty save set."""
+    _stage(emulator, "UDATA/4D530064/restored.dat", b"from the archive")
+
+    assert emulator._extract_saves() is None
+    assert (emulator.staging_dir / "UDATA/4D530064/restored.dat").exists()
+
+
+def test_a_listing_failure_fails_the_whole_extraction(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A directory that cannot be listed fails the extraction rather than staging part of it."""
+    _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"progress")
+    _stage(emulator, "UDATA/4D530064/restored.dat", b"from the archive")
+    emulator._title_id = "4D530064"
+    _calls, _released, _handle = _proxy_fatx(monkeypatch, fail="walk")
+
+    assert emulator._extract_saves() is None
+    assert (emulator.staging_dir / "UDATA/4D530064/restored.dat").exists()
+    assert [p.name for p in emulator.staging_dir.parent.iterdir()
+            if p.name.startswith(".")] == []
+
+
+def test_a_successful_extraction_replaces_the_staged_files(emulator: xemu.Xemu) -> None:
+    """What the extraction stages is exactly what came off the image."""
+    _seed(emulator.hdd_image, "/UDATA/4D530064/saved.dat", b"progress")
+    _stage(emulator, "UDATA/4D530064/stale.dat", b"last session")
+    emulator._title_id = "4D530064"
+
+    assert emulator._extract_saves() == 1
+    assert not (emulator.staging_dir / "UDATA/4D530064/stale.dat").exists()
+    assert (emulator.staging_dir / "UDATA/4D530064/saved.dat").read_bytes() == b"progress"
+
+
 # ── Session contract ─────────────────────────────────────────────────────────
 
 
@@ -749,3 +1079,22 @@ def test_save_and_exit_reports_saves_rather_than_a_state(
     assert result["state_slot"] is None
     assert result["title_id"] == "4D530064"
     assert result["saves_extracted"] == 1
+
+
+def test_exit_keeps_the_staged_saves_when_the_image_cannot_be_read(
+    emulator: xemu.Xemu, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit reports no saves rather than emptying the staging dir on a failed read.
+
+    Reporting zero is survivable; replacing the user's saves with an empty
+    archive is not.
+    """
+    _stage(emulator, "UDATA/4D530064/restored.dat", b"from the archive")
+    emulator._title_id = "4D530064"
+    monkeypatch.setattr(xemu, "_reap_strays", lambda: None)
+    monkeypatch.setattr(emulator, "stop", lambda: None)
+    monkeypatch.setattr(xemu, "_open_fatx_e", lambda image: None)
+
+    result = emulator.save_and_exit(None)
+    assert result["saves_extracted"] == 0
+    assert (emulator.staging_dir / "UDATA/4D530064/restored.dat").exists()

@@ -4,6 +4,7 @@ Covers config/ipc patching, the savestates symlink, save_subtrees, resume
 target selection, save-and-exit, and boot verification.
 """
 
+import logging
 import os
 import socket
 import struct
@@ -58,6 +59,21 @@ def _touch(path: Path, mtime: Optional[float] = None) -> Path:
     path.write_bytes(b"state")
     if mtime is not None:
         os.utime(path, (mtime, mtime))
+    return path
+
+
+def _write_pkg(path: Path, title_id: str) -> Path:
+    """Write a .pkg whose header carries `title_id` in its content id.
+
+    Only the 0x60-byte header `_pkg_title_id` reads is real; the payload a
+    genuine PKG carries after it is irrelevant to every code path under test.
+    """
+    header = bytearray(0x60)
+    header[0:4] = b"\x7fPKG"
+    content_id = f"UP0001-{title_id}_00-0000000000000000".encode("ascii")
+    header[0x30 : 0x30 + len(content_id)] = content_id
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header))
     return path
 
 
@@ -172,20 +188,64 @@ def test_building_every_emulator_does_not_touch_the_symlink(rpcs3_dirs: dict[str
     assert not rpcs3_dirs["sstate_link"].exists()
 
 
-def test_clearing_the_working_slot_wipes_every_title_leftover_state(rpcs3_dirs: dict[str, Path]) -> None:
+def test_clearing_the_working_slot_drops_the_incoming_titles_leftover_state(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
     """A stale state from a previous session must not outrank a fresh restore.
 
     A state left behind by a previous session must not outrank (by mtime)
     whatever this session's own archive restore brings back.
     """
     stale = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
-    other_title = _touch(rpcs3_dirs["sstate_root"] / "OTHER00000" / "OTHER00000_1.SAVESTAT")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    assert emu.resolve_rom_file(pkg) == pkg
+    emu.clear_working_slot()
+
+    assert not stale.exists()
+    assert rpcs3_dirs["sstate_root"].is_dir()
+
+
+def test_clearing_the_working_slot_spares_every_other_titles_state(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """Another title's state may not have been archived yet, so it must survive."""
+    other_title = _touch(rpcs3_dirs["sstate_root"] / "OTHER0000" / "OTHER0000_1.SAVESTAT")
+    pkg = _write_pkg(tmp_path / "roms" / "game.pkg", "BLUS30443")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(pkg)
+    emu.clear_working_slot()
+
+    assert other_title.exists()
+
+
+def test_clearing_the_working_slot_keeps_states_when_the_title_is_unknown(
+    rpcs3_dirs: dict[str, Path], tmp_path: Path
+) -> None:
+    """A bare .iso names no title, so the clear has nothing to scope to."""
+    kept = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
+    iso = tmp_path / "roms" / "game.iso"
+    iso.parent.mkdir(parents=True)
+    iso.write_bytes(b"iso")
+
+    emu = rpcs3.Rpcs3()
+    emu.resolve_rom_file(iso)
+    emu.clear_working_slot()
+
+    assert kept.exists()
+
+
+def test_clearing_the_working_slot_keeps_states_without_a_resolved_rom(
+    rpcs3_dirs: dict[str, Path],
+) -> None:
+    """No resolved boot target means no title to clear for, so nothing goes."""
+    kept = _touch(rpcs3_dirs["sstate_root"] / "BLUS30443" / "BLUS30443_1.SAVESTAT")
 
     rpcs3.Rpcs3().clear_working_slot()
 
-    assert not stale.exists()
-    assert not other_title.exists()
-    assert rpcs3_dirs["sstate_root"].is_dir()
+    assert kept.exists()
 
 
 def test_clearing_the_working_slot_enters_restoring_mode(rpcs3_dirs: dict[str, Path]) -> None:
@@ -662,6 +722,10 @@ def test_pine_request_coerces_a_truncated_body_to_empty(pine_socket: Path) -> No
 class _StubSocket:
     def __init__(self, chunks: list[bytes]) -> None:
         self._chunks = list(chunks)
+        self.timeouts: list[float] = []
+
+    def settimeout(self, value: float) -> None:
+        self.timeouts.append(value)
 
     def recv(self, _n: int) -> bytes:
         return self._chunks.pop(0) if self._chunks else b""
@@ -671,14 +735,47 @@ def test_pine_recv_exact_accumulates_across_several_recv_calls() -> None:
     """PINE recv exact accumulates across several recv calls."""
     sock = _StubSocket([b"ab", b"cde", b"f"])
 
-    assert rpcs3._pine_recv_exact(sock, 6) == b"abcdef"
+    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() + 5) == b"abcdef"
 
 
 def test_pine_recv_exact_returns_none_when_the_socket_closes_early() -> None:
     """PINE recv exact returns none when the socket closes early."""
     sock = _StubSocket([b"ab", b""])
 
-    assert rpcs3._pine_recv_exact(sock, 6) is None
+    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() + 5) is None
+
+
+def test_pine_recv_exact_gives_up_once_the_shared_deadline_passes() -> None:
+    """A deadline already in the past stops the read before any recv."""
+    sock = _StubSocket([b"ab", b"cd", b"ef"])
+
+    assert rpcs3._pine_recv_exact(sock, 6, time.monotonic() - 1) is None
+    assert sock.timeouts == []
+
+
+def test_pine_recv_exact_spends_the_budget_rather_than_restarting_it() -> None:
+    """Each recv gets the time remaining, never a fresh full timeout.
+
+    A peer dribbling one byte per call would otherwise hold the caller
+    forever, since a per-recv timeout never expires.
+    """
+    sock = _StubSocket([b"a", b"b", b"c"])
+
+    rpcs3._pine_recv_exact(sock, 3, time.monotonic() + 5)
+
+    assert sock.timeouts == sorted(sock.timeouts, reverse=True)
+    assert all(t <= 5 for t in sock.timeouts)
+
+
+def test_pine_request_refuses_a_reply_larger_than_the_cap(pine_socket: Path) -> None:
+    """A declared reply above the cap is refused instead of accumulated."""
+    reply = struct.pack("<IB", rpcs3._PINE_MAX_REPLY_BYTES + 1, 0)
+    thread = _serve_pine_reply(pine_socket, reply)
+
+    result = rpcs3._pine_request(rpcs3._PINE_MSG_STATUS, timeout=2.0)
+    thread.join(timeout=2)
+
+    assert result is None
 
 
 # ── boot watchdog ───────────────────────────────────────────────────────
@@ -1736,3 +1833,23 @@ def test_pick_rom_file_accepts_an_archive_candidate_when_the_cache_is_enabled(
     archive.write_bytes(b"")
 
     assert rpcs3._pick_rom_file([archive], folder) == archive
+
+
+def test_session_save_dirs_is_empty_without_a_launch(
+    rpcs3_dirs: dict[str, Path], caplog: pytest.LogCaptureFixture
+) -> None:
+    """With no launch in this process, no save dir is claimed as the session's.
+
+    A zero baseline would match every file on disk and drag every other
+    title's saves into the dump, so the absence of a baseline has to fail
+    closed rather than select everything.
+    """
+    _touch(rpcs3.USER_HOME / "savedata" / "BLES00001" / "SAVE", mtime=1000)
+    _touch(rpcs3.USER_HOME / "savedata" / "BLUS99999" / "SAVE", mtime=9_000_000_000)
+
+    emu = rpcs3.Rpcs3()
+
+    with caplog.at_level(logging.WARNING):
+        assert emu._session_save_dirs() == []
+
+    assert "no launch" in caplog.text

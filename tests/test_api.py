@@ -7,18 +7,21 @@ exports, context, exit and disc swap.
 import io
 import json
 import os
+import shutil
 import signal
 import subprocess
 import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Optional
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketState
 
-from webstation_broker import saves, session, settings
+from webstation_broker import api, callback, saves, selkies, session, settings
 from webstation_broker.app import create_app
 from webstation_broker.emulators import base, rpcs3, shadps4
 
@@ -227,10 +230,16 @@ def test_activate_restores_the_save_archive_it_is_pointed_at(
 def test_activate_refuses_a_save_archive_that_is_not_there(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator], tmp_path: Path
 ) -> None:
-    """Activate refuses a save archive that is not there."""
+    """Activate refuses a save archive that is not there, with the working slot untouched.
+
+    The slot is emptied to make room for the restore, so a refusal that had
+    already emptied it would have thrown away the save data of whoever played
+    last in exchange for a 404.
+    """
     response = _activate(client, broker_dirs, save={"archive": str(tmp_path / "gone.zip")})
 
     assert response.status_code == 404
+    assert fake_emulator[0].cleared is False
 
 
 def test_activate_rejects_an_archive_it_cannot_unpack(
@@ -718,6 +727,7 @@ def test_starting_the_app_reaps_an_emulator_an_earlier_broker_left(
     never to a mounted one.
     """
     monkeypatch.setattr(settings, "PREFIX", prefix)
+    monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
     proc = sleeper()
     base._record_pid("fake", proc.pid, SLEEPER_CMD)
 
@@ -738,6 +748,7 @@ def test_starting_the_app_sweeps_the_scratch_dirs_both_caching_emulators_leave(
     whose games are already extracted may never run one again.
     """
     monkeypatch.setattr(settings, "PREFIX", prefix)
+    monkeypatch.setattr(settings, "BROKER_SECRET", "s3cret")
     orphans = []
     for module, name in ((shadps4, "shadps4"), (rpcs3, "rpcs3")):
         cache = tmp_path / name
@@ -984,6 +995,9 @@ def test_a_disconnected_arrival_is_reclaimed_at_the_room_cap(
     ).json()["url"]
     invite = url.split("invite=")[1]
     first = client.get(f"{API}/session/context", params={"invite": invite}).json()
+    # Past the grace a just-minted seat gets, so the seat reads as one whose
+    # user left rather than one whose browser is still loading.
+    session.SESSION["viewers"][0]["last_seen"] = 0.0
 
     response = client.get(f"{API}/session/context", params={"invite": invite})
 
@@ -1204,3 +1218,420 @@ class TestSwapDisc:
             json={"path": str(self._disc(broker_dirs))},
         )
         assert r.status_code == 403
+
+    def test_a_disc_under_a_symlinked_library_root_is_accepted(
+        self,
+        secret_client: TestClient,
+        broker_dirs: dict[str, Path],
+        fake_emulator: list[FakeEmulator],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """A library root reached through a symlink still contains its own discs.
+
+        The path RomM sends is resolved before the check, so a root left
+        unresolved never matches and every swap on such a container is refused.
+        """
+        self._session(secret_client, broker_dirs)
+        disc = self._disc(broker_dirs)
+        link = tmp_path / "romm-link"
+        link.symlink_to(broker_dirs["roms"])
+        monkeypatch.setattr(settings, "ROM_ROOT", link)
+
+        r = secret_client.post(
+            f"{API}/session/swap-disc", json={"path": str(link / disc.name)}
+        )
+
+        assert r.status_code == 200
+        assert fake_emulator[0].swapped_discs == [disc.resolve()]
+
+
+class _RoomSocket:
+    """A stand-in for a seated member's room socket that records what it is sent.
+
+    Attributes:
+        client_state: What the room fanout checks before sending; always connected.
+        sent: Every payload this seat received, in order.
+    """
+
+    def __init__(self) -> None:
+        """Build a connected socket with nothing sent to it yet."""
+        self.client_state = WebSocketState.CONNECTED
+        self.sent: list[dict[str, Any]] = []
+
+    async def send_json(self, payload: dict[str, Any]) -> None:
+        """Record a payload sent to this seat.
+
+        Args:
+            payload: The JSON message the broker produced.
+        """
+        self.sent.append(payload)
+
+    async def close(self, code: int = 1000) -> None:
+        """Accept the close the session teardown sends.
+
+        Args:
+            code: The close code; unused.
+        """
+
+
+def _seat_room_sockets() -> tuple[_RoomSocket, _RoomSocket]:
+    """Seat a recording socket as the controller and another as an invite guest.
+
+    Returns:
+        The controller's socket and the guest's socket.
+    """
+    controller = _RoomSocket()
+    guest = _RoomSocket()
+    session.ROOM["controller"] = {"websocket": controller}
+    session.ROOM["viewers"] = {"guest-token": {"websocket": guest}}
+    return controller, guest
+
+
+def _chat_messages(socket: _RoomSocket) -> list[str]:
+    """List the chat bodies a seat received.
+
+    Args:
+        socket: The recording socket to read.
+
+    Returns:
+        Every chat message body, in the order it arrived.
+    """
+    return [m["message"] for m in socket.sent if m.get("type") == "chat_message"]
+
+
+def test_a_failed_save_dump_is_not_reported_as_a_successful_no_op(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dump that failed is reported as a failure, not as a session with nothing to save.
+
+    Both produce no archive, and calling that a success is what has RomM file
+    the session as saved and drop save data it never received.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+    shutil.rmtree(fake_emulator[0].save_root)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["mode"] == "failed"
+    assert body["upload"]["ok"] is False
+    assert "save dump failed" in body["upload"]["error"]
+    assert body["save_dump"]["error"]
+
+
+def test_a_session_that_saved_nothing_still_reports_a_clean_exit(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that wrote no saves is a skipped upload, which is still a success."""
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["upload"]["mode"] == "skipped"
+    assert body["upload"]["ok"] is True
+    assert body["save_dump"]["error"] is None
+
+
+def test_a_second_activate_arriving_mid_launch_is_refused(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """An activate arriving while another is still launching is refused rather than run.
+
+    Holding the lock stands in for the first caller being somewhere between the
+    409 gate and the session it has not written yet, which is the whole window
+    in which two emulators can end up sharing one screen.
+    """
+    assert api._ACTIVATE_LOCK.acquire(blocking=False)
+    try:
+        response = _activate(client, broker_dirs)
+    finally:
+        api._ACTIVATE_LOCK.release()
+
+    assert response.status_code == 409
+    assert fake_emulator == []
+
+
+def test_a_rom_under_a_symlinked_library_root_is_accepted(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A library root reached through a symlink still contains its own ROMs.
+
+    The incoming path is resolved before the containment check, so a root left
+    unresolved never matches and every launch on such a container is refused.
+    """
+    rom = _rom(broker_dirs)
+    link = tmp_path / "romm-link"
+    link.symlink_to(broker_dirs["roms"])
+    monkeypatch.setattr(settings, "ROM_ROOT", link)
+
+    response = _activate(
+        client,
+        broker_dirs,
+        rom={"id": 5, "name": "Game", "platform": "ps2", "path": str(link / rom.name)},
+    )
+
+    assert response.status_code == 200
+    assert fake_emulator[0].launched[0] == rom.resolve()
+
+
+def test_a_join_says_when_selkies_never_took_the_seat(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A join whose token push was refused says so, rather than handing back a seat that cannot stream."""
+    _activate(client, broker_dirs)
+
+    async def _refuse(_session: dict[str, Any]) -> bool:
+        """Refuse the push.
+
+        Args:
+            _session: The session whose tokens would have been pushed.
+
+        Returns:
+            Always False.
+        """
+        return False
+
+    monkeypatch.setattr(selkies, "push_tokens", _refuse)
+
+    body = client.post(f"{API}/session/join", json={"permission": "participant"}).json()
+
+    assert body["selkies_tokens_pushed"] is False
+
+
+def test_exit_reports_stream_tokens_it_could_not_clear(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exit reports a token set selkies would not empty, so a live credential is not left unnoticed."""
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+    _activate(client, broker_dirs)
+
+    async def _refuse() -> bool:
+        """Refuse the clear.
+
+        Returns:
+            Always False.
+        """
+        return False
+
+    monkeypatch.setattr(selkies, "clear_tokens", _refuse)
+
+    body = client.post(f"{API}/session/exit").json()
+
+    assert body["selkies_tokens_cleared"] is False
+
+
+def test_the_room_gets_its_grace_period_before_the_tokens_go(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The token clear waits out the grace period, so browsers can drop the stream first."""
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.3)
+    _activate(client, broker_dirs)
+    cleared_at: list[float] = []
+
+    async def _record() -> bool:
+        """Record when the clear ran.
+
+        Returns:
+            Always True.
+        """
+        cleared_at.append(time.monotonic())
+        return True
+
+    monkeypatch.setattr(selkies, "clear_tokens", _record)
+    started = time.monotonic()
+
+    client.post(f"{API}/session/exit")
+
+    assert cleared_at
+    assert cleared_at[0] - started >= 0.3
+
+
+def test_the_exit_summary_keeps_paths_urls_and_errors_off_the_invite_seats(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The room summary names no container path, callback URL or upload error; the controller gets those.
+
+    An invite link seats anonymous guests, and the container layout and the
+    parent's endpoints are not theirs to read.
+    """
+    monkeypatch.setattr(api, "TOKEN_CLEAR_GRACE_SECONDS", 0.0)
+
+    async def _refuse(
+        _cb: Optional[dict[str, Any]],
+        _zip_bytes: bytes,
+        _name: str,
+        _sess: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Report the upload as refused by the parent.
+
+        Args:
+            _cb: The session callback block.
+            _zip_bytes: The archive that would have been sent.
+            _name: The archive filename.
+            _sess: The session being exited.
+
+        Returns:
+            A failed upload report naming the endpoint and the error.
+        """
+        return {
+            "mode": "failed",
+            "ok": False,
+            "url": "https://romm.example/api/webstation/saves",
+            "error": "connection refused",
+        }
+
+    monkeypatch.setattr(callback, "push_save_archive", _refuse)
+    _activate(client, broker_dirs)
+    _write_save_after_launch(fake_emulator[0].save_root / "saves" / "card.bin", b"played")
+    controller, guest = _seat_room_sockets()
+
+    body = client.post(f"{API}/session/exit").json()
+    archive_path = body["save_dump"]["archive_path"]
+
+    assert archive_path
+    seen_by_guest = " ".join(_chat_messages(guest))
+    assert archive_path not in seen_by_guest
+    assert "romm.example" not in seen_by_guest
+    assert "connection refused" not in seen_by_guest
+    seen_by_controller = " ".join(_chat_messages(controller))
+    assert archive_path in seen_by_controller
+    assert "connection refused" in seen_by_controller
+
+
+def test_two_state_pushes_never_share_a_staging_file(
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Each state push stages under its own name, so no two can interleave into one file.
+
+    A shared staging name lets a second push write into the first one's file
+    and the rename then publishes the mixture as a state.
+    """
+    _activate(client, broker_dirs)
+    target = tmp_path / "GAME.03.p2s"
+    fake_emulator[0].state_file = target
+    staged: list[str] = []
+    real_replace = os.replace
+
+    def _spy(src: Path, dst: Path) -> None:
+        """Record the staging path a push published from.
+
+        Args:
+            src: The staged file being renamed.
+            dst: Where it is renamed to.
+        """
+        staged.append(str(src))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(api.os, "replace", _spy)
+    for content in (b"first", b"second"):
+        response = client.put(
+            f"{API}/session/state-file", params={"filename": "GAME.01.p2s"}, content=content
+        )
+        assert response.status_code == 200
+
+    assert len(set(staged)) == 2
+    assert target.read_bytes() == b"second"
+    assert list(tmp_path.glob(".*.tmp")) == []
+
+
+@pytest.mark.parametrize("method", ["get", "put"])
+def test_the_memory_card_cannot_be_touched_while_a_session_runs(
+    method: str,
+    client: TestClient,
+    broker_dirs: dict[str, Path],
+    fake_emulator: list[FakeEmulator],
+) -> None:
+    """Neither card route runs mid-session: the emulator holds the card open for the whole game.
+
+    Capture reads a card caught mid-write, and replace corrupts it outright.
+    """
+    _activate(client, broker_dirs)
+    params = {"emulator": "pcsx2"}
+
+    if method == "get":
+        response = client.get(f"{API}/session/memory-card", params=params)
+    else:
+        response = client.put(
+            f"{API}/session/memory-card", params=params, content=_zip({"a": b"x"})
+        )
+
+    assert response.status_code == 409
+    assert list(broker_dirs["imports"].iterdir()) == []
+
+
+def test_a_stored_import_leaves_no_staging_file_behind(
+    client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """A stored import leaves only the archive activate is pointed at."""
+    response = client.put(f"{API}/session/imports/sess-1.zip", content=_zip({"a": b"x"}))
+
+    assert response.status_code == 200
+    assert [p.name for p in broker_dirs["imports"].iterdir()] == ["sess-1.zip"]
+
+
+def test_a_refused_import_leaves_nothing_on_disk(
+    client: TestClient, broker_dirs: dict[str, Path]
+) -> None:
+    """An import refused for not being a zip leaves nothing staged."""
+    response = client.put(f"{API}/session/imports/sess-1.zip", content=b"not a zip at all")
+
+    assert response.status_code == 422
+    assert list(broker_dirs["imports"].iterdir()) == []
+
+
+def test_an_oversized_import_is_refused_without_keeping_the_body(
+    client: TestClient, broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An import over the size limit is refused and nothing it sent is kept."""
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 16)
+
+    response = client.put(
+        f"{API}/session/imports/sess-1.zip", content=_zip({"a": b"x" * 4096})
+    )
+
+    assert response.status_code == 413
+    assert list(broker_dirs["imports"].iterdir()) == []
+
+
+def test_an_oversized_card_push_is_refused_without_keeping_the_body(
+    client: TestClient, broker_dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card over the size limit is refused and nothing it sent is kept."""
+    monkeypatch.setattr(saves, "SAVE_FILE_MAX_BYTES", 16)
+
+    response = client.put(
+        f"{API}/session/memory-card",
+        params={"emulator": "pcsx2"},
+        content=_zip({"a": b"x" * 4096}),
+    )
+
+    assert response.status_code == 413
+    assert list(broker_dirs["imports"].iterdir()) == []

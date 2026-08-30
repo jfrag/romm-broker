@@ -6,6 +6,7 @@ whether input goes to mouse/keyboard, a virtual gamepad slot, or nowhere. The
 broker just keeps that map in sync with room state.
 """
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -68,6 +69,59 @@ def _token_urls() -> list[str]:
     return list(urls)
 
 
+RETRY_DELAY_SECONDS = 0.25
+"""Pause before the one retry a fully failed sweep gets."""
+
+
+async def _post(tokens: dict[str, dict[str, Any]], what: str) -> bool:
+    """POST a token set to selkies, trying each candidate endpoint in turn.
+
+    Every endpoint that refuses is logged with the endpoint that produced it
+    and the traceback, since the cost of a lost push is silent: selkies keeps
+    routing input by the map it already has, so a viewer holds a pad the room
+    thinks it gave away. A sweep that fails everywhere is retried once against
+    the last-known-good endpoint, which covers the common case of a single
+    request losing a race with a selkies restart without making every room
+    action wait out a second full sweep of timeouts. Nothing is queued for
+    later: each call sends the whole map, so the next successful push is
+    itself the reconciliation.
+
+    Args:
+        tokens: The token map to send; empty disconnects every client.
+        what: What this push is, for the log lines.
+
+    Returns:
+        True when an endpoint accepted the push, False when none did (the
+        failure is logged, not raised).
+    """
+    global _active_url
+    urls = _token_urls()
+    rounds = [urls, urls[:1]] if urls else []
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        for index, round_urls in enumerate(rounds):
+            if index:
+                await asyncio.sleep(RETRY_DELAY_SECONDS)
+            for url in round_urls:
+                try:
+                    resp = await client.post(
+                        url,
+                        json=tokens,
+                        headers={"Authorization": f"Bearer {settings.SELKIES_MASTER_TOKEN}"},
+                    )
+                    resp.raise_for_status()
+                    _active_url = url
+                    log.debug("selkies %s accepted by %s (%d tokens)", what, url, len(tokens))
+                    return True
+                except Exception:
+                    log.warning("selkies %s refused by %s", what, url, exc_info=True)
+    log.error(
+        "selkies %s failed on every endpoint (%s); input routing is left on the previous map",
+        what,
+        ", ".join(urls) or "none configured",
+    )
+    return False
+
+
 async def push_tokens(session: dict[str, Any]) -> bool:
     """POST the current token set to selkies.
 
@@ -82,24 +136,7 @@ async def push_tokens(session: dict[str, Any]) -> bool:
         True when an endpoint accepted the push, False when every candidate
         failed (the failure is logged, not raised).
     """
-    global _active_url
-    tokens = build_token_map(session)
-    last_exc = None
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for url in _token_urls():
-            try:
-                resp = await client.post(
-                    url,
-                    json=tokens,
-                    headers={"Authorization": f"Bearer {settings.SELKIES_MASTER_TOKEN}"},
-                )
-                resp.raise_for_status()
-                _active_url = url
-                return True
-            except Exception as exc:
-                last_exc = exc
-    log.warning("selkies token push failed: %s", last_exc)
-    return False
+    return await _post(build_token_map(session), "token push")
 
 
 async def clear_tokens() -> bool:
@@ -109,20 +146,4 @@ async def clear_tokens() -> bool:
         True when an endpoint accepted the empty set, False when every candidate
         failed (the failure is logged, not raised).
     """
-    global _active_url
-    last_exc = None
-    async with httpx.AsyncClient(timeout=2.0) as client:
-        for url in _token_urls():
-            try:
-                resp = await client.post(
-                    url,
-                    json={},
-                    headers={"Authorization": f"Bearer {settings.SELKIES_MASTER_TOKEN}"},
-                )
-                resp.raise_for_status()
-                _active_url = url
-                return True
-            except Exception as exc:
-                last_exc = exc
-    log.warning("selkies token clear failed: %s", last_exc)
-    return False
+    return await _post({}, "token clear")

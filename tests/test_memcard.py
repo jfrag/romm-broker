@@ -195,3 +195,39 @@ def test_a_replaced_card_captures_back_to_the_same_members(tmp_path: Path) -> No
     memcard.replace(card, image, MARKER)
 
     assert _names(memcard.build_archive(card, MARKER)) == _names(image)
+
+
+def test_capture_refuses_a_card_it_could_not_read_in_full(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capture refuses a card whose files could not all be read into the image.
+
+    `replace` wipes the live card before laying an image down, so a partial image is a card missing
+    a save with nothing about it to tell it apart from a complete one afterwards.
+    """
+    card = tmp_path / "Slot 1"
+    memcard.ensure_card(card, MARKER)
+    (card / MARKER).write_bytes(b"superblock")
+    (card / "BASCUS-97129").mkdir()
+    (card / "BASCUS-97129" / "icon.sys").write_bytes(b"icon")
+    real_write = zipfile.ZipFile.write
+    written: list[str] = []
+
+    def _fail_after_the_first(
+        self: zipfile.ZipFile, filename: Path, arcname: str
+    ) -> None:
+        """Write the first member as usual, then fail as an unreadable file would.
+
+        Args:
+            self: The archive being built.
+            filename: The card file to add.
+            arcname: The member name to store it under.
+        """
+        written.append(arcname)
+        if len(written) > 1:
+            raise OSError("input/output error")
+        real_write(self, filename, arcname)
+
+    monkeypatch.setattr(zipfile.ZipFile, "write", _fail_after_the_first)
+
+    assert memcard.build_archive(card, MARKER) == "memory card could not be read in full"

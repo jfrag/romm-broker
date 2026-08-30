@@ -290,6 +290,7 @@ def extract_save_archive(
         for info in wanted:
             target = root / PurePosixPath(info.filename)
             mtime = calendar.timegm(info.date_time)
+            tmp: Optional[Path] = None
             try:
                 # Belt-and-suspenders on top of the member-path check above:
                 # confirms the resolved write location is still under root
@@ -308,6 +309,15 @@ def extract_save_archive(
                 os.utime(target, (mtime, mtime))
             except (OSError, ValueError) as exc:
                 log.warning("saves: could not restore %s: %s", info.filename, exc)
+                # The staging file is dot-prefixed, so `_iter_save_files` never
+                # sees it and no later dump would ever carry it off the disk.
+                if tmp is not None:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError as cleanup_exc:
+                        log.warning(
+                            "saves: could not remove the staging file %s: %s", tmp, cleanup_exc
+                        )
                 result["failed"] += 1
                 continue
             result["written"] += 1
@@ -327,25 +337,4 @@ def write_export(zip_bytes: bytes, name: str) -> str:
     settings.EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     path = settings.EXPORT_DIR / name
     path.write_bytes(zip_bytes)
-    return str(path)
-
-
-def write_import(zip_bytes: bytes, name: str) -> str:
-    """Persist an archive the parent uploaded for restore under `settings.IMPORT_DIR`.
-
-    Written through a temp file and renamed so a half-received upload can
-    never be handed to activate as a restore source.
-
-    Args:
-        zip_bytes: The archive body.
-        name: The filename to write it as.
-
-    Returns:
-        The path written, as a string.
-    """
-    settings.IMPORT_DIR.mkdir(parents=True, exist_ok=True)
-    path = settings.IMPORT_DIR / name
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(zip_bytes)
-    tmp.replace(path)
     return str(path)
