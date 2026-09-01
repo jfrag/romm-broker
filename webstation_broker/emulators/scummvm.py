@@ -247,7 +247,13 @@ def normalize_language(raw: Optional[str]) -> Optional[str]:
     if not lang:
         return None
     lang = _LANGUAGE_ALIASES.get(lang, lang)
-    return lang if lang in SCUMMVM_LANGUAGES else None
+    if lang in SCUMMVM_LANGUAGES:
+        return lang
+    # A locale tag whose region ScummVM makes nothing of ("fr-fr", "en-gb")
+    # still names a language it knows, so only the region is dropped. The tags
+    # whose region does mean something (`pt-br`, `zh-tw`) were translated above.
+    base = lang.partition("-")[0]
+    return base if base in SCUMMVM_LANGUAGES else None
 
 
 def _language_rank(keys: dict[str, str], language: Optional[str]) -> int:
@@ -336,28 +342,33 @@ def _ini_domains() -> dict[str, dict[str, str]]:
     return domains
 
 
-def _pins(fullscreen: bool) -> dict[str, dict[str, str]]:
+def _pins(
+    fullscreen: bool, gui_language: Optional[str] = None
+) -> dict[str, dict[str, str]]:
     """The settings this launch pins, per ini section.
 
     Args:
         fullscreen: Whether the game should fill the stream.
+        gui_language: The interface language to pin, or None to leave whatever
+            the file says. Absent rather than empty, because writing an empty
+            value would override the user's own setting with nothing.
 
     Returns:
         Section name to the keys pinned in it: `_INI_PINS` plus the save
         directory and this launch's `fullscreen` under `[scummvm]`, and the
         menu binding the macros depend on under `[keymapper]`.
     """
-    return {
-        "scummvm": {
-            **_INI_PINS,
-            "savepath": str(SAVE_DIR),
-            "fullscreen": "true" if fullscreen else "false",
-        },
-        "keymapper": {"keymap_global_MENU": MENU_KEY},
+    app = {
+        **_INI_PINS,
+        "savepath": str(SAVE_DIR),
+        "fullscreen": "true" if fullscreen else "false",
     }
+    if gui_language:
+        app["gui_language"] = gui_language
+    return {"scummvm": app, "keymapper": {"keymap_global_MENU": MENU_KEY}}
 
 
-def patch_ini(fullscreen: bool = True) -> None:
+def patch_ini(fullscreen: bool = True, gui_language: Optional[str] = None) -> None:
     """Write the broker's pinned settings into scummvm.ini.
 
     Existing keys are rewritten in place and missing ones appended to their
@@ -373,8 +384,12 @@ def patch_ini(fullscreen: bool = True) -> None:
 
     Args:
         fullscreen: Whether the game should fill the stream.
+        gui_language: The interface language to pin, or None to leave the
+            file's own. Pinning it is also what makes `gmm_hotkeys` read the
+            right letters, since the GMM buttons take their shortcut from the
+            translated label.
     """
-    pins = _pins(fullscreen)
+    pins = _pins(fullscreen, gui_language)
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -960,14 +975,28 @@ class Scummvm(Emulator):
 
         self._launch_seq += 1
         seq = self._launch_seq
-        patch_ini(FULLSCREEN)
+
+        gui_language = normalize_language(self.gui_language)
+        if self.gui_language and gui_language is None:
+            log.warning(
+                "scummvm: ignoring unrecognised gui_language %r, leaving the "
+                "interface as configured",
+                self.gui_language,
+            )
+        patch_ini(FULLSCREEN, gui_language)
 
         language = normalize_language(self.language)
         if self.language and language is None:
             log.warning(
-                "scummvm: ignoring unrecognised language %r, booting the game's own default",
+                "scummvm: ignoring unrecognised language %r, falling back to "
+                "the interface language or the game's own default",
                 self.language,
             )
+        # A multilingual folder registers one target per detected language and
+        # the target is what boots, so a rom that names no language of its own
+        # leaves the player's interface language as the only thing saying which
+        # variant they want. Without either, the name breaks the tie.
+        language = language or gui_language
         target = target_for_path(rom_dir, language) or register_target(rom_dir, language)
         if target is None:
             raise RuntimeError(f"scummvm: no detectable game in {rom_dir}")
@@ -996,10 +1025,12 @@ class Scummvm(Emulator):
         cmd.append(target)
 
         log.info(
-            "scummvm: launching %s (rom=%s, language=%s, resume_slot=%s, boot resume=%s)",
+            "scummvm: launching %s (rom=%s, language=%s, gui_language=%s, "
+            "resume_slot=%s, boot resume=%s)",
             target,
             rom_dir,
             language or "-",
+            gui_language or "-",
             resume_slot,
             resume_path is not None,
         )

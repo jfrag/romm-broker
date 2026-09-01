@@ -231,9 +231,13 @@ it also goes on the command line so the running game agrees with the domain it
 booted from. Codes are translated to ScummVM's own spellings (`pt-br` becomes
 `br`, `jp` becomes `ja`, `zh-hans` becomes `cn`), a close relative stands in
 when the exact one is absent (a `us` variant answers an `en` request), and a
-code ScummVM would reject is dropped rather than failing the boot. With no
-language at all the pick is alphabetical and stable, which is what keeps the
-`<target>.sNN` save names from moving between relaunches.
+code ScummVM would reject is dropped rather than failing the boot. A rom that
+names no language falls back to `gui_language`, the player's own interface
+language: RomM rarely knows what language a game is in, and a multilingual
+folder is exactly the case where it usually does not, so the player's is then
+the only thing saying which variant they want. With neither, the pick is
+alphabetical and stable, which is what keeps the `<target>.sNN` save names from
+moving between relaunches.
 
 There is no control socket and no state hotkeys, so save and load drive the
 Global Main Menu with xdotool: the menu key opens it, the bare-letter Save/Load
@@ -248,8 +252,9 @@ arrives without its Ctrl and the menu never opens; the unmodified `F5` that
 does work belongs to the engine keymap, which an engine may take for itself
 (gob answers it with Gobliiins' own panel, which has no Save). And the button
 letters follow the GUI translation (`~S~ave` becomes `~S~auvegarder`), so they
-are read back from `gui_language`. Only that one keymap action is pinned; any
-other binding the user set is left alone.
+are read back from `gui_language` — which the activate payload pins when it
+carries one, and which is left as the user set it when it does not. Only that
+one keymap action is pinned; any other binding the user set is left alone.
 
 The macro says nothing about its result, so a save is only reported once the
 slot's file has actually changed on disk. Engines without runtime save support

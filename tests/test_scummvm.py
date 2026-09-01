@@ -1154,6 +1154,11 @@ def test_waiting_for_a_state_returns_as_soon_as_it_lands(
         ("jp", "ja"),
         ("zh-hans", "cn"),
         ("no", "nb"),
+        # A locale tag keeps its language when the region says nothing extra.
+        ("fr_FR", "fr"),
+        ("en_GB", "en"),
+        ("zh_TW", "tw"),
+        ("fr-CA", "fr-ca"),
         # No preference, rather than a failure, for anything unusable.
         ("", None),
         ("xx", None),
@@ -1316,3 +1321,112 @@ def test_an_unusable_language_does_not_fail_the_launch(
 
     assert not any(arg.startswith("--language=") for arg in spawned.cmd)
     assert spawned.cmd[-1] == "monkey"
+
+
+def _multilingual(dirs: dict[str, Path]) -> Path:
+    """A folder registered as one German and one French variant of the same game."""
+    folder = game_folder(dirs["roms"])
+    write_ini(
+        dirs["ini"],
+        f"""
+        [monkey-de]
+        gameid=monkey
+        language=de
+        path={folder.resolve()}
+
+        [monkey-fr]
+        gameid=monkey
+        language=fr
+        path={folder.resolve()}
+        """,
+    )
+    return folder
+
+
+def test_the_gui_language_picks_the_variant_when_the_rom_names_none(
+    dirs: dict[str, Path], spawned: Spawned
+) -> None:
+    """A rom with no language of its own boots in the player's own language.
+
+    RomM only knows a game's language when the library says so, and a
+    multilingual folder is exactly the case where it usually does not. Without
+    this the name breaks the tie and a French player gets the German variant.
+    """
+    folder = _multilingual(dirs)
+    emu = Scummvm()
+    emu.gui_language = "fr"
+
+    emu.launch(emu.resolve_rom_file(folder), None)
+
+    assert spawned.cmd[-1] == "monkey-fr"
+    assert "--language=fr" in spawned.cmd
+
+
+def test_the_rom_language_beats_the_gui_language(
+    dirs: dict[str, Path], spawned: Spawned
+) -> None:
+    """The game's own language wins: the fallback only fills a gap."""
+    folder = _multilingual(dirs)
+    emu = Scummvm()
+    emu.language = "de"
+    emu.gui_language = "fr"
+
+    emu.launch(emu.resolve_rom_file(folder), None)
+
+    assert spawned.cmd[-1] == "monkey-de"
+    assert "--language=de" in spawned.cmd
+
+
+def test_the_gui_language_is_pinned_in_the_ini(
+    dirs: dict[str, Path], spawned: Spawned
+) -> None:
+    """ScummVM's own interface follows the player, and so do the GMM hotkeys.
+
+    `gmm_hotkeys` reads the letters back out of the file, so pinning it here is
+    what makes the save and load macros press the translated buttons.
+    """
+    folder = registered(dirs)
+    emu = Scummvm()
+    emu.gui_language = "fr"
+
+    emu.launch(emu.resolve_rom_file(folder), None)
+
+    assert scummvm._ini_domains()["scummvm"]["gui_language"] == "fr"
+    assert scummvm.gmm_hotkeys() == scummvm._GMM_HOTKEYS["fr"]
+
+
+def test_no_gui_language_leaves_the_ini_setting_alone(
+    dirs: dict[str, Path], spawned: Spawned
+) -> None:
+    """An absent language must not overwrite what the user configured."""
+    folder = game_folder(dirs["roms"])
+    write_ini(
+        dirs["ini"],
+        f"""
+        [scummvm]
+        gui_language=it
+
+        [monkey]
+        gameid=monkey
+        path={folder.resolve()}
+        """,
+    )
+    emu = Scummvm()
+
+    emu.launch(emu.resolve_rom_file(folder), None)
+
+    assert scummvm._ini_domains()["scummvm"]["gui_language"] == "it"
+
+
+def test_an_unusable_gui_language_is_not_pinned(
+    dirs: dict[str, Path], spawned: Spawned
+) -> None:
+    """A code ScummVM would reject never reaches the ini or the target pick."""
+    folder = _multilingual(dirs)
+    emu = Scummvm()
+    emu.gui_language = "klingon"
+
+    emu.launch(emu.resolve_rom_file(folder), None)
+
+    assert "gui_language" not in scummvm._ini_domains()["scummvm"]
+    assert not any(arg.startswith("--language=") for arg in spawned.cmd)
