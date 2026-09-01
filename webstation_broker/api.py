@@ -75,12 +75,21 @@ class RomIn(BaseModel):
         id: RomM's id for the rom, if known.
         name: The rom's display name, if known.
         platform: The platform slug, which general-purpose emulators use to pick a core.
+        language: The rom's language, for emulators whose games ship several in one folder.
         path: Absolute container path to the rom, validated against ROM_ROOT on activate.
     """
 
     id: Optional[int] = None
     name: Optional[str] = None
     platform: Optional[str] = None
+    language: Optional[str] = None
+    """The rom's language, for a launcher whose games ship several in one folder.
+
+    ScummVM detects one target per language in a game folder and the target is
+    what boots, so without this a multilingual game starts in whichever
+    language sorts first. Unknown or absent values leave the emulator on its
+    own default rather than failing the launch.
+    """
     path: str
 
 
@@ -478,9 +487,11 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
     emulator = get_emulator(body.emulator)
     if emulator is None:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
-    # General-purpose emulators (retroarch) pick their core from the platform.
+    # General-purpose emulators (retroarch) pick their core from the platform,
+    # and a multilingual folder (ScummVM) picks its target from the language.
     if body.rom is not None:
         emulator.platform = body.rom.platform
+        emulator.language = body.rom.language
 
     rom_file = None
     if emulator.requires_rom:

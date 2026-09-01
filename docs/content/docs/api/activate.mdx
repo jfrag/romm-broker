@@ -29,7 +29,7 @@ The payload fields:
 | Field | Required | Purpose |
 | --- | --- | --- |
 | `emulator` | yes | A registry key from [Supported emulators](/docs/emulators). |
-| `rom` | unless the emulator is `desktop` | `path` is the container path; `id`, `name` and `platform` are echoed in the exit upload and, for `retroarch`, `platform` picks the core. |
+| `rom` | unless the emulator is `desktop` | `path` is the container path; `id`, `name` and `platform` are echoed in the exit upload and, for `retroarch`, `platform` picks the core. The optional `language` is the rom's own language, for an emulator whose games ship several of them in one folder: ScummVM registers one target per language it detects and the target is what boots, so without it a multilingual game starts in whichever language sorts first. An unrecognised code is ignored rather than failing the launch. |
 | `user` | no | `id`, `username`, `display_name` of the controller. Joins and re-joins match on `id`, then `username`. |
 | `session_id` | no | A caller-supplied id, reduced to what is safe in a filename; the broker mints one otherwise. |
 | `save` | no | See below. |
