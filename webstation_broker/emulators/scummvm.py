@@ -29,9 +29,11 @@ works in `STATE_SLOT` (default 1) and, like every launcher here, resolves
 whatever slot RomM asks for to that one.
 
 Two more ini settings are pinned for the stream rather than for ScummVM's own
-sake. `fullscreen`, pinned off, because going fullscreen makes SDL grab and
-confine the pointer against a stack that feeds it absolutely; `SCUMMVM_FULLSCREEN`
-turns it on for an image known to survive that. `gfx_mode=surfacesdl` because
+sake. `fullscreen`, pinned off whatever the launch, because going fullscreen
+makes SDL grab and confine the pointer against a stack that feeds it
+absolutely; the window is grown to the display afterwards instead, which SDL
+reads as an ordinary resize (`SCUMMVM_FILL_SCREEN`). `gfx_mode=surfacesdl`
+because
 the OpenGL renderer scales mouse coordinates through `getSdlDpiScalingFactor`
 (backends/platform/sdl/sdl-window.cpp), which divides by
 `SDL_GL_GetDrawableSize` and only means anything for a GL window, so against an
@@ -102,37 +104,38 @@ RESUME_LOAD_WAIT = float(os.environ.get("SCUMMVM_RESUME_LOAD_WAIT", "45"))
 """Seconds a deferred resume waits for RomM to push its state (env `SCUMMVM_RESUME_LOAD_WAIT`)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("SCUMMVM_RESUME_LOAD_SETTLE", "8"))
 """Seconds a deferred resume gives the game to reach a menu-able state (env `SCUMMVM_RESUME_LOAD_SETTLE`)."""
-FULLSCREEN = os.environ.get("SCUMMVM_FULLSCREEN", "false").lower() in (
-    "true",
-    "1",
-    "yes",
-    "on",
+FILL_SCREEN = os.environ.get("SCUMMVM_FILL_SCREEN", "true").lower() not in (
+    "false",
+    "0",
+    "no",
+    "off",
 )
-"""Whether the game fills the stream (env `SCUMMVM_FULLSCREEN`, default off).
+"""Whether the game is grown to fill the stream (env `SCUMMVM_FILL_SCREEN`, default on).
 
-Windowed is the ugly option and the working one. A ScummVM window is its
-game's own resolution, 640x480 for most, so it sits as a postage stamp in the
-middle of the stream; fullscreen is ScummVM's own scaler filling the display
-and looks far better. What it costs is the pointer. Going fullscreen makes
-ScummVM's SDL window grab the pointer and confine it to a rect
-(`SdlWindow::createOrUpdateWindow`: `shouldGrab = ... || fullscreenFlags`,
-then `SDL_SetWindowMouseRect`) and ask SDL for an explicit display mode on the
-way in. Both are harmless on a real X server and both fight the streaming
-stack, which feeds an absolute pointer and owns the display size itself: the
-pointer stops tracking the stream while clicks still land, and these games are
-nothing but mouse. Off by default for that reason; the env var trades the
-pointer for the full stream if an image is known to survive it.
+A ScummVM window is its game's own resolution, 640x480 for most, which is a
+postage stamp in the middle of the stream. The obvious fix is ScummVM's own
+fullscreen, and it is the wrong one: going fullscreen makes SDL grab the
+pointer and confine it to a rect (`SdlWindow::createOrUpdateWindow`:
+`shouldGrab = ... || fullscreenFlags`, then `SDL_SetWindowMouseRect`) and ask
+for an explicit display mode on the way in. Both are harmless on a real X
+server and both fight a streaming stack that feeds an absolute pointer and owns
+the display size itself: the pointer stops tracking while clicks still land,
+and these games are nothing but mouse. `fullscreen` is therefore pinned off in
+the ini whatever this setting says.
 
-This is downstream of a separate, mandatory container fix: a running game holds
-Xwayland's warp-emulation pointer lock, which silently drops the absolute
-virtual-pointer motion the browser sends, and no launcher setting reaches that.
-The image has to patch selkies' `input_handler.py` to re-inject the residual
-through the relative path (and ship `python-xlib` for the pointer readback the
-detection needs). Without it the in-game pointer is dead windowed too.
+What works is asking the window manager for the size instead. The window is
+resized to the display after launch, SDL sees an ordinary resize and scales its
+output into it — letterboxing to keep the game's aspect on its own — and never
+sets the flag that triggers the grab. The cost is the title bar, which no tool
+in this image can remove (xdotool 3.2016 has no `windowstate`, and there is no
+wmctrl); a labwc window rule in the image would.
 
-`window_maximized` is deliberately not used: labwc leaves the window at its
-own size regardless, so it fills nothing.
+`window_maximized` is deliberately not used either: labwc leaves the window at
+its own size regardless, so it fills nothing.
 """
+
+FILL_SCREEN_WAIT = float(os.environ.get("SCUMMVM_FILL_SCREEN_WAIT", "10"))
+"""Seconds to wait for the game window before giving up on resizing it."""
 
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 """The xdotool binary that drives the GMM (env `XDOTOOL_BIN`)."""
@@ -192,8 +195,8 @@ _INI_PINS = {
 `gui_saveload_chooser` because the macros walk a list and the default grid
 chooser has no keyboard path to a numbered slot. `gfx_mode` because ScummVM's
 OpenGL renderer mis-scales the pointer, explained in the module docstring.
-`savepath` and `fullscreen` depend on where the saves are and on how the
-launch was configured, so `_pins` adds them on top of these.
+`savepath` and `fullscreen` depend on where the saves live and on the grab
+ScummVM's own fullscreen would cost, so `_pins` adds them on top of these.
 """
 
 _SAVE_NAME_RE = re.compile(r"^(?P<stem>[^/\\.]+)\.(?P<ext>s\d{2,3}|\d{3})$")
@@ -355,33 +358,27 @@ def _ini_domains() -> dict[str, dict[str, str]]:
     return domains
 
 
-def _pins(
-    fullscreen: bool, gui_language: Optional[str] = None
-) -> dict[str, dict[str, str]]:
+def _pins(gui_language: Optional[str] = None) -> dict[str, dict[str, str]]:
     """The settings this launch pins, per ini section.
 
     Args:
-        fullscreen: Whether the game should fill the stream.
         gui_language: The interface language to pin, or None to leave whatever
             the file says. Absent rather than empty, because writing an empty
             value would override the user's own setting with nothing.
 
     Returns:
         Section name to the keys pinned in it: `_INI_PINS` plus the save
-        directory and this launch's `fullscreen` under `[scummvm]`, and the
-        menu binding the macros depend on under `[keymapper]`.
+        directory and `fullscreen=false` under `[scummvm]`, and the menu
+        binding the macros depend on under `[keymapper]`. `fullscreen` is
+        never true: see `FILL_SCREEN` for the grab it would cost.
     """
-    app = {
-        **_INI_PINS,
-        "savepath": str(SAVE_DIR),
-        "fullscreen": "true" if fullscreen else "false",
-    }
+    app = {**_INI_PINS, "savepath": str(SAVE_DIR), "fullscreen": "false"}
     if gui_language:
         app["gui_language"] = gui_language
     return {"scummvm": app, "keymapper": {"keymap_global_MENU": MENU_KEY}}
 
 
-def patch_ini(fullscreen: bool = False, gui_language: Optional[str] = None) -> None:
+def patch_ini(gui_language: Optional[str] = None) -> None:
     """Write the broker's pinned settings into scummvm.ini.
 
     Existing keys are rewritten in place and missing ones appended to their
@@ -396,13 +393,12 @@ def patch_ini(fullscreen: bool = False, gui_language: Optional[str] = None) -> N
     to be the pinned ones.
 
     Args:
-        fullscreen: Whether the game should fill the stream.
         gui_language: The interface language to pin, or None to leave the
             file's own. Pinning it is also what makes `gmm_hotkeys` read the
             right letters, since the GMM buttons take their shortcut from the
             translated label.
     """
-    pins = _pins(fullscreen, gui_language)
+    pins = _pins(gui_language)
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -842,11 +838,14 @@ class Scummvm(Emulator):
         self._rom_dir = resolved
         return resolved
 
-    def _xdotool(self, *args: str) -> Optional[str]:
+    def _xdotool(self, *args: str, quiet: bool = False) -> Optional[str]:
         """Run one xdotool command against the session display.
 
         Args:
             *args: Arguments passed to the xdotool binary.
+            quiet: Suppress the failure warning. For a caller polling for
+                something that is not there yet, where `search` exiting
+                non-zero is the expected answer rather than a fault.
 
         Returns:
             Its stdout, or None if it could not be run, timed out, or exited non-zero.
@@ -860,14 +859,18 @@ class Scummvm(Emulator):
                 timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            log.warning("scummvm: xdotool %s failed: %s", " ".join(args), exc)
+            if not quiet:
+                log.warning("scummvm: xdotool %s failed: %s", " ".join(args), exc)
             return None
         if result.returncode != 0:
-            log.warning("scummvm: xdotool %s: %s", " ".join(args), result.stderr.strip())
+            if not quiet:
+                log.warning(
+                    "scummvm: xdotool %s: %s", " ".join(args), result.stderr.strip()
+                )
             return None
         return result.stdout
 
-    def _window(self) -> Optional[str]:
+    def _window(self, quiet: bool = False) -> Optional[str]:
         """The X window this launch's ScummVM renders into.
 
         Matched on this process's own pid, so a window left behind by an
@@ -875,18 +878,27 @@ class Scummvm(Emulator):
         lists in creation order and ScummVM's game window is created after the
         transient ones.
 
+        Args:
+            quiet: Suppress the "no window" warning. For a caller polling for
+                a window that is not mapped yet, where absence is the normal
+                answer until it is not.
+
         Returns:
             The window id as xdotool prints it, or None when this process has
             no visible window.
         """
         proc = self._proc
         if proc is None:
-            log.warning("scummvm: no process to find a window for")
+            if not quiet:
+                log.warning("scummvm: no process to find a window for")
             return None
-        out = self._xdotool("search", "--onlyvisible", "--pid", str(proc.pid))
+        out = self._xdotool(
+            "search", "--onlyvisible", "--pid", str(proc.pid), quiet=quiet
+        )
         ids = out.split() if out else []
         if not ids:
-            log.warning("scummvm: no visible window for pid %d", proc.pid)
+            if not quiet:
+                log.warning("scummvm: no visible window for pid %d", proc.pid)
             return None
         return ids[-1]
 
@@ -996,7 +1008,7 @@ class Scummvm(Emulator):
                 "interface as configured",
                 self.gui_language,
             )
-        patch_ini(FULLSCREEN, gui_language)
+        patch_ini(gui_language)
 
         language = normalize_language(self.language)
         if self.language and language is None:
@@ -1049,8 +1061,52 @@ class Scummvm(Emulator):
         )
         self._spawn(cmd, env)
 
+        if FILL_SCREEN:
+            Thread(target=self._fill_screen, args=(seq,), daemon=True).start()
         if resume_slot is not None and resume_path is None:
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
+
+    def _fill_screen(self, seq: int) -> None:
+        """Grow the game window to the display once it exists.
+
+        Waits for the window because it is not mapped the instant the process
+        starts, and abandons itself if a later launch has taken over. Purely
+        cosmetic, so every failure is logged and swallowed: a game running at
+        640x480 in the middle of the stream is worth more than a launch
+        reported as broken.
+
+        Args:
+            seq: The launch sequence number this resize belongs to.
+        """
+        deadline = time.monotonic() + FILL_SCREEN_WAIT
+        win_id = None
+        while time.monotonic() < deadline:
+            if self._launch_seq != seq:
+                return
+            win_id = self._window(quiet=True)
+            if win_id:
+                break
+            time.sleep(0.5)
+        if not win_id:
+            log.warning("scummvm: no window to fill the screen with")
+            return
+
+        geometry = self._xdotool("getdisplaygeometry")
+        parts = geometry.split() if geometry else []
+        if len(parts) != 2 or not all(p.isdigit() for p in parts):
+            log.warning("scummvm: could not read the display size, window left as is")
+            return
+        width, height = parts
+
+        if self._launch_seq != seq:
+            return
+        # Move first: a window placed by the WM at an offset would otherwise be
+        # sized to the display and then hang off the bottom right of it.
+        if self._xdotool("windowmove", win_id, "0", "0") is None:
+            return
+        if self._xdotool("windowsize", win_id, width, height) is None:
+            return
+        log.info("scummvm: window %s grown to %sx%s", win_id, width, height)
 
     def _deferred_load_state(self, seq: int) -> None:
         """Wait for a pushed state to arrive, then load it through the menu.

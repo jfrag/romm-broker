@@ -543,20 +543,62 @@ def test_a_macro_focuses_the_window_before_sending_keys(
     )
 
 
-@pytest.mark.parametrize(("fullscreen", "expected"), [(True, "true"), (False, "false")])
-def test_the_window_mode_follows_the_launch(
-    dirs: dict[str, Path], fullscreen: bool, expected: str
+def test_the_window_is_grown_to_the_display(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Whether the game fills the stream is decided per launch.
+    """Filling the stream is the window manager's job, not SDL's.
 
-    Args:
-        dirs: The redirected directories.
-        fullscreen: Whether this launch fills the stream.
-        expected: The value that has to land in the ini.
+    The move comes first: a window the WM placed at an offset would otherwise
+    be sized to the display and hang off the bottom right of it.
     """
-    scummvm.patch_ini(fullscreen)
+    xdo = Xdo()
+    emu = running(monkeypatch, xdo)
 
-    assert scummvm._ini_domains()["scummvm"]["fullscreen"] == expected
+    emu._fill_screen(emu._launch_seq)
+
+    assert ("windowmove", "4242", "0", "0") in xdo.calls
+    assert ("windowsize", "4242", "1280", "720") in xdo.calls
+    assert xdo.calls.index(("windowmove", "4242", "0", "0")) < xdo.calls.index(
+        ("windowsize", "4242", "1280", "720")
+    )
+
+
+def test_an_unreadable_display_size_leaves_the_window_alone(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Growing the window is cosmetic, so a failure never touches the game."""
+    xdo = Xdo()
+    xdo.display = "not a size"
+    emu = running(monkeypatch, xdo)
+
+    emu._fill_screen(emu._launch_seq)
+
+    assert not [c for c in xdo.calls if c and c[0] in ("windowmove", "windowsize")]
+
+
+def test_a_superseded_launch_does_not_resize(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relaunch must not have the previous launch's resize land on it."""
+    xdo = Xdo()
+    emu = running(monkeypatch, xdo)
+
+    emu._fill_screen(emu._launch_seq - 1)
+
+    assert not [c for c in xdo.calls if c and c[0] in ("windowmove", "windowsize")]
+
+
+def test_fullscreen_is_pinned_off_whatever_the_ini_said(dirs: dict[str, Path]) -> None:
+    """ScummVM's own fullscreen is never used.
+
+    It makes SDL grab and confine the pointer, which is fatal against an
+    injected absolute pointer; the window manager grows the window instead.
+    """
+    write_ini(dirs["ini"], "[scummvm]\nfullscreen=true")
+
+    scummvm.patch_ini()
+
+    assert scummvm._ini_domains()["scummvm"]["fullscreen"] == "false"
 
 
 # ── GMM hotkeys ───────────────────────────────────────────────────────────────
@@ -777,6 +819,9 @@ def spawned(monkeypatch: pytest.MonkeyPatch) -> Spawned:
         self._proc = SimpleNamespace(pid=4242, poll=lambda: None)
 
     monkeypatch.setattr(Scummvm, "_spawn", fake_spawn)
+    # Growing the window is a launch side effect that reaches for the real
+    # xdotool; the tests that care drive `_fill_screen` themselves.
+    monkeypatch.setattr(scummvm, "FILL_SCREEN", False)
     return record
 
 
@@ -897,6 +942,7 @@ class Xdo:
     Attributes:
         calls: Every argument list the launcher passed, in order.
         writes: The file a `Return` creates, standing in for ScummVM's write.
+        display: What `getdisplaygeometry` answers.
     """
 
     def __init__(self, writes: Optional[Path] = None) -> None:
@@ -907,12 +953,14 @@ class Xdo:
         """
         self.calls: list[tuple[str, ...]] = []
         self.writes = writes
+        self.display = "1280 720"
 
-    def __call__(self, *args: str) -> Optional[str]:
+    def __call__(self, *args: str, **kwargs: Any) -> Optional[str]:
         """Record one xdotool call and answer the way the real one would.
 
         Args:
             *args: The xdotool arguments.
+            **kwargs: The real helper's keyword options, ignored here.
 
         Returns:
             A window id for a search, an empty string for anything else.
@@ -920,6 +968,8 @@ class Xdo:
         self.calls.append(args)
         if args and args[0] == "search":
             return "4242\n"
+        if args and args[0] == "getdisplaygeometry":
+            return self.display
         if self.writes is not None and "Return" in args:
             self.writes.write_bytes(b"state")
         return ""
@@ -944,7 +994,9 @@ def running(monkeypatch: pytest.MonkeyPatch, xdo: Xdo, target: str = "monkey") -
     Returns:
         The launcher, ready for a macro.
     """
-    monkeypatch.setattr(Scummvm, "_xdotool", lambda self, *args: xdo(*args))
+    monkeypatch.setattr(
+        Scummvm, "_xdotool", lambda self, *args, **kwargs: xdo(*args, **kwargs)
+    )
     emu = booted(target)
     emu._proc = SimpleNamespace(pid=4242, poll=lambda: None)
     return emu
@@ -1008,7 +1060,7 @@ def test_a_macro_without_a_window_fails(
     dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With no window to send to there is nothing to drive."""
-    monkeypatch.setattr(Scummvm, "_xdotool", lambda self, *args: None)
+    monkeypatch.setattr(Scummvm, "_xdotool", lambda self, *args, **kwargs: None)
     emu = booted()
     emu._proc = SimpleNamespace(pid=4242, poll=lambda: None)
 
