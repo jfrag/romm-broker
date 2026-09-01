@@ -425,7 +425,7 @@ def test_a_missing_ini_is_created_with_the_pins(dirs: dict[str, Path]) -> None:
     domains = scummvm._ini_domains()
     assert domains["scummvm"]["gui_saveload_chooser"] == "list"
     assert domains["scummvm"]["savepath"] == str(dirs["saves"])
-    assert domains["scummvm"]["fullscreen"] == "true"
+    assert domains["scummvm"]["fullscreen"] == "false"
 
 
 def test_pinned_keys_are_rewritten_and_the_rest_is_left_alone(dirs: dict[str, Path]) -> None:
@@ -435,7 +435,7 @@ def test_pinned_keys_are_rewritten_and_the_rest_is_left_alone(dirs: dict[str, Pa
         """
         [scummvm]
         gui_saveload_chooser=grid
-        fullscreen=false
+        fullscreen=true
         music_volume=192
 
         [monkey]
@@ -448,7 +448,7 @@ def test_pinned_keys_are_rewritten_and_the_rest_is_left_alone(dirs: dict[str, Pa
 
     domains = scummvm._ini_domains()
     assert domains["scummvm"]["gui_saveload_chooser"] == "list"
-    assert domains["scummvm"]["fullscreen"] == "true"
+    assert domains["scummvm"]["fullscreen"] == "false"
     assert domains["scummvm"]["music_volume"] == "192"
     # A game domain the broker did not write must come out of this untouched.
     assert domains["monkey"]["path"] == "/romm/monkey"

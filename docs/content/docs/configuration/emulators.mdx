@@ -207,5 +207,5 @@ Timings are in seconds.
 | `SCUMMVM_ADD_TIMEOUT` | `120` | How long `scummvm --add` gets to scan a folder. Detection reads through every file in it. |
 | `SCUMMVM_RESUME_LOAD_WAIT` | `45` | How long a deferred resume waits for the parent to push its state. |
 | `SCUMMVM_RESUME_LOAD_SETTLE` | `8` | How long that resume then gives the game to reach a state where it answers the menu. |
-| `SCUMMVM_FULLSCREEN` | `true` | Let ScummVM fill the stream. A window is the game's own resolution, 640x480 for most, which is a postage stamp on a 1080p stream. Set it false for a compositor that confines the pointer to a fullscreen window, since these games are nothing but mouse. |
+| `SCUMMVM_FULLSCREEN` | `false` | Let ScummVM fill the stream. A window is the game's own resolution, 640x480 for most, which is a postage stamp on a 1080p stream — but fullscreen makes SDL grab and confine the pointer against a stack that feeds it absolutely, so the cursor stops tracking while clicks still land. Off by default because these games are nothing but mouse; turn it on for an image known to survive it. |
 | `SCUMMVM_STOP_WAIT` | `10` | Seconds SIGTERM gets, which ScummVM spends flushing its config, before escalating to SIGKILL. |

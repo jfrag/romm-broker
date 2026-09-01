@@ -273,16 +273,32 @@ in is renamed onto the booted target, because ScummVM finds a save by name
 alone and a multilingual folder registers one target per language.
 
 Two more pins are for the stream rather than for ScummVM's own sake.
-`fullscreen`, on by default, because a ScummVM window is its game's own
-resolution and 640x480 in the middle of a 1080p stream is a postage stamp;
-`SCUMMVM_FULLSCREEN` turns it off for a compositor that would confine the
-pointer to a fullscreen window. (ScummVM's `window_maximized` is not used:
-labwc leaves the window at its own size regardless, so it fills nothing.) And
+`fullscreen`, **off** by default. A ScummVM window is its game's own
+resolution, so 640x480 sits as a postage stamp in the middle of the stream and
+fullscreen looks far better — but going fullscreen makes SDL grab the pointer
+and confine it to a rect (`shouldGrab = ... || fullscreenFlags`, then
+`SDL_SetWindowMouseRect`) and ask for an explicit display mode, and both fight
+a stack that feeds an absolute pointer and owns the display size itself: the
+pointer stops tracking the stream while clicks still land. These games are
+nothing but mouse, so windowed is the default and `SCUMMVM_FULLSCREEN` trades
+the pointer for the full stream on an image known to survive it. (ScummVM's
+`window_maximized` is not used: labwc leaves the window at its own size
+regardless, so it fills nothing.) And
 `gfx_mode=surfacesdl`, because the OpenGL renderer scales mouse coordinates
 through `SDL_GL_GetDrawableSize`, which means nothing outside a GL window, so
 against an injected absolute pointer the game takes clicks while the cursor
 stops moving. SDL is also forced onto X11 at launch so the macros have an
 Xwayland window to talk to.
+
+None of that reaches the one pointer problem a launcher cannot fix. A running
+game holds Xwayland's warp-emulation pointer lock — ScummVM hides the system
+cursor and warps the pointer — and a locked compositor pointer silently drops
+the *absolute* virtual-pointer motion the browser sends while still delivering
+relative motion, so the in-game cursor freezes with clicks landing. The image
+has to patch selkies' `input_handler.py` to read the X pointer back after each
+absolute injection and re-inject the residual through the relative path, and
+ship `python-xlib` for that readback. Without it the pointer is dead windowed
+too, whatever this launcher pins.
 
 ## Desktop
 

@@ -29,9 +29,9 @@ works in `STATE_SLOT` (default 1) and, like every launcher here, resolves
 whatever slot RomM asks for to that one.
 
 Two more ini settings are pinned for the stream rather than for ScummVM's own
-sake. `fullscreen` because a ScummVM window is its game's own resolution, and
-640x480 in the middle of a 1080p stream is a postage stamp; it is on by
-default and `SCUMMVM_FULLSCREEN` turns it off. `gfx_mode=surfacesdl` because
+sake. `fullscreen`, pinned off, because going fullscreen makes SDL grab and
+confine the pointer against a stack that feeds it absolutely; `SCUMMVM_FULLSCREEN`
+turns it on for an image known to survive that. `gfx_mode=surfacesdl` because
 the OpenGL renderer scales mouse coordinates through `getSdlDpiScalingFactor`
 (backends/platform/sdl/sdl-window.cpp), which divides by
 `SDL_GL_GetDrawableSize` and only means anything for a GL window, so against an
@@ -102,20 +102,33 @@ RESUME_LOAD_WAIT = float(os.environ.get("SCUMMVM_RESUME_LOAD_WAIT", "45"))
 """Seconds a deferred resume waits for RomM to push its state (env `SCUMMVM_RESUME_LOAD_WAIT`)."""
 RESUME_LOAD_SETTLE = float(os.environ.get("SCUMMVM_RESUME_LOAD_SETTLE", "8"))
 """Seconds a deferred resume gives the game to reach a menu-able state (env `SCUMMVM_RESUME_LOAD_SETTLE`)."""
-FULLSCREEN = os.environ.get("SCUMMVM_FULLSCREEN", "true").lower() not in (
-    "false",
-    "0",
-    "no",
-    "off",
+FULLSCREEN = os.environ.get("SCUMMVM_FULLSCREEN", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+    "on",
 )
-"""Whether the game fills the stream (env `SCUMMVM_FULLSCREEN`, default on).
+"""Whether the game fills the stream (env `SCUMMVM_FULLSCREEN`, default off).
 
-A ScummVM window is its game's own resolution, 640x480 for most, which is a
-postage stamp in the middle of a 1080p stream. Fullscreen is ScummVM's own
-scaler filling the display, and the pointer keeps tracking under it here (the
-same as every other fullscreen launcher in this container). The escape hatch
-exists because a compositor that confines the pointer to a fullscreen window
-would break mouse-driven games outright, and these games are nothing but mouse.
+Windowed is the ugly option and the working one. A ScummVM window is its
+game's own resolution, 640x480 for most, so it sits as a postage stamp in the
+middle of the stream; fullscreen is ScummVM's own scaler filling the display
+and looks far better. What it costs is the pointer. Going fullscreen makes
+ScummVM's SDL window grab the pointer and confine it to a rect
+(`SdlWindow::createOrUpdateWindow`: `shouldGrab = ... || fullscreenFlags`,
+then `SDL_SetWindowMouseRect`) and ask SDL for an explicit display mode on the
+way in. Both are harmless on a real X server and both fight the streaming
+stack, which feeds an absolute pointer and owns the display size itself: the
+pointer stops tracking the stream while clicks still land, and these games are
+nothing but mouse. Off by default for that reason; the env var trades the
+pointer for the full stream if an image is known to survive it.
+
+This is downstream of a separate, mandatory container fix: a running game holds
+Xwayland's warp-emulation pointer lock, which silently drops the absolute
+virtual-pointer motion the browser sends, and no launcher setting reaches that.
+The image has to patch selkies' `input_handler.py` to re-inject the residual
+through the relative path (and ship `python-xlib` for the pointer readback the
+detection needs). Without it the in-game pointer is dead windowed too.
 
 `window_maximized` is deliberately not used: labwc leaves the window at its
 own size regardless, so it fills nothing.
@@ -368,7 +381,7 @@ def _pins(
     return {"scummvm": app, "keymapper": {"keymap_global_MENU": MENU_KEY}}
 
 
-def patch_ini(fullscreen: bool = True, gui_language: Optional[str] = None) -> None:
+def patch_ini(fullscreen: bool = False, gui_language: Optional[str] = None) -> None:
     """Write the broker's pinned settings into scummvm.ini.
 
     Existing keys are rewritten in place and missing ones appended to their
