@@ -252,8 +252,8 @@ arrives without its Ctrl and the menu never opens; the unmodified `F5` that
 does work belongs to the engine keymap, which an engine may take for itself
 (gob answers it with Gobliiins' own panel, which has no Save). And the button
 letters follow the GUI translation (`~S~ave` becomes `~S~auvegarder`), so they
-are read back from `gui_language` — which the activate payload pins when it
-carries one, and which is left as the user set it when it does not. Only that
+are read back from `gui_language`, which the activate payload pins when it
+carries one and leaves as the user set it when it does not. Only that
 one keymap action is pinned; any other binding the user set is left alone.
 
 The macro says nothing about its result, so a save is only reported once the
@@ -275,7 +275,7 @@ alone and a multilingual folder registers one target per language.
 Two more pins are for the stream rather than for ScummVM's own sake.
 `fullscreen`, pinned **off** whatever the launch. A ScummVM window is its
 game's own resolution, so 640x480 sits as a postage stamp in the middle of the
-stream — but ScummVM's own fullscreen is the wrong way to fix that. It makes
+stream. ScummVM's own fullscreen is the wrong way to fix that: it makes
 SDL grab the pointer and confine it to a rect (`shouldGrab = ... ||
 fullscreenFlags`, then `SDL_SetWindowMouseRect`) and ask for an explicit
 display mode, and both fight a stack that feeds an absolute pointer and owns
@@ -289,7 +289,7 @@ keep the game's 4:3 on its own, and never sets the flag that triggers the grab.
 It is best-effort and purely cosmetic: a display size it cannot read, or a
 window that never appears, leaves the game running at its own size rather than
 failing the launch. What it does not remove is the title bar, since no tool in
-the image can (xdotool 3.2016 has no `windowstate`, and there is no wmctrl) —
+the image can (xdotool 3.2016 has no `windowstate`, and there is no wmctrl);
 a labwc window rule would. (ScummVM's `window_maximized` is not used either:
 labwc leaves the window at its own size regardless, so it fills nothing.) And
 `gfx_mode=surfacesdl`, because the OpenGL renderer scales mouse coordinates
@@ -299,8 +299,8 @@ stops moving. SDL is also forced onto X11 at launch so the macros have an
 Xwayland window to talk to.
 
 None of that reaches the one pointer problem a launcher cannot fix. A running
-game holds Xwayland's warp-emulation pointer lock — ScummVM hides the system
-cursor and warps the pointer — and a locked compositor pointer silently drops
+game holds Xwayland's warp-emulation pointer lock (ScummVM hides the system
+cursor and warps the pointer), and a locked compositor pointer silently drops
 the *absolute* virtual-pointer motion the browser sends while still delivering
 relative motion, so the in-game cursor freezes with clicks landing. The image
 has to patch selkies' `input_handler.py` to read the X pointer back after each

@@ -125,7 +125,7 @@ the ini whatever this setting says.
 
 What works is asking the window manager for the size instead. The window is
 resized to the display after launch, SDL sees an ordinary resize and scales its
-output into it — letterboxing to keep the game's aspect on its own — and never
+output into it, letterboxing to keep the game's aspect on its own, and never
 sets the flag that triggers the grab. The cost is the title bar, which no tool
 in this image can remove (xdotool 3.2016 has no `windowstate`, and there is no
 wmctrl); a labwc window rule in the image would.
