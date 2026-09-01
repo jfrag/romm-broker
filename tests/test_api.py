@@ -148,6 +148,26 @@ def test_activate_without_a_language_leaves_it_unset(
     assert fake_emulator[0].language is None
 
 
+def test_activate_hands_the_emulator_the_gui_language(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """The player's interface language reaches the emulator too.
+
+    An emulator with a translated UI follows it, and a multilingual game folder
+    falls back to it when the rom names no language of its own.
+    """
+    assert _activate(client, broker_dirs, gui_language="fr").status_code == 200
+    assert fake_emulator[0].gui_language == "fr"
+
+
+def test_activate_without_a_gui_language_leaves_it_unset(
+    client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
+) -> None:
+    """A payload that names no interface language leaves the emulator's own."""
+    assert _activate(client, broker_dirs).status_code == 200
+    assert fake_emulator[0].gui_language is None
+
+
 def test_activate_launches_the_rom_and_hands_back_a_landing_url(
     client: TestClient, broker_dirs: dict[str, Path], fake_emulator: list[FakeEmulator]
 ) -> None:

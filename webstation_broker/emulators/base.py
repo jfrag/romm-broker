@@ -264,6 +264,7 @@ class Emulator:
         display_name: Human-readable name the UI shows.
         platform: The RomM platform slug the session was activated for, or None.
         language: The language the rom was activated for, or None.
+        gui_language: The player's own interface language, or None.
         requires_rom: Whether a launch needs a ROM; the desktop session does not.
         save_root: Root of the emulator's writable data.
         save_subtrees: Subtrees under `save_root` that hold save data; save
@@ -311,6 +312,15 @@ class Emulator:
     languages in one folder has any use for it (ScummVM registers one target
     per detected language and the target is what boots), and every other
     launcher ignores it.
+    """
+    gui_language: Optional[str] = None
+    """The player's own interface language, or None.
+
+    Set by the activate route on every instance it builds, like `platform` and
+    `language`, but describing the player rather than the rom: it is set even
+    for a launch with no rom. Only a launcher with a translated interface has
+    any use for it (ScummVM pins it in scummvm.ini and falls back to it when
+    the rom carries no language of its own).
     """
     requires_rom: bool = True
     """Whether a launch needs a ROM; the desktop session is the one that does not."""

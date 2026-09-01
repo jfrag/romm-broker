@@ -165,6 +165,7 @@ class ActivateIn(BaseModel):
         user: The RomM user taking the controller seat, if known.
         emulator: The emulator name to launch.
         rom: The rom to boot; optional for launch types without a game.
+        gui_language: The player's interface language, for emulators with a translated UI.
         save: Save data to restore before launch, if any.
         callback: Where the exit save archive goes, if not derived from the request.
         multiplayer: Whether RomM advertises the session for joining.
@@ -175,6 +176,16 @@ class ActivateIn(BaseModel):
     emulator: str
     rom: Optional[RomIn] = None
     """The rom to boot. Optional for launch types without a game (e.g. emulator "desktop")."""
+    gui_language: Optional[str] = None
+    """The player's own interface language, from their RomM UI locale.
+
+    Describes the player rather than the rom, so it is sent for a launch with
+    no rom at all. An emulator with a translated interface follows it (ScummVM
+    pins it in scummvm.ini), and a multilingual game folder falls back to it
+    when the rom itself carries no language: it is the only thing that says
+    which of several detected variants this player wants. Unknown or absent
+    values leave the emulator on its own default rather than failing the launch.
+    """
     save: Optional[SaveIn] = None
     callback: Optional[CallbackIn] = None
     multiplayer: bool = False
@@ -489,6 +500,9 @@ async def _start_session(body: ActivateIn, request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=422, detail=f"unknown emulator: {body.emulator}")
     # General-purpose emulators (retroarch) pick their core from the platform,
     # and a multilingual folder (ScummVM) picks its target from the language.
+    # gui_language describes the player, not the rom, so it is set for a launch
+    # that carries no rom at all.
+    emulator.gui_language = body.gui_language
     if body.rom is not None:
         emulator.platform = body.rom.platform
         emulator.language = body.rom.language
