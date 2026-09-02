@@ -570,6 +570,9 @@ def test_the_window_is_grown_to_the_display(
     """
     xdo = Xdo()
     emu = running(monkeypatch, xdo)
+    monkeypatch.setattr(scummvm, "FILL_SCREEN_POLL", 0.0)
+    alive = iter([True, False])
+    monkeypatch.setattr(Scummvm, "alive", lambda self: next(alive, False))
 
     emu._fill_screen(emu._launch_seq)
 
@@ -580,6 +583,51 @@ def test_the_window_is_grown_to_the_display(
     )
 
 
+def test_the_window_follows_a_display_that_changes_size(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The display is sized by the streaming client, not by the launch.
+
+    A game started before a browser connects is grown to whatever the last
+    session left behind; when the client then resizes the display, a window
+    sized once would sit in the top left corner of a bigger screen.
+    """
+    xdo = Xdo()
+    emu = running(monkeypatch, xdo)
+    monkeypatch.setattr(scummvm, "FILL_SCREEN_POLL", 0.0)
+    sizes = iter(["1024 768", "1024 768", "1920 888"])
+    alive = iter([True, True, True, False])
+    monkeypatch.setattr(Scummvm, "alive", lambda self: next(alive, False))
+
+    def display(*args: str, **kwargs: Any) -> Optional[str]:
+        """Answer a moving display size, everything else the way Xdo does."""
+        if args and args[0] == "getdisplaygeometry":
+            return next(sizes, "1920 888")
+        return xdo(*args, **kwargs)
+
+    monkeypatch.setattr(Scummvm, "_xdotool", lambda self, *a, **k: display(*a, **k))
+
+    emu._fill_screen(emu._launch_seq)
+
+    assert ("windowsize", "4242", "1024", "768") in xdo.calls
+    assert ("windowsize", "4242", "1920", "888") in xdo.calls
+
+
+def test_an_unchanged_display_is_not_resized_again(
+    dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Following the display must not mean an xdotool call every tick."""
+    xdo = Xdo()
+    emu = running(monkeypatch, xdo)
+    monkeypatch.setattr(scummvm, "FILL_SCREEN_POLL", 0.0)
+    alive = iter([True, True, True, False])
+    monkeypatch.setattr(Scummvm, "alive", lambda self: next(alive, False))
+
+    emu._fill_screen(emu._launch_seq)
+
+    assert len([c for c in xdo.calls if c and c[0] == "windowsize"]) == 1
+
+
 def test_an_unreadable_display_size_leaves_the_window_alone(
     dirs: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -587,6 +635,9 @@ def test_an_unreadable_display_size_leaves_the_window_alone(
     xdo = Xdo()
     xdo.display = "not a size"
     emu = running(monkeypatch, xdo)
+    monkeypatch.setattr(scummvm, "FILL_SCREEN_POLL", 0.0)
+    alive = iter([True, True, False])
+    monkeypatch.setattr(Scummvm, "alive", lambda self: next(alive, False))
 
     emu._fill_screen(emu._launch_seq)
 

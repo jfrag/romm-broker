@@ -137,6 +137,13 @@ its own size regardless, so it fills nothing.
 FILL_SCREEN_WAIT = float(os.environ.get("SCUMMVM_FILL_SCREEN_WAIT", "10"))
 """Seconds to wait for the game window before giving up on resizing it."""
 
+FILL_SCREEN_POLL = float(os.environ.get("SCUMMVM_FILL_SCREEN_POLL", "2"))
+"""Seconds between checks that the window still matches the display.
+
+The display is resized by whichever client is connected, so the window has to
+follow it rather than being sized once at launch.
+"""
+
 _XDOTOOL = os.environ.get("XDOTOOL_BIN", "xdotool")
 """The xdotool binary that drives the GMM (env `XDOTOOL_BIN`)."""
 
@@ -1081,16 +1088,21 @@ class Scummvm(Emulator):
             Thread(target=self._deferred_load_state, args=(seq,), daemon=True).start()
 
     def _fill_screen(self, seq: int) -> None:
-        """Grow the game window to the display once it exists.
+        """Keep the game window the size of the display, for as long as it runs.
 
-        Waits for the window because it is not mapped the instant the process
-        starts, and abandons itself if a later launch has taken over. Purely
-        cosmetic, so every failure is logged and swallowed: a game running at
-        640x480 in the middle of the stream is worth more than a launch
-        reported as broken.
+        Resizing once at launch is not enough: the display is sized by the
+        streaming client, so a game that starts before a browser has connected
+        is grown to whatever the last session left behind and then sits in the
+        top left corner of a screen that changed under it. The same happens
+        mid-session when a viewer resizes their browser. So this follows the
+        display instead of photographing it, and exits when the launch is
+        superseded or the game is gone.
+
+        Purely cosmetic, so every failure is logged and swallowed: a game
+        running at its own size is worth more than a launch reported as broken.
 
         Args:
-            seq: The launch sequence number this resize belongs to.
+            seq: The launch sequence number this belongs to.
         """
         deadline = time.monotonic() + FILL_SCREEN_WAIT
         win_id = None
@@ -1105,22 +1117,34 @@ class Scummvm(Emulator):
             log.warning("scummvm: no window to fill the screen with")
             return
 
-        geometry = self._xdotool("getdisplaygeometry")
+        applied: Optional[tuple[str, str]] = None
+        while self._launch_seq == seq and self.alive():
+            size = self._display_size()
+            if size and size != applied:
+                # Move first: a window the WM placed at an offset would
+                # otherwise be sized to the display and hang off the bottom
+                # right of it.
+                width, height = size
+                if (
+                    self._xdotool("windowmove", win_id, "0", "0") is not None
+                    and self._xdotool("windowsize", win_id, width, height) is not None
+                ):
+                    applied = size
+                    log.info("scummvm: window %s sized to %sx%s", win_id, width, height)
+            time.sleep(FILL_SCREEN_POLL)
+
+    def _display_size(self) -> Optional[tuple[str, str]]:
+        """The display's current size as a `(width, height)` pair of digits.
+
+        Returns:
+            The pair, or None when xdotool could not be asked or answered
+            something that is not two numbers.
+        """
+        geometry = self._xdotool("getdisplaygeometry", quiet=True)
         parts = geometry.split() if geometry else []
         if len(parts) != 2 or not all(p.isdigit() for p in parts):
-            log.warning("scummvm: could not read the display size, window left as is")
-            return
-        width, height = parts
-
-        if self._launch_seq != seq:
-            return
-        # Move first: a window placed by the WM at an offset would otherwise be
-        # sized to the display and then hang off the bottom right of it.
-        if self._xdotool("windowmove", win_id, "0", "0") is None:
-            return
-        if self._xdotool("windowsize", win_id, width, height) is None:
-            return
-        log.info("scummvm: window %s grown to %sx%s", win_id, width, height)
+            return None
+        return parts[0], parts[1]
 
     def _deferred_load_state(self, seq: int) -> None:
         """Wait for a pushed state to arrive, then load it through the menu.
