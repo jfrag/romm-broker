@@ -817,10 +817,24 @@ class Scummvm(Emulator):
                 pointed at).
 
         Returns:
-            The game folder, or None when the path is outside the ROM root, is
-            not a folder, or holds nothing to detect.
+            The game folder, or None when the path is a file this launcher
+            does not recognise, is outside the ROM root, is not a folder, or
+            holds nothing to detect.
         """
         self._rom_dir = None
+        if not path.is_dir() and path.suffix.lower() not in self.rom_extensions:
+            # Falling through to `path.parent` here would register whatever
+            # directory the file happens to sit in. For a library laid out as
+            # <root>/<platform>/<file>, that is the platform folder: `--add`
+            # would scan every game in it and boot whichever target sorts
+            # first. A wrong game is worse than a refused launch.
+            log.warning(
+                "scummvm: %s is not a game folder or a %s marker; ScummVM games "
+                "are folders, extract an archived one first",
+                path,
+                " or ".join(self.rom_extensions),
+            )
+            return None
         rom_dir = path if path.is_dir() else path.parent
         try:
             resolved = rom_dir.resolve()

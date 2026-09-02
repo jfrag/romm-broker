@@ -102,6 +102,23 @@ def test_a_file_resolves_to_the_folder_holding_it(dirs: dict[str, Path]) -> None
     assert Scummvm().resolve_rom_file(marker) == folder.resolve()
 
 
+def test_an_archive_resolves_to_nothing_rather_than_its_folder(
+    dirs: dict[str, Path],
+) -> None:
+    """A zipped game must not be read as "the folder it sits in".
+
+    Libraries are laid out as <root>/<platform>/<game>, so the folder around a
+    loose file is the platform folder. Registering that would `--add` every
+    game on the platform and boot whichever target sorts first: the player
+    asks for one game and gets another, which is worse than a refused launch.
+    """
+    folder = game_folder(dirs["roms"])
+    archive = folder.parent / "woodruff.zip"
+    archive.write_bytes(b"PK")
+
+    assert Scummvm().resolve_rom_file(archive) is None
+
+
 def test_an_empty_folder_resolves_to_nothing(dirs: dict[str, Path]) -> None:
     """A folder with nothing in it has nothing to detect."""
     empty = dirs["roms"] / "empty"
