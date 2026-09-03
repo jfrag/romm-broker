@@ -300,13 +300,14 @@ Xwayland window to talk to.
 
 None of that reaches the one pointer problem a launcher cannot fix. A running
 game holds Xwayland's warp-emulation pointer lock (ScummVM hides the system
-cursor and warps the pointer), and a locked compositor pointer silently drops
-the *absolute* virtual-pointer motion the browser sends while still delivering
-relative motion, so the in-game cursor freezes with clicks landing. The image
-has to patch selkies' `input_handler.py` to read the X pointer back after each
-absolute injection and re-inject the residual through the relative path, and
-ship `python-xlib` for that readback. Without it the pointer is dead windowed
-too, whatever this launcher pins.
+cursor and warps the pointer), and labwc drops the *absolute* motion the
+browser sends while a lock is active yet still forwards relative motion, so
+the in-game cursor freezes with clicks landing. The image has to patch
+selkies' `input_handler.py` to send every absolute move as a relative delta
+followed by the absolute position, and to read the X pointer back after a
+pause (it ships `python-xlib` for that) so a warp issued by the game does not
+leave a lasting offset. Without it the pointer is dead windowed too, whatever
+this launcher pins.
 
 ## Desktop
 
